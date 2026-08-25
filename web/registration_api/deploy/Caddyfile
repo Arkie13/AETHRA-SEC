@@ -1,0 +1,13 @@
+# Replace both domains with the real ones before deploying. Caddy issues
+# and renews Let's Encrypt certificates automatically once DNS resolves to
+# this droplet - no manual certbot/nginx config needed.
+
+aethra-sec.example {
+	root * /var/www/aethra-site
+	file_server
+	encode gzip
+}
+
+api.aethra-sec.example {
+	reverse_proxy 127.0.0.1:8001
+}

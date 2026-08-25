@@ -1,0 +1,59 @@
+# ---------------------------------------------------------------------------
+# AETHRA-SEC - version control exclusions
+# ---------------------------------------------------------------------------
+
+# Secrets / local configuration -- NEVER commit real credentials
+.env
+.env.local
+*.env
+!.env.example
+
+# Registration API's own SQLite database and its WAL/SHM sidecar files
+web/registration_api/*.db
+web/registration_api/*.db-wal
+web/registration_api/*.db-shm
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+ENV/
+
+# Testing / tooling caches
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
+
+# Packaged copies of this tree, built for delivery. The repository is the
+# source of truth; an archive of it does not belong inside it.
+AETHRA-SEC.zip
+*.zip
+
+# Application runtime output
+logs/
+reports_output/
+captures/
+backups/
+*.log
+*.pcap
+*.pcapng
+
+# OS / editor
+Thumbs.db
+Desktop.ini
+.DS_Store
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,20 @@
+[Unit]
+Description=AETHRA-SEC registration API
+After=network.target
+
+[Service]
+Type=simple
+User=aethra-reg
+Group=aethra-reg
+WorkingDirectory=/opt/aethra-registration/web/registration_api
+EnvironmentFile=/opt/aethra-registration/web/registration_api/.env
+ExecStart=/opt/aethra-registration/web/registration_api/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8001 --workers 1
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/aethra-registration
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

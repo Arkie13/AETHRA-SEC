@@ -1,0 +1,11 @@
+# Windows batch files must keep CRLF endings: cmd.exe can mis-parse a
+# multi-line IF block in a file that only has LF endings.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Shell scripts and SQL must keep LF, whatever the checkout platform.
+*.sh  text eol=lf
+*.sql text eol=lf
+
+# Everything else: normalise in the repository, native on checkout.
+*     text=auto

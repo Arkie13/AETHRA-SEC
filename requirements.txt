@@ -1,0 +1,28 @@
+# ---------------------------------------------------------------------------
+# AETHRA-SEC - Python dependencies
+#
+# Target: Python 3.10+ on Windows (also runs on Linux for CI / lab servers).
+# Tkinter is part of the CPython standard library on Windows; on Debian/Ubuntu
+# install it with:  sudo apt-get install python3-tk
+# ---------------------------------------------------------------------------
+
+# --- Database -------------------------------------------------------------
+mysql-connector-python>=8.3,<27       # MySQL driver + built-in connection pooling
+
+# --- Security -------------------------------------------------------------
+argon2-cffi>=23.1                     # Argon2id password hashing (preferred KDF)
+
+# --- Cybersecurity tool integrations --------------------------------------
+python-nmap>=0.7.1                    # Nmap wrapper (vulnerability assessment)
+pyshark>=0.6                          # Wireshark/TShark wrapper (live capture)
+
+# --- System / configuration ----------------------------------------------
+psutil>=5.9                           # Interfaces, disk usage, process health
+python-dotenv>=1.0                    # .env configuration loading
+
+# --- Reporting ------------------------------------------------------------
+reportlab>=4.0                        # PDF report generation
+openpyxl>=3.1                         # Excel (.xlsx) export
+
+# --- Testing (development only) ------------------------------------------
+pytest>=8.0

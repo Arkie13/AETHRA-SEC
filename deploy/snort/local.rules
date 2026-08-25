@@ -1,0 +1,28 @@
+# Real detection rules. Each fires on properties of an actual packet; nothing
+# here fabricates an alert.
+#
+# Every rule's destination is $HOME_NET (this sensor's one protected host,
+# set in snort.wsl.conf) - never "any". Traffic *to* this host is what an
+# attacker's traffic looks like; traffic *from* it is this machine's own
+# ordinary browsing and background app activity, and matching that too was
+# the earlier bug that turned every website visited into a "Reconnaissance
+# activity" incident. rev bumped to 2 on the rules that changed for that fix.
+#
+# Single-packet rules catch one matching packet. Flood/DoS rules below them
+# use Snort's inline `threshold` option to require a *rate* (N matches from
+# the same source within T seconds) before alerting - a single SYN or ping is
+# normal traffic, not an attack; only the rate makes it one.
+
+# --- Single-packet, deliberately broad (see README: replace for real use) ---
+alert icmp any any -> $HOME_NET any (msg:"ICMP echo request"; itype:8; sid:1000001; rev:2; classtype:misc-activity;)
+alert tcp any any -> $HOME_NET any (msg:"TCP SYN (any port)"; flags:S; dsize:0; sid:1000002; rev:2; classtype:attempted-recon;)
+alert udp any any -> $HOME_NET 53 (msg:"UDP traffic to DNS port"; sid:1000003; rev:2; classtype:misc-activity;)
+alert tcp any any -> $HOME_NET 80 (msg:"TCP SYN to HTTP port"; flags:S; sid:1000004; rev:2; classtype:attempted-recon;)
+alert tcp any any -> $HOME_NET 443 (msg:"TCP SYN to HTTPS port"; flags:S; sid:1000005; rev:2; classtype:attempted-recon;)
+
+# --- Flood / DoS (rate-based: N from one source within T seconds) ---
+alert icmp any any -> $HOME_NET any (msg:"ICMP flood - possible ping flood/DoS"; itype:8; threshold: type both, track by_src, count 20, seconds 5; sid:1000006; rev:2; classtype:attempted-dos;)
+alert tcp any any -> $HOME_NET any (msg:"TCP SYN flood - possible DoS"; flags:S; threshold: type both, track by_src, count 30, seconds 5; sid:1000007; rev:2; classtype:attempted-dos;)
+alert udp any any -> $HOME_NET any (msg:"UDP flood - possible DoS"; threshold: type both, track by_src, count 50, seconds 5; sid:1000008; rev:2; classtype:attempted-dos;)
+alert tcp any any -> $HOME_NET 80 (msg:"HTTP port SYN flood - possible web server DoS"; flags:S; threshold: type both, track by_src, count 20, seconds 5; sid:1000009; rev:2; classtype:attempted-dos;)
+alert tcp any any -> $HOME_NET 443 (msg:"HTTPS port SYN flood - possible web server DoS"; flags:S; threshold: type both, track by_src, count 20, seconds 5; sid:1000010; rev:2; classtype:attempted-dos;)

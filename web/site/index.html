@@ -1,0 +1,553 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>AETHRA-SEC</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="description" content="AETHRA-SEC unifies authorised Nmap assessment, live Wireshark/TShark traffic analysis, and Snort intrusion detection into a single defensive security operations console." />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800;900&family=Source+Sans+3:ital,wght@0,400;0,500;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+<style>
+  /* Deliberately single-theme: a SOC console read at night, a terminal
+     transcript and a radar sweep do not have a convincing daylight reading,
+     and the product this promotes is itself dark-only by design. */
+  :root{
+    --bg:#0B0E13; --surface:#12161D; --surface-2:#171C25; --surface-3:#1D2430;
+    --border:#232A36; --border-strong:#2E3644;
+    --ink:#EAEDF2; --muted:#9099AB; --dim:#5B6577;
+    --accent:#3B82F6; --accent-hover:#5B95F8; --accent-ink:#0B0E13;
+    --signal:#38E1C6;
+    --critical:#F0475F; --high:#F2924B; --medium:#F0C24B; --low:#34D399;
+    --radius:10px; --radius-lg:14px;
+    color-scheme: dark;
+  }
+
+  *{ box-sizing:border-box; }
+  html{ background:var(--bg); }
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:"Source Sans 3", "Segoe UI", sans-serif;
+    font-size:16px; line-height:1.55;
+    -webkit-font-smoothing:antialiased;
+    overflow-x:hidden;
+  }
+  h1,h2,h3{ font-family:"Big Shoulders Display","Arial Narrow",sans-serif; font-weight:800; line-height:0.96; letter-spacing:0.01em; text-wrap:balance; margin:0; }
+  code,.mono{ font-family:"JetBrains Mono","Consolas",monospace; font-variant-numeric:tabular-nums; }
+  a{ color:inherit; }
+  .eyebrow{
+    font-family:"JetBrains Mono",monospace; font-size:0.78rem; font-weight:600;
+    letter-spacing:0.14em; text-transform:uppercase; color:var(--signal);
+  }
+  section{ position:relative; }
+  .wrap{ max-width:1180px; margin:0 auto; padding:0 28px; }
+  .visually-hidden{ position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0,0,0,0); }
+
+  /* ---------- nav ---------- */
+  #site-nav{
+    position:sticky; top:0; z-index:40;
+    background:color-mix(in srgb, var(--bg) 86%, transparent);
+    backdrop-filter:blur(10px);
+    border-bottom:1px solid var(--border);
+  }
+  .nav-row{ display:flex; align-items:center; justify-content:space-between; height:64px; }
+  .brand{ display:flex; align-items:baseline; gap:10px; text-decoration:none; }
+  .brand-mark{ font-family:"Big Shoulders Display",sans-serif; font-weight:800; font-size:1.35rem; letter-spacing:0.02em; }
+  .brand-tag{ font-family:"JetBrains Mono",monospace; font-size:0.68rem; color:var(--dim); letter-spacing:0.08em; }
+  .nav-links{ display:flex; align-items:center; gap:28px; }
+  .nav-links a{ text-decoration:none; color:var(--muted); font-size:0.92rem; font-weight:600; }
+  .nav-links a:hover{ color:var(--ink); }
+  .btn{
+    display:inline-flex; align-items:center; gap:8px; border:1px solid transparent;
+    border-radius:8px; padding:11px 18px; font-size:0.92rem; font-weight:700;
+    cursor:pointer; text-decoration:none; font-family:inherit; transition:background .15s, border-color .15s, transform .1s;
+  }
+  .btn:active{ transform:translateY(1px); }
+  .btn:disabled{ opacity:0.6; cursor:default; }
+  .btn-accent{ background:var(--accent); color:var(--accent-ink); }
+  .btn-accent:hover{ background:var(--accent-hover); }
+  .btn-ghost{ background:transparent; color:var(--ink); border-color:var(--border-strong); }
+  .btn-ghost:hover{ background:var(--surface-2); }
+  .btn-ghost[aria-disabled="true"]{ color:var(--dim); cursor:default; }
+  .btn-ghost[aria-disabled="true"]:hover{ background:transparent; }
+  .btn-sm{ padding:8px 14px; font-size:0.82rem; }
+
+  /* ---------- hero ---------- */
+  #hero{ padding:88px 0 64px; overflow:hidden; }
+  .hero-grid{ display:grid; grid-template-columns:1.1fr 0.9fr; gap:48px; align-items:center; }
+  #hero h1{ font-size:clamp(2.6rem, 5.4vw, 4.3rem); margin:16px 0 22px; }
+  #hero h1 .hl{ color:var(--accent); }
+  .hero-sub{ font-size:1.14rem; color:var(--muted); max-width:52ch; margin:0 0 30px; }
+  .hero-ctas{ display:flex; gap:14px; flex-wrap:wrap; }
+  .radar-wrap{ position:relative; aspect-ratio:1/1; max-width:440px; margin:0 auto; }
+  #radar{ width:100%; height:100%; display:block; }
+  .radar-caption{
+    position:absolute; left:50%; bottom:-8px; transform:translateX(-50%);
+    font-family:"JetBrains Mono",monospace; font-size:0.7rem; color:var(--dim);
+    letter-spacing:0.08em; white-space:nowrap;
+  }
+  .stat-strip{ display:flex; gap:36px; margin-top:46px; flex-wrap:wrap; }
+  .stat b{ display:block; font-family:"Big Shoulders Display",sans-serif; font-size:2rem; font-weight:800; }
+  .stat span{ font-size:0.82rem; color:var(--dim); }
+
+  /* ---------- feed demo ---------- */
+  #feed-demo{ padding:70px 0; }
+  .section-head{ margin-bottom:30px; max-width:70ch; }
+  .section-head h2{ font-size:clamp(1.8rem,3.4vw,2.5rem); margin:10px 0 12px; }
+  .section-head p{ color:var(--muted); font-size:1.02rem; }
+  .feed-panel{
+    background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-lg);
+    overflow:hidden;
+  }
+  .feed-panel-head{
+    display:flex; align-items:center; justify-content:space-between; gap:12px;
+    padding:14px 18px; border-bottom:1px solid var(--border); background:var(--surface-2);
+  }
+  .feed-title{ display:flex; align-items:center; gap:10px; font-family:"JetBrains Mono",monospace; font-size:0.82rem; color:var(--muted); }
+  .live-dot{ width:8px; height:8px; border-radius:50%; background:var(--signal); box-shadow:0 0 0 0 color-mix(in srgb, var(--signal) 60%, transparent); animation:pulse 2.2s infinite; }
+  @keyframes pulse{
+    0%{ box-shadow:0 0 0 0 color-mix(in srgb, var(--signal) 45%, transparent); }
+    70%{ box-shadow:0 0 0 8px transparent; }
+    100%{ box-shadow:0 0 0 0 transparent; }
+  }
+  table.feed{ width:100%; border-collapse:collapse; font-size:0.88rem; }
+  table.feed th{
+    text-align:left; font-family:"JetBrains Mono",monospace; font-size:0.68rem; letter-spacing:0.08em;
+    text-transform:uppercase; color:var(--dim); font-weight:600; padding:11px 18px; border-bottom:1px solid var(--border);
+  }
+  table.feed td{ padding:12px 18px; border-bottom:1px solid var(--border); color:var(--ink); }
+  table.feed tr:last-child td{ border-bottom:none; }
+  td.time{ font-family:"JetBrains Mono",monospace; color:var(--dim); white-space:nowrap; font-variant-numeric:tabular-nums; }
+  .sev{ display:inline-flex; align-items:center; gap:6px; font-family:"JetBrains Mono",monospace; font-size:0.72rem; font-weight:600; letter-spacing:0.04em; text-transform:uppercase; }
+  .sev::before{ content:""; width:7px; height:7px; border-radius:2px; display:inline-block; }
+  .sev.critical{ color:var(--critical); } .sev.critical::before{ background:var(--critical); }
+  .sev.high{ color:var(--high); } .sev.high::before{ background:var(--high); }
+  .sev.medium{ color:var(--medium); } .sev.medium::before{ background:var(--medium); }
+  .sev.low{ color:var(--low); } .sev.low::before{ background:var(--low); }
+  .feed-foot{ padding:10px 18px; font-size:0.76rem; color:var(--dim); font-family:"JetBrains Mono",monospace; border-top:1px solid var(--border); background:var(--surface-2); }
+
+  /* ---------- capabilities ledger ---------- */
+  #capabilities{ padding:70px 0; }
+  .ledger{ display:grid; grid-template-columns:1fr 1fr; border:1px solid var(--border); border-radius:var(--radius-lg); overflow:hidden; }
+  .ledger-col{ padding:0; }
+  .ledger-col + .ledger-col{ border-left:1px solid var(--border); }
+  .ledger-head{
+    padding:16px 22px; font-family:"JetBrains Mono",monospace; font-size:0.75rem; font-weight:700;
+    letter-spacing:0.1em; text-transform:uppercase; border-bottom:1px solid var(--border);
+  }
+  .ledger-head.does{ color:var(--low); background:color-mix(in srgb, var(--low) 10%, var(--surface)); }
+  .ledger-head.never{ color:var(--critical); background:color-mix(in srgb, var(--critical) 10%, var(--surface)); }
+  .ledger-col ul{ list-style:none; margin:0; padding:0; }
+  .ledger-col li{ padding:15px 22px; border-bottom:1px solid var(--border); font-size:0.94rem; color:var(--muted); }
+  .ledger-col li:last-child{ border-bottom:none; }
+  .ledger-col li b{ color:var(--ink); font-weight:600; }
+  @media (max-width:760px){
+    .ledger{ grid-template-columns:1fr; }
+    .ledger-col + .ledger-col{ border-left:none; border-top:1px solid var(--border); }
+  }
+
+  /* ---------- setup ---------- */
+  #setup{ padding:70px 0; }
+  .setup-grid{ display:grid; grid-template-columns:0.85fr 1.15fr; gap:32px; align-items:start; }
+  .req-table{ width:100%; border-collapse:collapse; font-size:0.88rem; }
+  .req-table th{ text-align:left; font-family:"JetBrains Mono",monospace; font-size:0.68rem; text-transform:uppercase; letter-spacing:0.08em; color:var(--dim); padding:9px 0; border-bottom:1px solid var(--border); }
+  .req-table td{ padding:11px 0; border-bottom:1px solid var(--border); vertical-align:top; }
+  .req-table td:first-child{ font-weight:600; white-space:nowrap; padding-right:16px; }
+  .req-table td:last-child{ color:var(--muted); }
+  .terminal{
+    background:#0A0D12; border:1px solid var(--border-strong); border-radius:var(--radius-lg);
+    overflow:hidden; box-shadow:0 20px 40px -24px rgba(0,0,0,0.5);
+  }
+  .term-bar{ display:flex; align-items:center; gap:8px; padding:11px 14px; background:#12151B; border-bottom:1px solid #232A36; }
+  .term-dot{ width:10px; height:10px; border-radius:50%; }
+  .term-bar .term-title{ margin-left:8px; font-family:"JetBrains Mono",monospace; font-size:0.74rem; color:#7C8598; }
+  .term-body{ padding:20px 22px; font-family:"JetBrains Mono",monospace; font-size:0.83rem; line-height:1.85; color:#D6E2F0; overflow-x:auto; }
+  .term-body .c{ color:#5B6577; }
+  .term-body .p{ color:#38E1C6; }
+
+  /* ---------- registration ---------- */
+  #registration{ padding:76px 0 90px; }
+  .reg-card{
+    background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-lg);
+    padding:44px; display:grid; grid-template-columns:1fr 1fr; gap:40px; align-items:center;
+  }
+  .reg-count{ font-family:"Big Shoulders Display",sans-serif; font-weight:900; font-size:3.2rem; color:var(--accent); line-height:1; font-variant-numeric:tabular-nums; }
+  .reg-count-label{ font-family:"JetBrains Mono",monospace; font-size:0.76rem; color:var(--dim); letter-spacing:0.06em; margin-top:8px; }
+  .reg-form{ display:flex; flex-direction:column; gap:12px; align-items:flex-start; width:100%; max-width:320px; }
+  .reg-form input{
+    width:100%; padding:12px 14px; border-radius:8px; border:1px solid var(--border-strong);
+    background:var(--surface-2); color:var(--ink); font-family:inherit; font-size:0.94rem;
+  }
+  .reg-form input:focus{ outline:2px solid var(--accent); outline-offset:1px; }
+  .reg-note{ font-size:0.8rem; color:var(--dim); }
+  .reg-status{ font-size:0.86rem; min-height:1.2em; }
+  .reg-status.ok{ color:var(--low); }
+  .reg-status.err{ color:var(--critical); }
+  .reg-status.info{ color:var(--dim); }
+  @media (max-width:760px){ .reg-card{ grid-template-columns:1fr; padding:28px; } .reg-form{ max-width:none; } }
+
+  /* ---------- footer ---------- */
+  #site-footer{ border-top:1px solid var(--border); padding:36px 0 44px; }
+  .foot-row{ display:flex; justify-content:space-between; gap:20px; flex-wrap:wrap; align-items:flex-start; }
+  .foot-note{ max-width:62ch; color:var(--dim); font-size:0.86rem; }
+  .foot-links{ display:flex; gap:18px; font-size:0.86rem; }
+  .foot-links a{ text-decoration:none; color:var(--muted); }
+  .foot-links a:hover{ color:var(--ink); }
+  .foot-meta{ margin-top:18px; font-family:"JetBrains Mono",monospace; font-size:0.72rem; color:var(--dim); }
+
+  @media (max-width:900px){
+    .hero-grid{ grid-template-columns:1fr; }
+    .radar-wrap{ order:-1; max-width:260px; }
+    .setup-grid{ grid-template-columns:1fr; }
+  }
+  @media (prefers-reduced-motion: reduce){
+    .live-dot{ animation:none; }
+    * { scroll-behavior:auto !important; }
+  }
+</style>
+</head>
+<body>
+
+<nav id="site-nav">
+  <div class="wrap nav-row">
+    <a class="brand" href="#hero">
+      <span class="brand-mark">AETHRA-SEC</span>
+      <span class="brand-tag">// SOC CONSOLE</span>
+    </a>
+    <div class="nav-links">
+      <a href="#feed-demo">The console</a>
+      <a href="#capabilities">Capabilities</a>
+      <a href="#setup">Setup</a>
+      <a href="#registration" class="btn btn-accent btn-sm">Join early access</a>
+    </div>
+  </div>
+</nav>
+
+<section id="hero">
+  <div class="wrap hero-grid">
+    <div>
+      <p class="eyebrow">Defensive security operations console</p>
+      <h1>One console.<br>Three real tools.<br><span class="hl">Zero fabricated alerts.</span></h1>
+      <p class="hero-sub">AETHRA-SEC unifies authorised Nmap assessment, live Wireshark/TShark traffic analysis, and Snort intrusion detection into a single desktop console — correlating real evidence into incidents, scoring risk transparently, and recommending mitigation for a human to approve. Built for security labs and authorised internal networks.</p>
+      <div class="hero-ctas">
+        <a href="#registration" class="btn btn-accent">Join early access</a>
+        <span id="github-cta" class="btn btn-ghost" aria-disabled="true" title="Repository link coming soon">View source (coming soon)</span>
+      </div>
+      <div class="stat-strip">
+        <div class="stat"><b>3</b><span>real tools unified</span></div>
+        <div class="stat"><b>31</b><span>tracked evidence tables</span></div>
+        <div class="stat"><b>0</b><span>invented data points</span></div>
+      </div>
+    </div>
+    <div class="radar-wrap">
+      <canvas id="radar" width="440" height="440" role="img" aria-label="Animated radar sweep illustration"></canvas>
+      <p class="radar-caption">[ live capture · authorised segment only ]</p>
+    </div>
+  </div>
+</section>
+
+<section id="feed-demo">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">Illustrative — your own data, once it's running</p>
+      <h2>What the console looks like mid-incident.</h2>
+      <p>Every row here would be a real Snort alert or a real traffic anomaly, correlated with the host it came from. On a fresh install the tables read "No data available" — there is no seeded demo data and nothing here is invented.</p>
+    </div>
+    <div class="feed-panel">
+      <div class="feed-panel-head">
+        <div class="feed-title"><span class="live-dot"></span> alert_feed.sample</div>
+        <div class="feed-title">HOME_NET 192.168.100.0/24</div>
+      </div>
+      <table class="feed">
+        <thead><tr><th>Time</th><th>Severity</th><th>Signature</th><th>Source → Destination</th></tr></thead>
+        <tbody>
+          <tr><td class="time">23:37:29</td><td><span class="sev high">High</span></td><td>UDP flood — possible DoS</td><td class="mono">192.168.100.132:51221 → 192.168.100.31:9999</td></tr>
+          <tr><td class="time">23:31:04</td><td><span class="sev medium">Medium</span></td><td>TCP SYN sweep detected</td><td class="mono">192.168.100.31 → 192.168.100.1/24</td></tr>
+          <tr><td class="time">23:18:52</td><td><span class="sev critical">Critical</span></td><td>Repeated auth failures</td><td class="mono">192.168.100.47 → 192.168.100.31:22</td></tr>
+          <tr><td class="time">22:59:11</td><td><span class="sev low">Low</span></td><td>DNS query to unlisted host</td><td class="mono">192.168.100.31:53412 → 1.1.1.1:53</td></tr>
+        </tbody>
+      </table>
+      <div class="feed-foot">Correlated into incidents with a transparent, factor-by-factor risk score — never a black-box number.</div>
+    </div>
+  </div>
+</section>
+
+<section id="capabilities">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">Scope, stated plainly</p>
+      <h2>What it does — and what it will never do.</h2>
+      <p>Targets outside your configured authorised networks are refused before any command is even built.</p>
+    </div>
+    <div class="ledger">
+      <div class="ledger-col">
+        <div class="ledger-head does">It does</div>
+        <ul>
+          <li><b>Runs authorised Nmap assessments</b> from a fixed profile catalogue.</li>
+          <li><b>Captures and analyses live traffic</b> on an interface you select.</li>
+          <li><b>Receives real Snort alerts</b> over four configurable transports.</li>
+          <li><b>Correlates evidence into incidents</b> with a transparent risk breakdown.</li>
+          <li><b>Recommends mitigation</b> and explains its reasoning.</li>
+          <li><b>Records every action</b> in a hash-chained audit trail.</li>
+        </ul>
+      </div>
+      <div class="ledger-col">
+        <div class="ledger-head never">It never does</div>
+        <ul>
+          <li><b>Exploit anything</b> — no Metasploit, no attack tooling.</li>
+          <li><b>Attempt credential guessing</b> or brute force.</li>
+          <li><b>Reconfigure a firewall</b>, block an IP, or disable a service.</li>
+          <li><b>Invent packets, alerts, hosts</b> or statistics.</li>
+          <li><b>Apply a mitigation on its own</b> — a human always decides.</li>
+          <li><b>Store a plaintext password</b>, or email one out.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="setup">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">Quick start</p>
+      <h2>Running in five commands.</h2>
+      <p>Full step-by-step Windows and Linux instructions ship with the project. This is the short version.</p>
+    </div>
+    <div class="setup-grid">
+      <table class="req-table">
+        <thead><tr><th>Component</th><th>Version</th></tr></thead>
+        <tbody>
+          <tr><td>Python</td><td>3.10–3.14, with Tkinter</td></tr>
+          <tr><td>MySQL / MariaDB</td><td>8.0+ / 10.6+</td></tr>
+          <tr><td>Nmap</td><td>7.x</td></tr>
+          <tr><td>Wireshark / TShark</td><td>4.x (Npcap on Windows)</td></tr>
+          <tr><td>Snort</td><td>2.9.x or 3.x — optional</td></tr>
+        </tbody>
+      </table>
+      <div class="terminal">
+        <div class="term-bar">
+          <span class="term-dot" style="background:#F0475F"></span>
+          <span class="term-dot" style="background:#F0C24B"></span>
+          <span class="term-dot" style="background:#34D399"></span>
+          <span class="term-title">setup.bat</span>
+        </div>
+        <div class="term-body"><span class="c">:: 1. Create the environment</span>
+<span class="p">python</span> -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+
+<span class="c">:: 2. Configure</span>
+copy .env.example .env
+
+<span class="c">:: 3. Create the schema and seed reference data</span>
+<span class="p">python</span> scripts\init_db.py
+
+<span class="c">:: 4. Create the first administrator</span>
+<span class="p">python</span> scripts\create_admin.py --username admin
+
+<span class="c">:: 5. Check, then start</span>
+<span class="p">python</span> scripts\health_check.py
+<span class="p">python</span> -m aethra_sec.main</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="registration">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">Get early access</p>
+      <h2>Be notified when a packaged release is ready.</h2>
+    </div>
+    <div class="reg-card">
+      <div>
+        <div class="reg-count" id="reg-count">0</div>
+        <div class="reg-count-label">PEOPLE ON THE LIST — A REAL COUNT, NOT A FABRICATED ONE</div>
+      </div>
+      <form class="reg-form" id="reg-form">
+        <input type="text" id="reg-name" name="name" placeholder="Name" autocomplete="name" required maxlength="120" />
+        <input type="email" id="reg-email" name="email" placeholder="Email" autocomplete="email" required maxlength="254" />
+        <!-- Honeypot: hidden from real visitors via .visually-hidden; a filled value marks a submission as a bot. -->
+        <input type="text" id="reg-company" name="company" class="visually-hidden" tabindex="-1" autocomplete="off" />
+        <button type="submit" class="btn btn-accent" id="reg-submit">Count me in</button>
+        <p class="reg-status" id="reg-status" role="status"></p>
+        <p class="reg-note">AETHRA-SEC is built for authorised Network Security lab and internal-LAN use. We'll only use this to notify you about the release.</p>
+      </form>
+    </div>
+  </div>
+</section>
+
+<footer id="site-footer">
+  <div class="wrap">
+    <div class="foot-row">
+      <p class="foot-note">AETHRA-SEC must only be operated against networks, hosts and interfaces you are explicitly authorised to monitor or assess. No exploitation. No credential attacks. No automated mitigation — every action is a human decision.</p>
+      <div class="foot-links">
+        <span style="color:var(--dim);" title="Repository link coming soon">GitHub (soon)</span>
+        <a href="#setup">Setup guide</a>
+        <a href="#registration">Early access</a>
+      </div>
+    </div>
+    <p class="foot-meta">AETHRA-SEC · defensive security operations console · 683 tests passing on the current build</p>
+  </div>
+</footer>
+
+<script>
+(function(){
+  "use strict";
+
+  /* ---------------- radar canvas ---------------- */
+  var canvas = document.getElementById('radar');
+  var reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (canvas && canvas.getContext) {
+    var ctx = canvas.getContext('2d');
+    var W = canvas.width, H = canvas.height, cx = W/2, cy = H/2, R = W/2 - 10;
+    var blips = [];
+    for (var i=0;i<9;i++){
+      blips.push({
+        angle: Math.random()*Math.PI*2,
+        radius: 0.25*R + Math.random()*0.7*R,
+        life: Math.random()
+      });
+    }
+    var accent = getComputedStyle(document.documentElement).getPropertyValue('--signal').trim() || '#38E1C6';
+    var faint = getComputedStyle(document.documentElement).getPropertyValue('--border-strong').trim() || '#2E3644';
+    var sweep = 0;
+
+    function draw(){
+      ctx.clearRect(0,0,W,H);
+      ctx.strokeStyle = faint;
+      ctx.lineWidth = 1;
+      [0.28,0.52,0.76,1].forEach(function(f){
+        ctx.beginPath(); ctx.arc(cx,cy,R*f,0,Math.PI*2); ctx.globalAlpha = 0.55; ctx.stroke();
+      });
+      ctx.globalAlpha = 1;
+      ctx.beginPath(); ctx.moveTo(cx-R,cy); ctx.lineTo(cx+R,cy);
+      ctx.moveTo(cx,cy-R); ctx.lineTo(cx,cy+R);
+      ctx.globalAlpha = 0.3; ctx.stroke(); ctx.globalAlpha = 1;
+
+      ctx.save();
+      ctx.translate(cx,cy);
+      ctx.rotate(sweep);
+      var sweepGrad = ctx.createLinearGradient(0,0,R,0);
+      sweepGrad.addColorStop(0, 'transparent');
+      sweepGrad.addColorStop(1, accent);
+      ctx.globalAlpha = 0.5;
+      ctx.beginPath();
+      ctx.moveTo(0,0);
+      ctx.arc(0,0,R,-0.28,0);
+      ctx.closePath();
+      ctx.fillStyle = sweepGrad;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.restore();
+
+      blips.forEach(function(b){
+        var bx = cx + Math.cos(b.angle)*b.radius;
+        var by = cy + Math.sin(b.angle)*b.radius;
+        var diff = Math.cos(sweep - b.angle);
+        var lit = Math.max(0, diff);
+        ctx.beginPath();
+        ctx.arc(bx,by, 3.2, 0, Math.PI*2);
+        ctx.fillStyle = accent;
+        ctx.globalAlpha = 0.25 + lit*0.75;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      });
+
+      if (!reduceMotion) { sweep += 0.012; }
+      requestAnimationFrame(draw);
+    }
+    draw();
+  }
+
+  /* ---------------- registration: real backend ----------------
+     Talks to the registration API over plain fetch(). Local dev defaults
+     to the local API; edit the else-branch URL to the real deployed API
+     origin before going live. */
+  var API_BASE = (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
+    ? 'http://127.0.0.1:8001'
+    : 'https://api.aethra-sec.example'; // TODO: set to the real deployed API origin
+  var pageLoadedAt = Date.now();
+
+  function refreshCount(){
+    fetch(API_BASE + '/count')
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        var el = document.getElementById('reg-count');
+        if (el) { el.textContent = d.count; }
+      })
+      .catch(function(){ /* leave the last-rendered value on a transient failure */ });
+  }
+  refreshCount();
+
+  function alreadyCountedHere(){
+    try { return localStorage.getItem('aethra-counted-in') === '1'; }
+    catch (e) { return false; }
+  }
+  function markCountedHere(){
+    try { localStorage.setItem('aethra-counted-in', '1'); } catch (e) { /* per-viewer convenience only */ }
+  }
+
+  function attachFormHandler(){
+    var form = document.getElementById('reg-form');
+    if (!form) return;
+    var statusEl = document.getElementById('reg-status');
+    var submitEl = document.getElementById('reg-submit');
+
+    if (alreadyCountedHere()) {
+      submitEl.disabled = true;
+      statusEl.textContent = "You've already counted in from this browser.";
+      statusEl.className = 'reg-status ok';
+    }
+
+    form.addEventListener('submit', function(e){
+      e.preventDefault();
+      if (alreadyCountedHere()) { return; }
+
+      var name = document.getElementById('reg-name').value.trim();
+      var email = document.getElementById('reg-email').value.trim();
+      var company = document.getElementById('reg-company').value; // honeypot - left as typed, or empty
+
+      submitEl.disabled = true;
+      statusEl.textContent = 'Counting you in…';
+      statusEl.className = 'reg-status';
+
+      fetch(API_BASE + '/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: name,
+          email: email,
+          company: company,
+          loaded_at_ms: pageLoadedAt
+        })
+      })
+        .then(function(r){
+          if (r.status === 429) { throw { kind: 'rate' }; }
+          if (!r.ok) { throw { kind: 'other' }; }
+          return r.json();
+        })
+        .then(function(d){
+          var el = document.getElementById('reg-count');
+          if (el) { el.textContent = d.count; }
+          markCountedHere();
+          statusEl.textContent = "You're counted in.";
+          statusEl.className = 'reg-status ok';
+        })
+        .catch(function(err){
+          submitEl.disabled = false;
+          if (err && err.kind === 'rate') {
+            statusEl.textContent = 'Too many attempts - try again in a few minutes.';
+          } else {
+            statusEl.textContent = 'Could not save that just now — please try again.';
+          }
+          statusEl.className = 'reg-status err';
+        });
+    });
+  }
+  attachFormHandler();
+})();
+</script>
+</body>
+</html>
