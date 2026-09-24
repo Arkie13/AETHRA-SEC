@@ -13,14 +13,17 @@ There is no machine learning here and none is wanted (§87).
 
 from __future__ import annotations
 
+import ipaddress
+
 import threading
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Callable, Deque
 
 from aethra_sec.models.enums import EvidenceSource, Severity, ThreatCategory
 from aethra_sec.models.threat import DetectionRuleDefinition, TrafficAnomaly
+from aethra_sec.utils.timeutil import utcnow
 from aethra_sec.models.traffic import CapturedPacket
 from aethra_sec.utils.logging import get_logger
 
@@ -164,21 +167,150 @@ RULE_DEFINITIONS: tuple[DetectionRuleDefinition, ...] = (
 
 RULE_BY_ID: dict[str, DetectionRuleDefinition] = {r.rule_id: r for r in RULE_DEFINITIONS}
 
+#: The four flood rules whose severity the manuscript defines (§3.9.8).
+FLOOD_RULES: frozenset[str] = frozenset(
+    {RULE_ICMP_FLOOD, RULE_UDP_FLOOD, RULE_SYN_FLOOD, RULE_HTTP_FLOOD}
+)
+
+#: Manuscript §3.9.8 detection thresholds: 200 pps TCP SYN, 300 pps UDP,
+#: 120 pps ICMP and 600 HTTP requests per minute (10 per second).
+MANUSCRIPT_THRESHOLDS: dict[str, int] = {
+    "detection.tcp_syn_per_second": 200,
+    "detection.udp_packets_per_second": 300,
+    "detection.icmp_packets_per_second": 120,
+    "detection.http_requests_per_second": 10,
+}
+
+#: Manuscript §3.9.8 severity bands on the observed sustained rate:
+#: Low 100-500 pps, Medium 501-1,000 pps, High above 1,000 pps.
+FLOOD_BAND_LOW_FLOOR = 100.0
+FLOOD_BAND_MEDIUM_FLOOR = 500.0
+FLOOD_BAND_HIGH_FLOOR = 1000.0
+
+
+@dataclass(frozen=True)
+class FloodBand:
+    """One §3.9.8 severity band: its range, and what the manuscript calls it.
+
+    This is the single place the bands are written down. The classifier below
+    and every screen that explains a severity read them from here, so a range
+    shown to an operator cannot drift from the range actually applied.
+
+    ``min_pps`` and ``max_pps`` are the manuscript's integer bounds, for
+    display. The classification itself compares the measured rate against the
+    floors above, which is where a fractional rate such as 500.4 is decided.
+    """
+
+    severity: Severity
+    label: str
+    range_text: str
+    description: str
+    min_pps: int
+    max_pps: int | None
+
+    def summary(self) -> str:
+        """One line, as an anomaly's evidence records it."""
+        return f"{self.label.title()} ({self.range_text}, manuscript §3.9.8)"
+
+    def explain(self) -> str:
+        """The tooltip text: what the band is, and what it means."""
+        return (
+            f"{self.label} SEVERITY\n\n"
+            f"Threshold:\n{self.threshold_text}\n\n"
+            f"Criteria:\n{self.description}"
+        )
+
+    @property
+    def threshold_text(self) -> str:
+        """The range as prose, e.g. "Greater than 1,000 pps"."""
+        if self.max_pps is None:
+            return f"Greater than {self.min_pps - 1:,} pps"
+        return f"{self.min_pps:,} to {self.max_pps:,} pps"
+
+
+#: The §3.9.8 bands, highest first. Wording is the manuscript's.
+FLOOD_BANDS: tuple[FloodBand, ...] = (
+    FloodBand(
+        severity=Severity.HIGH, label="HIGH", range_text="> 1,000 pps",
+        description=(
+            "High-volume flooding consistent with a denial-of-service "
+            "condition."
+        ),
+        min_pps=1001, max_pps=None,
+    ),
+    FloodBand(
+        severity=Severity.MEDIUM, label="MEDIUM", range_text="501-1,000 pps",
+        description="Sustained abnormal traffic consistent with an active flood.",
+        min_pps=501, max_pps=1000,
+    ),
+    FloodBand(
+        severity=Severity.LOW, label="LOW", range_text="100-500 pps",
+        description="Traffic above the normal baseline but of limited volume.",
+        min_pps=100, max_pps=500,
+    ),
+)
+
+
+def flood_band(severity: Severity) -> FloodBand | None:
+    """The §3.9.8 band for a severity, or ``None`` where the study defines none.
+
+    Only these three severities are study-defined. Anything else - a review
+    state, an application-scored severity - correctly gets ``None`` rather
+    than a band invented to fill the space.
+    """
+    for band in FLOOD_BANDS:
+        if band.severity is severity:
+            return band
+    return None
+
+
+def flood_severity(rate_per_second: float) -> tuple[Severity, str]:
+    """The §3.9.8 severity band for a detected flood's sustained rate.
+
+    Returns:
+        ``(severity, band description)``. A detection below the manuscript's
+        Low floor (possible only when an administrator lowers a threshold
+        beneath 100 pps) is still reported LOW - the lowest band - and the
+        description says it fell below the band rather than pretending it
+        was inside it.
+    """
+    # The band descriptions come from FLOOD_BANDS so that the text an operator
+    # reads and the comparison actually applied cannot drift apart.
+    if rate_per_second > FLOOD_BAND_HIGH_FLOOR:
+        return Severity.HIGH, FLOOD_BANDS[0].summary()
+    if rate_per_second > FLOOD_BAND_MEDIUM_FLOOR:
+        return Severity.MEDIUM, FLOOD_BANDS[1].summary()
+    if rate_per_second >= FLOOD_BAND_LOW_FLOOR:
+        return Severity.LOW, FLOOD_BANDS[2].summary()
+    return Severity.LOW, (
+        f"Low - {rate_per_second:.1f} pps is below the manuscript's 100 pps "
+        "Low floor (§3.9.8); reported at the lowest band"
+    )
+
 
 @dataclass
 class DetectionThresholds:
-    """Threshold values read from the settings service."""
+    """Threshold values read from the settings service.
+
+    The flood defaults are the manuscript's §3.9.8 thresholds.
+    """
 
     enabled: bool = True
-    icmp_per_second: int = 50
+    icmp_per_second: int = 120
     udp_per_second: int = 300
-    syn_per_second: int = 100
+    syn_per_second: int = 200
     syn_unanswered_ratio: float = 0.8
-    http_per_second: int = 80
+    #: 10 requests per second is the manuscript's 600 requests per minute.
+    http_per_second: int = 10
     port_scan_ports: int = 20
     port_scan_window: int = 10
     host_sweep_hosts: int = 15
     host_sweep_window: int = 10
+    #: Share of the contacted addresses that must fall inside one /24 before
+    #: the pattern counts as a sweep. A sweep walks a range; a browser reaches
+    #: scattered public addresses. Configurable so a site whose traffic looks
+    #: different can tune it rather than live with the wrong answer.
+    host_sweep_concentration: float = 0.75
     rate_window: int = 5
     suppression_window: int = 120
 
@@ -256,6 +388,10 @@ class AnomalyRuleEngine:
         self._scan_ports: dict[tuple[str, str], _SlidingSet] = defaultdict(_SlidingSet)
         self._sweep_hosts: dict[str, _SlidingSet] = defaultdict(_SlidingSet)
         self._last_fired: dict[str, float] = {}
+        #: Highest severity rank reported per marker inside its window.
+        self._last_rank: dict[str, int] = {}
+        #: Markers whose latest firing was a band escalation.
+        self._escalated: set[str] = set()
         self._evaluations = 0
         self._fired = 0
 
@@ -290,6 +426,8 @@ class AnomalyRuleEngine:
             self._scan_ports.clear()
             self._sweep_hosts.clear()
             self._last_fired.clear()
+            self._last_rank.clear()
+            self._escalated.clear()
 
     # ------------------------------------------------------------------
     # Evaluation
@@ -375,8 +513,11 @@ class AnomalyRuleEngine:
         rate = count / float(window)
         if rate < thresholds.icmp_per_second:
             return None
-        if not self._should_fire(f"{RULE_ICMP_FLOOD}|{source}", timestamp, thresholds):
+        severity, band = flood_severity(rate)
+        marker = f"{RULE_ICMP_FLOOD}|{source}"
+        if not self._should_fire(marker, timestamp, thresholds, severity):
             return None
+        band += self._escalation_note(marker)
         return self._build(
             RULE_ICMP_FLOOD,
             packet,
@@ -385,10 +526,12 @@ class AnomalyRuleEngine:
             observed=rate,
             threshold=float(thresholds.icmp_per_second),
             window=window,
+            severity=severity,
             observation=(
                 f"{source} sent {count} ICMP packet(s) in {window} second(s) "
                 f"({rate:.1f} packets/second), which is at or above the "
-                f"configured threshold of {thresholds.icmp_per_second} per second."
+                f"configured threshold of {thresholds.icmp_per_second} per second. "
+                f"Severity band: {band}."
             ),
             evidence={
                 "icmp_packets_in_window": count,
@@ -396,6 +539,7 @@ class AnomalyRuleEngine:
                 "observed_rate_pps": round(rate, 2),
                 "threshold_pps": thresholds.icmp_per_second,
                 "most_recent_destination": destination,
+                "severity_band": band,
             },
         )
 
@@ -415,8 +559,10 @@ class AnomalyRuleEngine:
         if rate < thresholds.udp_per_second:
             return None
         marker = f"{RULE_UDP_FLOOD}|{source}|{destination}|{packet.dst_port}"
-        if not self._should_fire(marker, timestamp, thresholds):
+        severity, band = flood_severity(rate)
+        if not self._should_fire(marker, timestamp, thresholds, severity):
             return None
+        band += self._escalation_note(marker)
         return self._build(
             RULE_UDP_FLOOD,
             packet,
@@ -425,11 +571,13 @@ class AnomalyRuleEngine:
             observed=rate,
             threshold=float(thresholds.udp_per_second),
             window=window,
+            severity=severity,
             observation=(
                 f"{source} sent {count} UDP packet(s) to "
                 f"{destination}:{packet.dst_port} in {window} second(s) "
                 f"({rate:.1f} packets/second), at or above the configured "
-                f"threshold of {thresholds.udp_per_second} per second."
+                f"threshold of {thresholds.udp_per_second} per second. "
+                f"Severity band: {band}."
             ),
             evidence={
                 "udp_packets_in_window": count,
@@ -437,6 +585,7 @@ class AnomalyRuleEngine:
                 "observed_rate_pps": round(rate, 2),
                 "threshold_pps": thresholds.udp_per_second,
                 "destination_port": packet.dst_port,
+                "severity_band": band,
             },
         )
 
@@ -461,8 +610,11 @@ class AnomalyRuleEngine:
             # Connections are completing, so this is high traffic rather than a
             # flood indicator. Saying so is the honest outcome.
             return None
-        if not self._should_fire(f"{RULE_SYN_FLOOD}|{source}", timestamp, thresholds):
+        severity, band = flood_severity(rate)
+        marker = f"{RULE_SYN_FLOOD}|{source}"
+        if not self._should_fire(marker, timestamp, thresholds, severity):
             return None
+        band += self._escalation_note(marker)
         return self._build(
             RULE_SYN_FLOOD,
             packet,
@@ -471,14 +623,14 @@ class AnomalyRuleEngine:
             observed=rate,
             threshold=float(thresholds.syn_per_second),
             window=window,
-            severity=Severity.HIGH,
+            severity=severity,
             observation=(
                 f"{source} sent {syn_count} TCP SYN packet(s) in {window} "
                 f"second(s) ({rate:.1f}/second, threshold "
                 f"{thresholds.syn_per_second}/second) while only {answered} "
                 f"SYN/ACK reply packet(s) were observed - "
                 f"{unanswered_ratio * 100:.0f}% of connection attempts were "
-                "not seen to complete."
+                f"not seen to complete. Severity band: {band}."
             ),
             evidence={
                 "syn_packets_in_window": syn_count,
@@ -488,6 +640,7 @@ class AnomalyRuleEngine:
                 "window_seconds": window,
                 "observed_rate_pps": round(rate, 2),
                 "threshold_pps": thresholds.syn_per_second,
+                "severity_band": band,
             },
         )
 
@@ -499,14 +652,26 @@ class AnomalyRuleEngine:
         timestamp: float,
         thresholds: DetectionThresholds,
     ) -> TrafficAnomaly | None:
-        """High rate of decoded HTTP traffic from one source."""
+        """High rate of HTTP requests from one source.
+
+        The manuscript's threshold is in requests (§3.9.8: 600 per minute), so
+        a decoded HTTP *response* - one carrying a status code and no method -
+        is not counted. Where the decoder supplied neither field the packet
+        cannot be told apart and is counted, which can only make the rule more
+        sensitive, never hide a flood.
+        """
+        if packet.http_status is not None and not packet.http_method:
+            return None
         window = thresholds.rate_window
         count = self._http[source].add(timestamp, window)
         rate = count / float(window)
         if rate < thresholds.http_per_second:
             return None
-        if not self._should_fire(f"{RULE_HTTP_FLOOD}|{source}", timestamp, thresholds):
+        severity, band = flood_severity(rate)
+        marker = f"{RULE_HTTP_FLOOD}|{source}"
+        if not self._should_fire(marker, timestamp, thresholds, severity):
             return None
+        band += self._escalation_note(marker)
         return self._build(
             RULE_HTTP_FLOOD,
             packet,
@@ -515,18 +680,24 @@ class AnomalyRuleEngine:
             observed=rate,
             threshold=float(thresholds.http_per_second),
             window=window,
+            severity=severity,
             observation=(
-                f"{source} generated {count} decoded HTTP packet(s) in "
-                f"{window} second(s) ({rate:.1f}/second), at or above the "
-                f"configured threshold of {thresholds.http_per_second}/second."
+                f"{source} sent {count} HTTP request(s) in {window} second(s) "
+                f"({rate:.1f}/second, {rate * 60:.0f}/minute), at or above the "
+                f"configured threshold of {thresholds.http_per_second}/second "
+                f"({thresholds.http_per_second * 60}/minute). "
+                f"Severity band: {band}."
             ),
             evidence={
-                "http_packets_in_window": count,
+                "http_requests_in_window": count,
                 "window_seconds": window,
                 "observed_rate_pps": round(rate, 2),
+                "observed_requests_per_minute": round(rate * 60, 1),
                 "threshold_pps": thresholds.http_per_second,
+                "threshold_requests_per_minute": thresholds.http_per_second * 60,
                 "destination": destination,
                 "destination_port": packet.dst_port,
+                "severity_band": band,
             },
         )
 
@@ -570,6 +741,60 @@ class AnomalyRuleEngine:
             },
         )
 
+    @staticmethod
+    def _is_probeable_host(destination: str) -> bool:
+        """True when ``destination`` is an address a host could actually hold.
+
+        Broadcast, multicast and unspecified addresses are not hosts that were
+        contacted, and ARP and discovery protocols name them constantly, so
+        counting them turned routine chatter into a sweep.
+        """
+        value = (destination or "").strip().lower()
+        if not value:
+            return False
+        if value in {"ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00", "255.255.255.255"}:
+            return False
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError:
+            # A MAC that is not the broadcast address still names one device.
+            return True
+        return not (
+            address.is_multicast
+            or address.is_unspecified
+            or address.is_reserved
+            or address.is_loopback
+        )
+
+    @staticmethod
+    def _range_concentration(hosts: list[str]) -> tuple[float, str]:
+        """How tightly the contacted addresses cluster in one /24.
+
+        A sweep walks a range, so most of its destinations share a prefix.
+        Ordinary outbound traffic reaches scattered addresses that do not.
+
+        Returns:
+            The largest share falling in a single /24, and that range's name.
+            Non-IP destinations (ARP by MAC) are treated as one range, because
+            they are by definition confined to the local segment.
+        """
+        if not hosts:
+            return 0.0, "-"
+        counts: dict[str, int] = {}
+        for host in hosts:
+            try:
+                address = ipaddress.ip_address(host)
+            except ValueError:
+                counts["local segment"] = counts.get("local segment", 0) + 1
+                continue
+            if address.version != 4:
+                counts["ipv6"] = counts.get("ipv6", 0) + 1
+                continue
+            prefix = str(ipaddress.ip_network(f"{host}/24", strict=False))
+            counts[prefix] = counts.get(prefix, 0) + 1
+        subnet, top = max(counts.items(), key=lambda item: item[1])
+        return top / len(hosts), subnet
+
     def _check_host_sweep(
         self,
         packet: CapturedPacket,
@@ -577,16 +802,39 @@ class AnomalyRuleEngine:
         timestamp: float,
         thresholds: DetectionThresholds,
     ) -> TrafficAnomaly | None:
-        """Many distinct destination hosts contacted in a short window."""
+        """One source probing many addresses across a local range.
+
+        Counting distinct destinations alone is not evidence of a sweep. A
+        browser opening one page contacts well over the threshold of distinct
+        addresses in a few seconds, which is why this machine was repeatedly
+        reported as sweeping its own network. Two further conditions separate
+        discovery from ordinary use, and both are recorded as evidence:
+
+        * The destination must be a real host. Broadcast, multicast and
+          unspecified addresses are not hosts contacted, and ARP asks about
+          them constantly.
+        * The addresses must sit in one local range. A sweep walks a subnet;
+          a browser reaches scattered public addresses that share no prefix.
+
+        Both are configurable, and an incident is not raised when the evidence
+        does not meet them.
+        """
         window = thresholds.host_sweep_window
         destination = packet.dst_ip or packet.dst_mac
+        if not self._is_probeable_host(destination):
+            return None
         tracker = self._sweep_hosts[source]
         distinct = tracker.add(timestamp, destination, window)
         if distinct < thresholds.host_sweep_hosts:
             return None
+
+        hosts = sorted(str(h) for h in tracker.distinct(timestamp, window))
+        concentration, subnet = self._range_concentration(hosts)
+        if concentration < thresholds.host_sweep_concentration:
+            # Many destinations, but scattered - ordinary outbound traffic.
+            return None
         if not self._should_fire(f"{RULE_HOST_SWEEP}|{source}", timestamp, thresholds):
             return None
-        hosts = sorted(str(h) for h in tracker.distinct(timestamp, window))
         return self._build(
             RULE_HOST_SWEEP,
             packet,
@@ -598,13 +846,18 @@ class AnomalyRuleEngine:
             observation=(
                 f"{source} contacted {distinct} distinct destination host(s) "
                 f"within {window} second(s), at or above the configured "
-                f"threshold of {thresholds.host_sweep_hosts} hosts."
+                f"threshold of {thresholds.host_sweep_hosts} hosts, with "
+                f"{concentration:.0%} of them inside {subnet} - a range being "
+                "walked rather than scattered outbound traffic."
             ),
             evidence={
                 "distinct_hosts": distinct,
                 "threshold_hosts": thresholds.host_sweep_hosts,
                 "window_seconds": window,
                 "hosts_sample": hosts[:40],
+                "target_range": subnet,
+                "range_concentration": round(concentration, 3),
+                "threshold_concentration": thresholds.host_sweep_concentration,
             },
         )
 
@@ -612,14 +865,42 @@ class AnomalyRuleEngine:
     # Helpers
     # ------------------------------------------------------------------
     def _should_fire(
-        self, marker: str, timestamp: float, thresholds: DetectionThresholds
+        self,
+        marker: str,
+        timestamp: float,
+        thresholds: DetectionThresholds,
+        severity: Severity | None = None,
     ) -> bool:
-        """Suppression window: avoid re-raising the same finding constantly."""
+        """Suppression window: avoid re-raising the same finding constantly.
+
+        With a ``severity``, a flood already reported inside the window is
+        reported again when - and only when - its measured rate has entered a
+        higher §3.9.8 band. Detection fires the moment the sliding rate first
+        crosses the threshold, which is necessarily near the threshold; without
+        this, a flood that went on to 1,400 pps stayed recorded at the band of
+        its first second.
+        """
         previous = self._last_fired.get(marker)
+        rank = severity.rank if severity is not None else -1
         if previous is not None and (timestamp - previous) < thresholds.suppression_window:
-            return False
+            if severity is None or rank <= self._last_rank.get(marker, -1):
+                return False
+            self._escalated.add(marker)
+        else:
+            self._escalated.discard(marker)
         self._last_fired[marker] = timestamp
+        if severity is not None:
+            self._last_rank[marker] = rank
         return True
+
+    def _escalation_note(self, marker: str) -> str:
+        """Observation suffix for a band escalation, else empty."""
+        if marker in self._escalated:
+            return (
+                " Reported again because the sustained rate entered a higher "
+                "severity band than when this flood was first detected."
+            )
+        return ""
 
     def _build(
         self,
@@ -669,8 +950,19 @@ class AnomalyRuleEngine:
             observed_value=observed,
             threshold_value=threshold,
             window_seconds=window,
-            event_count=1,
-            first_seen=packet.captured_at,
+            # The window the rule actually counted over, not a single instant.
+            # Both bounds used to be the triggering packet's timestamp, which
+            # made the stored window a point: an analyst could read that 300
+            # packets had been counted but could not select those packets,
+            # because the two fields that should delimit them were equal. It
+            # also produced anomalies whose creation time preceded their own
+            # first_seen, since the packet clock and the system clock are not
+            # the same clock and the gap between them was all there was.
+            event_count=max(1, int(observed)),
+            # T2: taken here, where the threshold is actually crossed, and
+            # never derived from when the row is written.
+            detected_at=utcnow(),
+            first_seen=packet.captured_at - timedelta(seconds=window),
             last_seen=packet.captured_at,
             evidence=evidence,
             source=EvidenceSource.PYSHARK,
@@ -704,14 +996,17 @@ def thresholds_from_settings(get: Callable[[str, object], object]) -> DetectionT
 
     return DetectionThresholds(
         enabled=as_bool("detection.enabled", True),
-        icmp_per_second=as_int("detection.icmp_packets_per_second", 50),
+        icmp_per_second=as_int("detection.icmp_packets_per_second", 120),
         udp_per_second=as_int("detection.udp_packets_per_second", 300),
-        syn_per_second=as_int("detection.tcp_syn_per_second", 100),
+        syn_per_second=as_int("detection.tcp_syn_per_second", 200),
         syn_unanswered_ratio=as_float("detection.tcp_syn_unanswered_ratio", 0.8),
-        http_per_second=as_int("detection.http_requests_per_second", 80),
+        http_per_second=as_int("detection.http_requests_per_second", 10),
         port_scan_ports=as_int("detection.port_scan_distinct_ports", 20),
         port_scan_window=as_int("detection.port_scan_window_seconds", 10),
         host_sweep_hosts=as_int("detection.host_sweep_distinct_hosts", 15),
+        host_sweep_concentration=as_float(
+            "detection.host_sweep_range_concentration", 0.75
+        ),
         host_sweep_window=as_int("detection.host_sweep_window_seconds", 10),
         rate_window=as_int("detection.rate_window_seconds", 5),
         suppression_window=as_int("detection.suppression_window_seconds", 120),

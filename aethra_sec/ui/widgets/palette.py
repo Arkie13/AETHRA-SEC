@@ -221,7 +221,7 @@ class CommandPalette(ttk.Frame):
         """Describe what the list is currently showing."""
         if not commands and not records:
             if query and len(query) < MIN_SEARCH_LENGTH:
-                return "Keep typing to search hosts, incidents and alerts"
+                return "Keep typing to search hosts and alerts"
             return "Nothing matches that text"
         parts = [f"{commands} command(s)"]
         if records:

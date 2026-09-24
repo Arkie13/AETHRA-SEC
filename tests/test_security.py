@@ -454,3 +454,191 @@ class TestEventBus:
         bus = EventBus()
         bus.publish(EventType.NMAP_SCAN_COMPLETED, None)
         assert bus.statistics()["published"] == 1
+
+
+class TestLockoutIsNotAnEnumerationOracle:
+    """§60 - a refusal must not say more than the password did.
+
+    The per-account lockout was once checked before the password was verified,
+    so six wrong guesses against any name produced "This account is temporarily
+    locked" for a real account and "Invalid username or password" for an
+    invented one. That difference is a directory of valid operators, obtainable
+    with nothing but wrong passwords.
+
+    The rule that fixed it was "never refuse before verifying", and that is
+    the right rule for a refusal keyed on an *account*. The sign-in throttle
+    added later is keyed on the submitted *username string* instead, so it
+    accumulates identically for a name that does not exist - which is what
+    makes refusing early safe there. The tests below therefore pin the
+    property rather than the rule: whatever is raised before verification must
+    be reachable identically for an invented name, and that is checked by
+    running both.
+    """
+
+    def test_the_lock_is_checked_after_the_password(self) -> None:
+        import ast
+        from pathlib import Path
+
+        source = (
+            Path(__file__).resolve().parent.parent
+            / "aethra_sec"
+            / "security"
+            / "authentication.py"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        login = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "login"
+        )
+        body = ast.unparse(login)
+        verify_at = body.index("_passwords.verify")
+        lock_at = body.index("_is_locked")
+        assert lock_at > verify_at, (
+            "the lockout is disclosed before the password is checked, which "
+            "reveals whether an account exists"
+        )
+
+    def test_a_wrong_password_says_the_same_thing_either_way(self) -> None:
+        """The generic message must be the only credential-failure reply."""
+        import ast
+        from pathlib import Path
+
+        source = (
+            Path(__file__).resolve().parent.parent
+            / "aethra_sec"
+            / "security"
+            / "authentication.py"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        login = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "login"
+        )
+        # Drop the docstring first: it names the exceptions it is explaining,
+        # so scanning the rendered source would match the prose, not the code.
+        if (
+            login.body
+            and isinstance(login.body[0], ast.Expr)
+            and isinstance(login.body[0].value, ast.Constant)
+        ):
+            login.body = login.body[1:]
+        body = ast.unparse(login)
+        prelude = body[: body.index("_passwords.verify")]
+
+        # Account *state* must never be disclosed before the password is
+        # checked: whether an account is inactive is a fact about that account
+        # and nothing else, so revealing it identifies the account.
+        assert "AccountInactiveError" not in prelude, (
+            "AccountInactiveError is raised before the password is verified"
+        )
+
+        # The sign-in throttle is the one exception, and only because of how
+        # it is keyed. It counts failures against the *submitted username
+        # string*, so a name that does not exist accumulates and locks exactly
+        # as a real one does - the refusal is therefore not a fact about any
+        # account. That equivalence is what makes it safe, so it is asserted
+        # rather than assumed: the unknown-username branch must reach the same
+        # refusal, and the behavioural proof is below.
+        if "AccountLockedError" in prelude:
+            assert "_lockout_for" in prelude, (
+                "a lock is raised before the password is verified without the "
+                "identifier-keyed throttle that makes it safe"
+            )
+            assert "unknown_lock" in body, (
+                "an unknown username does not reach the same lock, so the "
+                "presence of a lock reveals that the account exists"
+            )
+
+    def test_an_unknown_username_locks_identically(self, clean_db) -> None:
+        """The behavioural proof, on equal histories.
+
+        Both names start with no recorded failures, so the only difference
+        between them is whether the account exists. Every reply must match,
+        byte for byte, through the lock and past it.
+        """
+        from aethra_sec.core.errors import AccountLockedError, AuthenticationError
+        from aethra_sec.core.session import SessionManager
+        from aethra_sec.database.repositories.audit import AuditRepository
+        from aethra_sec.database.repositories.users import UserRepository
+        from aethra_sec.security.audit import AuditService
+        from aethra_sec.security.authentication import AuthenticationService
+        from aethra_sec.security.lockout import FAILURES_BEFORE_LOCK
+        from aethra_sec.security.password import PasswordHashService
+
+        users = UserRepository(clean_db)
+        passwords = PasswordHashService(prefer_argon2=False)
+        service = AuthenticationService(
+            users, SessionManager(60), passwords,
+            AuditService(AuditRepository(clean_db)),
+        )
+        role = users.get_role_by_name("USER")
+        assert role and role.id
+        hashed = passwords.hash("CorrectHorse!2026")
+        users.create_user(
+            username="realuser", password_hash=hashed.hash,
+            password_algorithm=hashed.algorithm, role_id=role.id,
+            full_name="Real User",
+        )
+
+        def replies(name: str) -> list[str]:
+            out: list[str] = []
+            for _ in range(FAILURES_BEFORE_LOCK):
+                try:
+                    service.login(name, "WrongPassword!1")
+                except (AccountLockedError, AuthenticationError) as exc:
+                    out.append(exc.user_message)
+            return out
+
+        unknown = replies("definitely_not_a_user")
+        real = replies("realuser")
+        assert unknown == real, (
+            "a real username and an invented one answer differently, which is "
+            "a directory of valid operators obtainable with wrong passwords"
+        )
+        assert len(real) == FAILURES_BEFORE_LOCK
+
+    def test_a_correct_password_cannot_pass_an_active_lock(
+        self, clean_db
+    ) -> None:
+        """The lock is a refusal, not a warning."""
+        from aethra_sec.core.errors import AccountLockedError
+        from aethra_sec.core.session import SessionManager
+        from aethra_sec.database.repositories.audit import AuditRepository
+        from aethra_sec.database.repositories.users import UserRepository
+        from aethra_sec.security.audit import AuditService
+        from aethra_sec.security.authentication import AuthenticationService
+        from aethra_sec.security.lockout import FAILURES_BEFORE_LOCK
+        from aethra_sec.security.password import PasswordHashService
+
+        users = UserRepository(clean_db)
+        passwords = PasswordHashService(prefer_argon2=False)
+        service = AuthenticationService(
+            users, SessionManager(60), passwords,
+            AuditService(AuditRepository(clean_db)),
+        )
+        role = users.get_role_by_name("USER")
+        assert role and role.id
+        hashed = passwords.hash("CorrectHorse!2026")
+        users.create_user(
+            username="realuser", password_hash=hashed.hash,
+            password_algorithm=hashed.algorithm, role_id=role.id,
+            full_name="Real User",
+        )
+        for _ in range(FAILURES_BEFORE_LOCK):
+            with pytest.raises(Exception):
+                service.login("realuser", "WrongPassword!1")
+
+        locked, remaining = service.lockout_status("realuser")
+        assert locked and remaining > 0
+        with pytest.raises(AccountLockedError):
+            service.login("realuser", "CorrectHorse!2026")
+
+        # And a service built afresh - as after a restart - refuses too.
+        restarted = AuthenticationService(
+            UserRepository(clean_db), SessionManager(60), passwords,
+            AuditService(AuditRepository(clean_db)),
+        )
+        with pytest.raises(AccountLockedError):
+            restarted.login("realuser", "CorrectHorse!2026")

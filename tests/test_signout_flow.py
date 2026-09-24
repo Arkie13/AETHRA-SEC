@@ -71,9 +71,15 @@ class TestSignOutKeepsServicesUp:
         assert "self.root.destroy()" not in source
 
     def test_sign_out_stops_capture(self) -> None:
-        """A new operator must not inherit a running capture."""
+        """A new operator must not inherit a running capture.
+
+        Teardown has no session, so it uses the named internal path.
+        ``stop()`` itself now requires a session: it used to default one to
+        ``None`` and check the permission only when it was supplied, which
+        made authorization opt-in.
+        """
         teardown = inspect.getsource(app_module.MainWindow._teardown)
-        assert "capture.stop(" in teardown
+        assert "capture.stop_for_shutdown(" in teardown
 
     def test_quit_shuts_everything_down(self) -> None:
         """The window-close path still stops the services and the root."""
@@ -88,10 +94,15 @@ class TestSignOutKeepsServicesUp:
         from aethra_sec.core.application import ApplicationContext
 
         source = inspect.getsource(ApplicationContext.sign_out)
-        assert "self.current_session = None" in source
+        # Clears the session - now through set_session(None), which also detaches
+        # the automatic-assessment queue so it stops attributing scans to a
+        # session that no longer exists.
+        assert "self.set_session(None)" in source
+        set_session = inspect.getsource(ApplicationContext.set_session)
+        assert "self.current_session = session" in set_session
         # sign_out must not stop the subsystems - that is shutdown()'s job.
         assert "_started" not in source
-        assert "shutdown" not in source
+        assert "self.shutdown(" not in source
 
 
 class TestDesktopLoop:

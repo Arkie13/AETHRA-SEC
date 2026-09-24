@@ -8,8 +8,8 @@ is pinned is behaviour a user would notice the loss of:
 * a hint may be dropped to save the data beside it, but data never is;
 * a critical row is findable by its band, and the band is not overwritten by
   the zebra stripe underneath it;
-* the dashboard is divided into the four zones an operator reads in order, and
-  the header carries a real search field.
+* the dashboard separates what happened during the reporting period from
+  where things stand now, and the header carries a real search field.
 
 The widgets need a display, so the layout arithmetic is exercised directly and
 the structural facts are read from the source, as the other UI suites do.
@@ -24,10 +24,10 @@ from aethra_sec.ui import app as app_module
 from aethra_sec.ui.screens import alerts as alerts_module
 from aethra_sec.ui.screens import dashboard as dashboard_module
 from aethra_sec.ui.screens import hosts as hosts_module
-from aethra_sec.ui.screens import incidents as incidents_module
 from aethra_sec.ui.screens import logs as logs_module
 from aethra_sec.ui.screens import vulnerabilities as vulnerabilities_module
 from aethra_sec.ui.theme import PALETTE
+from aethra_sec.ui import theme as theme_module
 from aethra_sec.ui.widgets import cards as cards_module
 from aethra_sec.ui.widgets import tables as tables_module
 from aethra_sec.ui.widgets.cards import (
@@ -42,7 +42,6 @@ from aethra_sec.ui.widgets.cards import (
 FILTERED_SCREENS = (
     alerts_module,
     hosts_module,
-    incidents_module,
     logs_module,
     vulnerabilities_module,
 )
@@ -236,19 +235,31 @@ def _luminance(colour: str) -> int:
 class TestDashboardZones:
     """The dashboard is read in a fixed order, so it is built in one."""
 
-    def test_the_four_zones_are_titled_and_ordered(self) -> None:
-        """Posture, then live traffic, then events, then the subsystems."""
-        source = inspect.getsource(dashboard_module.DashboardScreen.build)
+    def test_the_zones_are_titled_and_ordered(self) -> None:
+        """Period activity, then current state, then live traffic, then
+        events, then the subsystems.
+
+        "SECURITY OVERVIEW" was one band mixing period figures with
+        current-state ones. Packets-today and open-findings look identical in
+        a row of tiles but behave oppositely at midnight, so they are now two
+        zones and the first two headings come from ``_build_stat_row``.
+        """
+        build = inspect.getsource(dashboard_module.DashboardScreen.build)
+        strip = inspect.getsource(dashboard_module.DashboardScreen._build_stat_row)
+        assert strip.index('"PERIOD ACTIVITY"') < strip.index(
+            '"CURRENT SECURITY STATE"'
+        )
+        assert "_build_stat_row" in build
         positions = [
-            source.index(title)
+            build.index(title)
             for title in (
-                '"SECURITY OVERVIEW"',
                 '"LIVE MONITORING"',
                 '"SECURITY EVENTS"',
                 '"SYSTEM STATUS"',
             )
         ]
         assert positions == sorted(positions)
+        assert build.index("_build_stat_row") < positions[0]
 
     def test_every_status_tile_reports_a_real_probe(self) -> None:
         """The zone note says so, and the screen must not make it a lie."""
@@ -279,17 +290,23 @@ class TestConsoleHeader:
 class TestPanels:
     """Every panel is findable by its own edge."""
 
-    def test_a_card_is_a_rounded_surface_not_a_bordered_box(self) -> None:
-        """ttk cannot draw a radius, so the panel is drawn rather than styled.
+    def test_a_section_draws_no_box_around_its_content(self) -> None:
+        """A section is a label and a rule, not a filled outlined rectangle.
 
-        This once asserted the hairline-bordered ttk.Frame. That box was the
-        thing that made every restyling read as the same interface, so what is
-        pinned now is that a card paints itself.
+        This previously asserted the opposite - that a card painted a rounded,
+        filled surface. That box, repeated around every group on every screen,
+        was the thing that made the console read as a stack of rectangles, and
+        it is what the redesign removes. What is pinned now is the absence:
+        a section paints a hairline under its own header and nothing else.
         """
         assert issubclass(cards_module.Card, tk.Canvas)
         source = inspect.getsource(cards_module.Card._redraw)
-        assert "rounded_rectangle(" in source
-        assert "CardTitle.TLabel" in inspect.getsource(cards_module.Card.__init__)
+        assert "rounded_rectangle(" not in source, "a section must not fill a box"
+        assert "create_line(" in source, "a section is separated by a rule"
+        init = inspect.getsource(cards_module.Card.__init__)
+        assert "CardTitle.TLabel" in init
+        # The section's own frame takes the page colour rather than a fill.
+        assert "self._fill = self._page" in init
 
     def test_a_cards_children_are_moved_into_its_padded_body(self) -> None:
         """Otherwise they would sit on the rounded corners, unpadded.
@@ -310,5 +327,21 @@ class TestPanels:
     def test_a_stat_tile_carries_its_severity_on_its_edge(self) -> None:
         """Colour on the number alone is lost at a glance across a row."""
         source = inspect.getsource(cards_module.StatCard.__init__)
-        assert 'style="Panel.TFrame"' in source
+        # A tile is one of the few things that IS an object, so unlike a
+        # section it keeps a surface fill - Tile.* rather than the page.
+        assert 'style="Tile.TFrame"' in source
         assert 'self._bar.pack(side="left", fill="y")' in source
+
+    def test_a_tile_keeps_a_fill_while_a_section_does_not(self) -> None:
+        """The one distinction the whole visual language rests on.
+
+        Sections group and therefore recede; tiles are objects and therefore
+        read as surfaces. If both took the same background the screen would
+        flatten into an undifferentiated field.
+        """
+        from aethra_sec.ui.theme import PALETTE
+
+        assert PALETTE.surface != PALETTE.background
+        theme_source = inspect.getsource(theme_module.apply_theme)
+        assert 'style.configure("Card.TFrame", background=p.background' in theme_source
+        assert 'style.configure("Tile.TFrame", background=p.surface' in theme_source

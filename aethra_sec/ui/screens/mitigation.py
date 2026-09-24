@@ -12,16 +12,19 @@ from tkinter import ttk
 from typing import Any
 
 from aethra_sec.models.enums import EvidenceSource, Severity, ThreatCategory
+from aethra_sec.models.scope import scope_of
 from aethra_sec.models.mitigation import MitigationRecommendation
 from aethra_sec.ui.base import Screen
-from aethra_sec.ui.theme import PALETTE, configure_text_widget
+from aethra_sec.ui.theme import METRICS, PALETTE, configure_text_widget
 from aethra_sec.ui.widgets import (
+    MitigationPanel,
+    FilterBar,
+    Workspace,
     Card,
     Column,
     DataTable,
     FormDialog,
     FormField,
-    ScrollableFrame,
     Toolbar,
     confirm,
     show_message,
@@ -30,8 +33,12 @@ from aethra_sec.utils.timeutil import format_local
 
 COLUMNS = (
     Column("code", "Code", width=170),
-    Column("threat", "Threat", width=250, stretch=True),
+    Column("threat", "Threat", width=250),
     Column("category", "Category", width=170),
+    # Which of these correspond to the study's tested attack scenarios, and
+    # which are guidance for other events the sensors genuinely observe. Both
+    # are real; conflating them would overstate the study's scope.
+    Column("scope", "Scope", width=150),
     Column("severity", "Severity", width=105, colour_by="severity", glyph=True),
     Column("service", "Service", width=100),
     Column("source", "Detection source", width=130),
@@ -51,72 +58,82 @@ class MitigationScreen(Screen):
         """Create the screen."""
         super().__init__(parent, app)
         self._entries: dict[int, MitigationRecommendation] = {}
+        #: Set by :meth:`set_focus_code` when another screen links here.
+        self._focus_code = ""
 
     # ------------------------------------------------------------------
     # Layout
     # ------------------------------------------------------------------
     def build(self) -> None:
-        """Construct the mitigation screen.
+        """A knowledge-base workspace: the entries beside the guidance.
 
-        Wrapped in a :class:`ScrollableFrame`, matching the Alerts screen:
-        the knowledge-base table and the recommendation detail are stacked,
-        each given real room, and the page scrolls to reach whichever one
-        does not fit - rather than a resizable split, whose divider a
-        `ttk.Panedwindow` (it has no `minsize` option at all, unlike the
-        classic `tk` one) cannot be stopped from landing, or being dragged,
-        somewhere too cramped to show a row.
+        This was two prose panels stacked above a *vertical* split whose lower
+        half - the guidance text - carried more weight than the list above it.
+        Fifteen real recommendations therefore rendered as roughly two visible
+        rows. The list now sits beside the guidance and takes the full height
+        of the workspace, so the whole knowledge base is on screen at once.
         """
-        scroller = ScrollableFrame(self)
-        scroller.pack(fill="both", expand=True)
-        root = scroller.interior
+        workspace = Workspace(self, share=0.46)
+        workspace.pack(fill="both", expand=True)
 
-        notice = Card(root, "How mitigation works here", fonts=self.fonts, padding=18)
-        notice.pack(fill="x")
-        ttk.Label(
-            notice,
-            text=(
-                "When a threat is detected, AETHRA-SEC selects the best-matching "
-                "entry below and binds it to the real evidence that triggered the "
-                "detection. It does not block addresses, change firewall rules, "
-                "stop services or lock accounts - the authorised operator reads "
-                "the guidance and decides."
-            ),
-            style="CardMuted.TLabel", wraplength=1000, justify="left",
-        ).pack(anchor="w")
-
-        controls = Card(root, "Search", fonts=self.fonts, padding=18)
-        controls.pack(fill="x", pady=(16, 0))
-        row = ttk.Frame(controls, style="Card.TFrame")
+        # Filters live on one line rather than inside a titled panel: they are
+        # controls, not a section of the page.
+        row = FilterBar(workspace.toolbar)
         row.pack(fill="x")
 
-        self._search_var = tk.StringVar()
-        ttk.Label(row, text="Search", style="CardMuted.TLabel").pack(side="left")
-        entry = ttk.Entry(row, textvariable=self._search_var, width=28)
-        entry.pack(side="left", padx=(8, 14))
-        entry.bind("<Return>", lambda _e: self.refresh())
-
+        # No search box here. The knowledge-base table carries its own, which
+        # filters live as you type; a second one that only applied on Enter or
+        # on an Apply button meant two controls doing the same job, and the
+        # slower one looked like the primary. These two narrow the query the
+        # table cannot: they change what is fetched, so each applies at once
+        # and there is nothing left for an Apply button to do.
         self._category_var = tk.StringVar(value="All")
         ttk.Label(row, text="Category", style="CardMuted.TLabel").pack(side="left")
-        ttk.Combobox(
-            row, textvariable=self._category_var, state="readonly", width=22,
+        categories = ttk.Combobox(
+            row, textvariable=self._category_var, state="readonly", width=20,
             values=["All", *[str(c) for c in ThreatCategory]],
-        ).pack(side="left", padx=(8, 14))
+        )
+        categories.pack(side="left", padx=(METRICS.space_sm, METRICS.space_md))
+        categories.bind("<<ComboboxSelected>>", lambda _e: self.refresh())
 
         self._active_only = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            row, text="Active only", variable=self._active_only, command=self.refresh
-        ).pack(side="left", padx=(0, 14))
-        ttk.Button(row, text="Apply", style="Accent.TButton", command=self.refresh).pack(
-            side="left"
+            row, text="Active only", variable=self._active_only,
+            command=self.refresh, style="Toolbar.TCheckbutton",
+        ).pack(side="left")
+
+        # The standing caveat is one muted line under the controls, not a
+        # titled panel: it never changes, so it should never take a panel's
+        # worth of the workspace.
+        disclaimer = ttk.Label(
+            workspace.context,
+            text=(
+                "Recommendation-only: AETHRA-SEC binds the best-matching entry "
+                "to the real evidence that triggered a detection. It never "
+                "blocks an address, changes a firewall rule, stops a service "
+                "or locks an account - the authorised operator decides."
+            ),
+            style="CardDim.TLabel", justify="left",
+        )
+        disclaimer.pack(anchor="w", fill="x")
+        # A fixed wraplength clips on any window narrower than the guess, so
+        # follow the real width of the row the label sits in.
+        workspace.context.bind(
+            "<Configure>",
+            lambda event: disclaimer.configure(wraplength=max(320, event.width - 8)),
+            add="+",
         )
 
-        card = Card(root, "Knowledge base", fonts=self.fonts, padding=18)
-        card.pack(fill="both", expand=True, pady=(16, 0))
+        # --- master: the whole knowledge base ---------------------------
+        listing = Card(
+            workspace.master_pane, "Knowledge base", fonts=self.fonts
+        )
+        listing.pack(fill="both", expand=True)
 
-        toolbar = Toolbar(card)
-        toolbar.pack(fill="x", pady=(0, 6))
+        toolbar = Toolbar(listing)
+        toolbar.pack(fill="x", pady=(0, METRICS.space_sm))
         can_manage = self.can("mitigation.manage")
-        toolbar.add_button("New recommendation", self._create, enabled=can_manage)
+        toolbar.add_button("New", self._create, enabled=can_manage)
         toolbar.add_button("Edit", self._edit, enabled=can_manage)
         toolbar.add_button("Activate", lambda: self._set_active(True), enabled=can_manage)
         toolbar.add_button(
@@ -126,19 +143,28 @@ class MitigationScreen(Screen):
             toolbar.add_label("Administrator access is required to edit entries.")
         self._count_label = toolbar.add_label("", side="right")
 
-        self._table = DataTable(card, COLUMNS, height=9, on_select=self._show_entry)
+        # `height` is a floor, not a cap: the table fills the pane, so the row
+        # count follows the window rather than this number.
+        self._table = DataTable(
+            workspace.master_pane, COLUMNS, height=14, on_select=self._show_entry,
+            on_activate=lambda _row: self._edit() if can_manage else None,
+            empty_text="No recommendations match these filters",
+        )
         self._table.pack(fill="both", expand=True)
 
-        detail_card = Card(root, "Recommendation", fonts=self.fonts, padding=18)
-        detail_card.pack(fill="both", expand=True, pady=(16, 0))
-        self._detail = tk.Text(detail_card, wrap="word")
-        configure_text_widget(self._detail, self.fonts)
-        scrollbar = ttk.Scrollbar(detail_card, orient="vertical", command=self._detail.yview)
-        self._detail.configure(yscrollcommand=scrollbar.set)
-        self._detail.insert("1.0", "Select a recommendation to read the full guidance.")
-        self._detail.configure(state="disabled")
-        self._detail.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        # --- detail: the selected recommendation ------------------------
+        self._detail_card = Card(
+            workspace.detail_pane, "Selected mitigation",
+            subtitle="select an entry", fonts=self.fonts,
+        )
+        self._detail_card.pack(fill="x")
+        # One scroll region for the whole recommendation, rather than a Text
+        # widget scrolling inside the pane that is already scrolling.
+        self._panel = MitigationPanel(
+            workspace.detail_pane, fonts=self.fonts,
+            on_copy=self._copy_to_clipboard,
+        )
+        self._panel.pack(fill="both", expand=True)
 
     # ------------------------------------------------------------------
     # Data
@@ -150,8 +176,6 @@ class MitigationScreen(Screen):
         if mitigation is None or session is None:
             return
         filters: dict[str, Any] = {}
-        if self._search_var.get().strip():
-            filters["text"] = self._search_var.get().strip()
         if self._category_var.get() != "All":
             filters["category"] = self._category_var.get()
         if self._active_only.get():
@@ -173,6 +197,7 @@ class MitigationScreen(Screen):
                     "code": entry.code,
                     "threat": entry.threat_name,
                     "category": entry.category.label,
+                    "scope": scope_of(entry.category).label,
                     "severity": str(entry.severity),
                     "service": entry.applies_to_service or "any",
                     "source": (
@@ -186,8 +211,50 @@ class MitigationScreen(Screen):
         )
         self._count_label.configure(text=f"{len(entries)} recommendation(s)")
         self.status(f"{len(entries)} mitigation recommendation(s) loaded.")
-        if entries:
+        if entries and not self._select_focused():
             self._table.select_first()
+
+    def set_focus_code(self, code: str) -> None:
+        """Open this screen on one existing entry, named by its stable code.
+
+        Used by "View in Mitigation" in the full alert view. It selects a
+        record that is already there; nothing is created by arriving here, and
+        the code is matched against the loaded rows rather than trusted, so an
+        entry that has since been removed leaves the screen on its normal
+        first row instead of on a blank panel.
+
+        The filters are cleared first: an entry hidden by the category or
+        active-only control would otherwise not be in the result set to select.
+        """
+        self._focus_code = str(code or "").strip()
+        if not self._focus_code:
+            return
+        self._category_var.set("All")
+        self._active_only.set(False)
+        if self._entries:
+            # Already loaded, so show it at once rather than after the reload.
+            # The code stays pending: navigate() calls this setter *before*
+            # on_show(), which always refreshes, and the reload would
+            # otherwise land on the first row and undo this selection.
+            self._select_focused(consume=False)
+
+    def _select_focused(self, *, consume: bool = True) -> bool:
+        """Select the row set by :meth:`set_focus_code`. True when it was found.
+
+        Args:
+            consume: clear the pending code, so a later refresh selects
+                normally. Left ``False`` for the eager selection made while a
+                reload is still on its way.
+        """
+        code = self._focus_code
+        if not code:
+            return False
+        if consume:
+            self._focus_code = ""
+        if self._table.select_where(lambda row: str(row.get("code", "")) == code):
+            self.status(f"Showing mitigation recommendation {code}.")
+            return True
+        return False
 
     def _selected(self) -> MitigationRecommendation | None:
         """The currently selected recommendation."""
@@ -197,54 +264,51 @@ class MitigationScreen(Screen):
         return self._entries.get(int(row.get("_id") or 0))
 
     def _show_entry(self, _row: dict[str, Any]) -> None:
-        """Render the selected recommendation in full (§30)."""
-        entry = self._selected()
-        self._detail.configure(state="normal")
-        self._detail.delete("1.0", "end")
-        if entry is None:
-            self._detail.insert("1.0", "Select a recommendation.")
-        else:
-            self._detail.insert(
-                "1.0",
-                "\n".join(
-                    [
-                        f"THREAT: {entry.threat_name}",
-                        f"CODE: {entry.code}    CATEGORY: {entry.category.label}    "
-                        f"SEVERITY: {entry.severity}",
-                        f"APPLIES TO SERVICE: {entry.applies_to_service or 'any service'}",
-                        f"DETECTION SOURCE: "
-                        f"{entry.detection_source.label if entry.detection_source else 'any source'}",
-                        f"STATUS: {entry.status_text}"
-                        + ("   (built-in entry)" if entry.is_builtin else ""),
-                        "",
-                        "EXPLANATION",
-                        entry.explanation or "-",
-                        "",
-                        "WHY IT MATTERS",
-                        entry.why_it_matters or "-",
-                        "",
-                        "IMMEDIATE RECOMMENDED ACTION",
-                        entry.immediate_action or "-",
-                        "",
-                        "LONG-TERM RECOMMENDED ACTION",
-                        entry.long_term_action or "-",
-                        "",
-                        "VERIFICATION STEPS",
-                        entry.verification_steps or "-",
-                        "",
-                        "REFERENCES",
-                        entry.references or "-",
-                        "",
-                        "NOTE: AETHRA-SEC recommends only. Apply changes through "
-                        "your normal change-control process.",
-                    ]
-                ),
-            )
-        self._detail.configure(state="disabled")
+        """Render the selected recommendation and its real evidence (§30).
 
-    # ------------------------------------------------------------------
-    # Management
-    # ------------------------------------------------------------------
+        The knowledge-base entry is already in memory, so the panel renders
+        immediately; the detections bound to it are fetched on a worker so a
+        selection never blocks the interface. Selecting a different entry
+        before the query returns simply discards the late result.
+        """
+        entry = self._selected()
+        if entry is None:
+            self._panel.show(None, [])
+            self._detail_card.set_subtitle("select an entry")
+            return
+
+        self._detail_card.set_subtitle(entry.code)
+        # Render the guidance now, with no evidence, then fill the evidence in
+        # when it arrives. The operator sees the actions immediately.
+        self._panel.show(entry, [])
+
+        mitigation = self.context.mitigation
+        session = self.session
+        if mitigation is None or session is None or entry.id is None:
+            return
+        wanted = entry.id
+
+        def work() -> list[Any]:
+            return mitigation.evidence_for(session, wanted)
+
+        def done(incidents: list[Any]) -> None:
+            current = self._selected()
+            # A slower query for an entry the operator has already moved on
+            # from must not overwrite what is now on screen.
+            if current is not None and current.id == wanted:
+                self._panel.show(current, incidents)
+
+        self.run_async(work, done, name="mitigation-evidence")
+
+    def _copy_to_clipboard(self, label: str, text: str) -> None:
+        """Put generated firewall text on the clipboard for review."""
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.status(f"{label} copied. AETHRA-SEC has not applied anything.")
+        except tk.TclError:  # pragma: no cover - no clipboard on this display
+            pass
+
     def _fields(
         self, entry: MitigationRecommendation | None = None
     ) -> list[FormField]:
@@ -385,7 +449,7 @@ class MitigationScreen(Screen):
             self, "Deactivate recommendation",
             f"Deactivate '{entry.code}'?",
             detail=(
-                "Deactivation is preferred over deletion: incidents that "
+                "Deactivation is preferred over deletion: detections that "
                 "already reference this entry keep their guidance, and new "
                 "detections stop using it."
             ),

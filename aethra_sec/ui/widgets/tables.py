@@ -20,6 +20,7 @@ from typing import Any, Callable, Iterable, Sequence
 from aethra_sec.ui.theme import (
     ICONS,
     PALETTE,
+    security_colour,
     severity_colour,
     severity_glyph,
     state_colour,
@@ -41,6 +42,13 @@ class Column:
     colour_by: str = ""  # "severity" | "state" | "status" | ""
     #: Prefix the cell with a severity shape, so severity is not colour-only.
     glyph: bool = False
+    #: Draw a truthy value as this compact mark instead of its own text.
+    #:
+    #: The *stored* value stays the word, which is what a copy, an export and
+    #: the quick filter see - so a CSV reads "UNREVIEWED" where the table
+    #: shows a dot, and typing the word still finds the rows. Only the on
+    #: screen cell is abbreviated.
+    marker: str = ""
 
 
 @dataclass(frozen=True)
@@ -70,6 +78,7 @@ class DataTable(ttk.Frame):
         actions: Sequence[RowAction] = (),
         show_footer: bool = True,
         show_toolbar: bool = True,
+        show_quick_filter: bool = True,
         empty_text: str = "No records to display",
     ) -> None:
         """Create the table.
@@ -82,6 +91,10 @@ class DataTable(ttk.Frame):
             actions: right-click menu entries for the row under the pointer.
             show_footer: draw the "showing X of Y" counter beneath the grid.
             show_toolbar: draw the quick filter and column picker above it.
+            show_quick_filter: draw the toolbar's own search box. A screen that
+                already owns a search turns this off and adds that search to
+                :attr:`toolbar` instead, so the page shows one search box on
+                one row rather than two boxes on two.
             empty_text: message shown in the footer when there are no rows.
         """
         super().__init__(parent, style="Card.TFrame")
@@ -99,6 +112,9 @@ class DataTable(ttk.Frame):
         self._filter_text = ""
         #: Text typed into the table's own filter box, ANDed with the screen's.
         self._quick_text = ""
+        #: row id -> the (values, tags) last drawn for it, so an incremental
+        #: reconcile can skip Tk entirely for a row that has not changed.
+        self._painted: dict[str, tuple[tuple, tuple]] = {}
         self._filter_predicate: Callable[[dict[str, Any]], bool] | None = None
         self._next_id = 0
         self._trimmed = 0
@@ -108,6 +124,10 @@ class DataTable(ttk.Frame):
         self._actions = list(actions)
         self._empty_text = empty_text
         self._hovered: str = ""
+        #: Rows the operator has marked. Held by row id rather than position,
+        #: so a mark survives sorting, filtering and later arrivals - the row
+        #: keeps its mark wherever it moves to.
+        self._marked: set[str] = set()
 
         keys = [c.key for c in self._columns]
         self.tree = ttk.Treeview(
@@ -135,30 +155,25 @@ class DataTable(ttk.Frame):
 
         vertical = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
         horizontal = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
+        self._vbar, self._hbar = vertical, horizontal
+        #: Scrollbar path -> whether it is currently gridded.
+        self._bars_shown: dict[str, bool] = {}
+        # A scrollbar that cannot scroll anything is clutter, and the
+        # horizontal one costs the grid a row of height it could be showing
+        # records in. Each hides itself when its whole range is visible.
+        #
+        # This cannot oscillate: the horizontal bar occupies height and
+        # appears on width overflow, the vertical one occupies width and
+        # appears on height overflow, so neither can cause the other's
+        # condition to flip back.
         self.tree.configure(
-            yscrollcommand=vertical.set, xscrollcommand=horizontal.set
+            yscrollcommand=lambda first, last: self._autohide(vertical, first, last),
+            xscrollcommand=lambda first, last: self._autohide(horizontal, first, last),
         )
-        self._horizontal = horizontal
-        #: `height` is the floor a table never shrinks below; grown upward as
-        #: the surrounding pane gets taller (`_on_resize`), since a
-        #: ``ttk.Treeview``'s row count is a fixed setting, not a share of
-        #: whatever pixel space its container happens to have.
-        self._min_rows = max(1, height)
-        self._configured_rows = height
-        #: Hard ceiling on dynamic growth (`_on_resize`). A table inside a
-        #: container with no height limit of its own - a `ScrollableFrame`'s
-        #: interior, which grows to fit its content by design - has no
-        #: natural stopping point: more rows makes the frame taller, which
-        #: this table then reads as more room, which asks for more rows
-        #: again, without end. This bound is what makes that converge
-        #: instead of pegging the CPU in a resize storm until the window
-        #: stops responding.
-        self._max_rows_dynamic = min(60, max(self._min_rows * 3, self._min_rows + 12))
-
         self._toolbar: ControlBar | None = None
         self._filter_var: tk.StringVar | None = None
         if show_toolbar:
-            self._build_toolbar()
+            self._build_toolbar(show_quick_filter)
 
         self.tree.grid(row=1, column=0, sticky="nsew")
         vertical.grid(row=1, column=1, sticky="ns")
@@ -187,6 +202,12 @@ class DataTable(ttk.Frame):
         # list has nothing to do with it. So these are declared in priority
         # order: the pointer beats severity, and severity beats the stripe.
         self.tree.tag_configure("hover", background=PALETTE.surface_hover)
+        # A marked row outranks its severity band: marking is the operator's
+        # own annotation, and it would be useless if a critical row could hide
+        # it. Only the pointer highlight, configured above, beats it.
+        self.tree.tag_configure(
+            "marked", background=PALETTE.accent_dim, foreground=PALETTE.text
+        )
         # The two severities that demand attention carry a tinted row band as
         # well as coloured text: on a long queue the band is what an analyst
         # navigates by, and a critical row is findable without reading a word.
@@ -212,7 +233,7 @@ class DataTable(ttk.Frame):
         self._menu = tk.Menu(self.tree, tearoff=0)
         self._menu.configure(
             background=PALETTE.surface_raised, foreground=PALETTE.text,
-            activebackground=PALETTE.accent_dim, activeforeground="#FFFFFF",
+            activebackground=PALETTE.accent_dim, activeforeground=PALETTE.text,
             borderwidth=0, relief="flat",
         )
         # ``tk_popup`` takes a pointer grab so the posted menu receives the
@@ -244,60 +265,27 @@ class DataTable(ttk.Frame):
         except tk.TclError:
             pass
 
-        # Grow the visible row count as the table gets more room (a
-        # maximised window, a dragged pane divider) instead of leaving the
-        # extra space blank below a handful of rows. Bound to this frame,
-        # not the tree itself, so reconfiguring the tree's row count - which
-        # does not change this frame's own allocated size - cannot re-fire
-        # the handler.
-        self.bind("<Configure>", self._on_resize, add="+")
-
-    def _on_resize(self, event: tk.Event) -> None:
-        """Recompute the tree's row count from this frame's new height.
-
-        A ``ttk.Treeview``'s ``height`` is a row count fixed at construction,
-        not a share of the space its container ends up with - stretching the
-        surrounding frame with ``fill``/``expand`` only adds blank margin
-        below the last row. This keeps the row count matched to the actual
-        space instead, floored at the table's originally requested height so
-        it never shrinks below what the screen was designed to show.
-        """
-        chrome = int(self._horizontal.winfo_reqheight())
-        if self._toolbar is not None:
-            chrome += self._toolbar.winfo_reqheight()
-        if self._footer is not None:
-            chrome += self._footer.winfo_reqheight()
-        # A container that sizes itself to its content rather than to a fixed
-        # viewport - a ScrollableFrame's interior, chiefly - has no ceiling of
-        # its own: more rows makes this frame taller, the interior grows to
-        # match, and that reads as still more room next time, without end.
-        # The one measurement that is never unbounded is the real window, so
-        # it is what actually limits growth; a plain bounded container's
-        # frame height is already <= this most of the time, so the clamp
-        # changes nothing there.
-        try:
-            ceiling = self.winfo_toplevel().winfo_height()
-        except tk.TclError:  # pragma: no cover - window closing
-            ceiling = event.height
-        height = min(event.height, ceiling) if ceiling > 1 else event.height
-        available = height - chrome
-        if available <= 0:
-            return
-        style_name = str(self.tree.cget("style")) or "Treeview"
-        row_height = ttk.Style().lookup(style_name, "rowheight")
-        try:
-            row_height = max(1, int(row_height))
-        except (TypeError, ValueError):
-            row_height = 20
-        rows = min(self._max_rows_dynamic, max(self._min_rows, available // row_height))
-        if rows != self._configured_rows:
-            self._configured_rows = rows
-            self.tree.configure(height=rows)
-
     # ------------------------------------------------------------------
     # Toolbar: quick filter and column visibility
     # ------------------------------------------------------------------
-    def _build_toolbar(self) -> None:
+    def _autohide(self, bar: ttk.Scrollbar, first: str, last: str) -> None:
+        """Show a scrollbar only while it has somewhere to scroll.
+
+        The shown/hidden state is tracked here rather than read back from the
+        widget: ``winfo_ismapped`` reports 0 for every child of a window that
+        is merely withdrawn, which would make this flap on a hidden page.
+        """
+        bar.set(first, last)
+        needed = not (float(first) <= 0.0 and float(last) >= 1.0)
+        if self._bars_shown.get(str(bar)) == needed:
+            return
+        self._bars_shown[str(bar)] = needed
+        if needed:
+            bar.grid()
+        else:
+            bar.grid_remove()  # keeps the cell, so nothing else shifts
+
+    def _build_toolbar(self, quick_filter: bool = True) -> None:
         """A filter box and a column picker above the grid.
 
         Both narrow what is *shown*; neither touches what is held. The counter
@@ -307,17 +295,18 @@ class DataTable(ttk.Frame):
         self._toolbar = ControlBar(self, padding=(0, 0, 0, 6))
         self._toolbar.grid(row=0, column=0, columnspan=2, sticky="ew")
 
-        glyph = ttk.Label(self._toolbar, text="⌕", style="CardDim.TLabel")
-        self._toolbar.add(glyph, side="left", padx=(2, 4))
-        self._filter_var = tk.StringVar()
-        entry = ttk.Entry(self._toolbar, textvariable=self._filter_var, width=24)
-        self._toolbar.add(entry, side="left")
-        self._filter_var.trace_add("write", lambda *_: self._apply_quick_filter())
-        entry.bind("<Escape>", self._clear_filter)
-        entry.bind("<Down>", lambda _event: (self.tree.focus_set(), "break")[1])
-        attach_tooltip(
-            entry, "Filter these rows as you type. Esc clears it."
-        )
+        if quick_filter:
+            glyph = ttk.Label(self._toolbar, text="⌕", style="CardDim.TLabel")
+            self._toolbar.add(glyph, side="left", padx=(2, 4))
+            self._filter_var = tk.StringVar()
+            entry = ttk.Entry(self._toolbar, textvariable=self._filter_var, width=24)
+            self._toolbar.add(entry, side="left")
+            self._filter_var.trace_add("write", lambda *_: self._apply_quick_filter())
+            entry.bind("<Escape>", self._clear_filter)
+            entry.bind("<Down>", lambda _event: (self.tree.focus_set(), "break")[1])
+            attach_tooltip(
+                entry, "Filter these rows as you type. Esc clears it."
+            )
 
         self._columns_button = ttk.Button(
             self._toolbar, text="Columns", style="Tool.TButton",
@@ -333,7 +322,7 @@ class DataTable(ttk.Frame):
         self._column_menu = tk.Menu(self, tearoff=0)
         self._column_menu.configure(
             background=PALETTE.surface_raised, foreground=PALETTE.text,
-            activebackground=PALETTE.accent_dim, activeforeground="#FFFFFF",
+            activebackground=PALETTE.accent_dim, activeforeground=PALETTE.text,
             borderwidth=0, relief="flat",
         )
         self._column_menu.bind("<Unmap>", self._release_column_grab, add="+")
@@ -425,6 +414,120 @@ class DataTable(ttk.Frame):
         self.clear()
         self.add_rows(rows)
 
+    def reconcile_rows(self, rows: Iterable[dict[str, Any]], *, key: str) -> bool:
+        """Update the table in place from ``rows``, matched on ``key``.
+
+        A periodically refreshed table must not be rebuilt from scratch. Every
+        ``set_rows`` deletes and re-inserts every item, which throws away the
+        scroll position and the selection: an operator scrolled halfway down
+        the host inventory was thrown back to the top each time the refresh
+        fired, which is what made the table feel impossible to scroll.
+
+        This patches only what changed - values on rows that differ, inserts
+        for new keys, deletes for keys that have gone - and leaves the view
+        where the operator put it.
+
+        Returns:
+            True when the in-place diff was applied. False when it fell back
+            to a full rebuild, which happens with an active sort or filter:
+            those make a row's position depend on its content, so there is no
+            stable position to patch.
+        """
+        incoming = [dict(row) for row in rows]
+        if (
+            self._sort_key
+            or self._filter_text
+            or self._quick_text
+            or self._filter_predicate is not None
+            or self._max_rows is not None
+        ):
+            self.set_rows(incoming)
+            return False
+
+        try:
+            first, _last = self.tree.yview()
+            selected_keys = {
+                str(self._rows[iid].get(key))
+                for iid in self.tree.selection()
+                if iid in self._rows
+            }
+        except tk.TclError:  # pragma: no cover - widget torn down
+            return False
+
+        existing: dict[str, str] = {}
+        for row_id in self._order:
+            row = self._rows.get(row_id)
+            if row is not None:
+                existing[str(row.get(key))] = row_id
+
+        order: list[str] = []
+        seen: set[str] = set()
+        for index, row in enumerate(incoming):
+            row_key = str(row.get(key))
+            seen.add(row_key)
+            row_id = existing.get(row_key)
+            stripe = "even" if index % 2 else "odd"
+            colour_tag = self._colour_tag(row)
+            tags = [colour_tag] if colour_tag else []
+            tags.append(stripe)
+            values = [self._cell(row, column) for column in self._columns]
+            painted = (tuple(values), tuple(tags))
+            if row_id is None:
+                self._next_id += 1
+                row_id = f"r{self._next_id}"
+                self._rows[row_id] = row
+                try:
+                    self.tree.insert(
+                        "", index, iid=row_id, values=values, tags=tuple(tags)
+                    )
+                except tk.TclError:  # pragma: no cover
+                    continue
+                self._painted[row_id] = painted
+            else:
+                self._rows[row_id] = row
+                # A refresh where nothing about this row changed costs no Tk
+                # call at all - the comparison is against what was last drawn,
+                # so a steady table is effectively free to "refresh".
+                if self._painted.get(row_id) != painted:
+                    try:
+                        self.tree.item(row_id, values=values, tags=tuple(tags))
+                    except tk.TclError:  # pragma: no cover
+                        continue
+                    self._painted[row_id] = painted
+                try:
+                    if self.tree.index(row_id) != index:
+                        self.tree.move(row_id, "", index)
+                except tk.TclError:  # pragma: no cover
+                    continue
+            order.append(row_id)
+
+        for row_key, row_id in existing.items():
+            if row_key in seen:
+                continue
+            self._rows.pop(row_id, None)
+            self._painted.pop(row_id, None)
+            self._marked.discard(row_id)
+            try:
+                if self.tree.exists(row_id):
+                    self.tree.delete(row_id)
+            except tk.TclError:  # pragma: no cover
+                pass
+
+        self._order = order
+        self._rendered = len(order)
+        restore = [
+            row_id for row_id in order
+            if str(self._rows[row_id].get(key)) in selected_keys
+        ]
+        try:
+            if restore:
+                self.tree.selection_set(restore)
+            self.tree.yview_moveto(first)
+        except tk.TclError:  # pragma: no cover
+            pass
+        self._update_counter(self.visible_count)
+        return True
+
     def add_rows(self, rows: Iterable[dict[str, Any]]) -> None:
         """Append rows, honouring the row cap.
 
@@ -486,6 +589,8 @@ class DataTable(ttk.Frame):
             colour_tag = self._colour_tag(row)
             tags = [colour_tag] if colour_tag else []
             tags.append("even" if index % 2 else "odd")
+            if row_id in self._marked:
+                tags.insert(0, "marked")
             try:
                 self.tree.insert("", "end", iid=row_id, values=values, tags=tuple(tags))
             except tk.TclError:  # pragma: no cover - duplicate id, widget gone
@@ -516,6 +621,9 @@ class DataTable(ttk.Frame):
         dropped = self._order[:excess]
         for row_id in dropped:
             self._rows.pop(row_id, None)
+            # A mark belongs to a row; once the row has left the view buffer
+            # the mark has nothing to refer to and must not accumulate.
+            self._marked.discard(row_id)
         self._order = self._order[excess:]
         self._trimmed += excess
         return dropped
@@ -524,10 +632,23 @@ class DataTable(ttk.Frame):
         """Remove every row."""
         self._rows.clear()
         self._order.clear()
+        self._painted.clear()
+        self._marked.clear()
         self._trimmed = 0
         self._rendered = 0
         for item in self.tree.get_children():
             self.tree.delete(item)
+
+    @property
+    def toolbar(self) -> ControlBar | None:
+        """The grid's own control row, for a screen to share.
+
+        A screen whose controls belong to this table adds them here rather
+        than packing a second row above it: the bar already reflows, and one
+        row of controls leaves the grid the height that two rows spend on
+        chrome. ``None`` when the table was built without a toolbar.
+        """
+        return self._toolbar
 
     @property
     def row_count(self) -> int:
@@ -652,6 +773,8 @@ class DataTable(ttk.Frame):
             colour_tag = self._colour_tag(row)
             tags = [colour_tag] if colour_tag else []
             tags.append("even" if index % 2 else "odd")
+            if row_id in self._marked:
+                tags.insert(0, "marked")
             self.tree.insert("", "end", iid=row_id, values=values, tags=tuple(tags))
 
         self._rendered = len(visible)
@@ -664,6 +787,16 @@ class DataTable(ttk.Frame):
                     pass
 
         self._update_counter(len(visible))
+
+    def set_empty_text(self, text: str) -> None:
+        """Change the message shown when the table holds no rows.
+
+        Live screens use this to say why the table is empty - waiting for the
+        first packet reads very differently from a capture that has stopped.
+        """
+        self._empty_text = text
+        if not self._order:
+            self._update_counter(0)
 
     def _update_counter(self, visible: int) -> None:
         """Report how many records are shown out of how many are held."""
@@ -701,10 +834,19 @@ class DataTable(ttk.Frame):
         self._hint.configure(text="  ·  ".join(parts))
 
     @staticmethod
-    def _cell(row: dict[str, Any], column: Column) -> str:
-        """Render one cell."""
+    def _cell(row: dict[str, Any], column: Column, *, display: bool = True) -> str:
+        """Render one cell.
+
+        Args:
+            display: False renders the value as it should be *read* rather
+                than as it is drawn, which is what a copy or an export wants:
+                a marker column then yields its stored word instead of the
+                glyph that stands in for it on screen.
+        """
         value = row.get(column.key, "")
         text = "" if value is None else str(value)
+        if column.marker and display:
+            return column.marker if text else ""
         if column.glyph and text:
             glyph = severity_glyph(text)
             if glyph:
@@ -721,7 +863,13 @@ class DataTable(ttk.Frame):
                 "severity": severity_colour,
                 "state": state_colour,
                 "status": status_colour,
+                "security": security_colour,
             }[column.colour_by](value)
+            if colour == PALETTE.text:
+                # security_colour's "no claim" answer. Left untagged so the
+                # cell keeps the table's ordinary foreground rather than being
+                # given a severity colour it has not earned.
+                return ""
             return {
                 PALETTE.critical: "sev_critical",
                 PALETTE.high: "sev_high",
@@ -747,12 +895,97 @@ class DataTable(ttk.Frame):
         """Every selected row's data."""
         return [self._rows[i] for i in self.tree.selection() if i in self._rows]
 
+    # ------------------------------------------------------------------
+    # Marking
+    # ------------------------------------------------------------------
+    def selected_row_id(self) -> str | None:
+        """The internal id of the selected row, for marking it."""
+        selection = self.tree.selection()
+        return selection[0] if selection else None
+
+    def is_marked(self, row_id: str) -> bool:
+        """True when a row carries the operator's mark."""
+        return row_id in self._marked
+
+    def set_marked(self, row_id: str, marked: bool) -> None:
+        """Mark or unmark one row and repaint it in place.
+
+        Only the display changes: marking is an operator annotation about a
+        real captured packet, and it neither alters nor re-interprets the
+        packet itself.
+        """
+        if not row_id or row_id not in self._rows:
+            return
+        if marked:
+            self._marked.add(row_id)
+        else:
+            self._marked.discard(row_id)
+        try:
+            if not self.tree.exists(row_id):
+                return
+            tags = [tag for tag in self.tree.item(row_id, "tags") if tag != "marked"]
+            if marked:
+                tags.insert(0, "marked")
+            self.tree.item(row_id, tags=tuple(tags))
+        except tk.TclError:  # pragma: no cover - row went away mid-refresh
+            pass
+
+    def toggle_mark(self, row_id: str) -> bool:
+        """Flip a row's mark; returns its new state."""
+        marked = not self.is_marked(row_id)
+        self.set_marked(row_id, marked)
+        return marked
+
+    @property
+    def marked_count(self) -> int:
+        """How many rows are marked, including any filtered out of view."""
+        return len(self._marked)
+
+    def marked_rows(self) -> list[dict[str, Any]]:
+        """The data of every marked row still held by the table."""
+        return [self._rows[row_id] for row_id in self._order if row_id in self._marked]
+
+    def clear_marks(self) -> None:
+        """Remove every mark, repainting the rows that carried one."""
+        for row_id in list(self._marked):
+            self.set_marked(row_id, False)
+
     def select_first(self) -> None:
         """Select the first visible row (used after a refresh)."""
         children = self.tree.get_children()
         if children:
             self.tree.selection_set(children[0])
             self.tree.focus(children[0])
+
+    def select_where(self, match: Callable[[dict[str, Any]], bool]) -> bool:
+        """Select and scroll to the first visible row the predicate accepts.
+
+        Returns ``False`` when nothing visible matches, so a screen opened to
+        show one particular record can fall back to its normal behaviour
+        rather than leaving the table with nothing selected and a detail pane
+        showing the wrong thing.
+        """
+        for row_id in self.tree.get_children():
+            row = self._rows.get(row_id)
+            if row is not None and match(row):
+                self.tree.selection_set(row_id)
+                self.tree.focus(row_id)
+                try:
+                    self.tree.see(row_id)
+                except tk.TclError:  # pragma: no cover - torn down mid-refresh
+                    pass
+                return True
+        return False
+
+    def focus_table(self) -> None:
+        """Put the keyboard on this table and select its first row.
+
+        Used when an action's whole point is the contents of this table, so
+        the operator can read, arrow through and copy it without the mouse.
+        """
+        self.tree.focus_set()
+        if not self.tree.selection():
+            self.select_first()
 
     def _handle_select(self, _event: tk.Event) -> None:
         """Forward a selection change."""
@@ -866,7 +1099,12 @@ class DataTable(ttk.Frame):
             return "break"
         header = "\t".join(column.title for column in self._columns)
         body = "\n".join(
-            "\t".join(self._cell(row, column) for column in self._columns)
+            # display=False: a pasted row should read "UNREVIEWED", not the
+            # dot that stands in for it in a 58-pixel column.
+            "\t".join(
+                self._cell(row, column, display=False)
+                for column in self._columns
+            )
             for row in rows
         )
         try:
@@ -960,6 +1198,11 @@ class DataTable(ttk.Frame):
             else self.rows()
         )
         return [
-            tuple(self._cell(row, column) for column in self._columns)
+            # display=False: an exported security record must be readable, so
+            # a marker column writes its word rather than its glyph.
+            tuple(
+                self._cell(row, column, display=False)
+                for column in self._columns
+            )
             for row in source
         ]

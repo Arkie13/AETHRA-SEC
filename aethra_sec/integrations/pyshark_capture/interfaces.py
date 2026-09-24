@@ -15,7 +15,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from aethra_sec.utils.logging import get_logger
-from aethra_sec.utils.net import NetworkInterface, list_interfaces, tshark_interfaces
+from aethra_sec.utils.net import (
+    NetworkInterface,
+    list_interfaces,
+    primary_outbound_address,
+    tshark_interfaces,
+    windows_adapter_details,
+)
 
 LOGGER = get_logger("integrations.pyshark.interfaces")
 
@@ -29,7 +35,8 @@ TSHARK_MISSING_MESSAGE = (
     "TShark (part of Wireshark) is not available, so live packet capture "
     "cannot start. Install Wireshark from https://www.wireshark.org/download "
     "(include Npcap on Windows) and, if it is installed somewhere unusual, set "
-    "AETHRA_TSHARK_PATH in .env to the full path of tshark.exe."
+    "AETHRA_TSHARK_PATH in the configuration file to the full path of "
+    "tshark.exe."
 )
 
 
@@ -53,6 +60,39 @@ class CaptureInterface:
     mac_address: str = ""
     is_up: bool = False
     source: str = "tshark"
+    #: OS classification of the medium - "Wi-Fi", "Ethernet", "Bluetooth",
+    #: "Loopback" or "" when the platform does not report one. Never guessed
+    #: from the adapter name, which operators rename freely.
+    kind: str = ""
+    #: The adapter name the operating system shows, e.g. "Wi-Fi".
+    friendly_name: str = ""
+    #: Negotiated link speed as reported by the OS, e.g. "300 Mbps".
+    link_speed: str = ""
+    #: True for the interface the routing table uses to reach the internet.
+    #: This is the one that carries real traffic, so it leads the picker.
+    is_primary: bool = False
+
+    @property
+    def guid(self) -> str:
+        r"""Interface GUID from a Windows NPF device name, upper-cased.
+
+        TShark names Windows devices ``\Device\NPF_{GUID}``; that GUID is the
+        exact join key back to the operating system's own adapter list.
+        """
+        marker = "NPF_"
+        if marker not in self.name:
+            return ""
+        return self.name.split(marker, 1)[1].strip().upper()
+
+    @property
+    def group(self) -> str:
+        """Heading this interface is listed under in the picker."""
+        return self.kind or "Other"
+
+    @property
+    def display_name(self) -> str:
+        """Best human-readable name: the OS adapter name where known."""
+        return self.friendly_name or self.description or self.name
 
     @property
     def primary_ipv4(self) -> str:
@@ -193,13 +233,55 @@ def list_capture_interfaces(
         iface.name: iface for iface in list_interfaces()
     }
 
-    tshark_list = tshark_interfaces(tshark_path)
+    # Resolve the executable the same way the availability probe does. Without
+    # this, a Wireshark installed in its default directory but absent from PATH
+    # was reported AVAILABLE while enumeration silently fell back to the OS
+    # names - and on Windows PyShark cannot capture on those, so every capture
+    # started from the fallback list failed.
+    executable = find_tshark(tshark_path)
+
+    # Which adapter the routing table actually uses. Empty when the
+    # machine has no route, in which case no interface is marked.
+    primary_address = primary_outbound_address()
+
+    # Windows only, and empty when the query fails - the adapter's real medium
+    # and OS name, joined on the GUID that both TShark and Windows report.
+    adapters = windows_adapter_details()
+
+    tshark_list = tshark_interfaces(executable)
     if tshark_list:
         result: list[CaptureInterface] = []
         for name, description in tshark_list:
             match = os_interfaces.get(name)
             if match is None and description:
                 match = os_interfaces.get(description)
+
+            probe = CaptureInterface(name=name)
+            adapter = adapters.get(probe.guid) if probe.guid else None
+            if adapter is None and description:
+                # Not every capture device is a NIC (loopback, USBPcap, ETW),
+                # so fall back to the name TShark printed.
+                adapter = next(
+                    (a for a in adapters.values() if a.friendly_name == description),
+                    None,
+                )
+
+            if adapter is not None:
+                kind = adapter.kind
+            elif "loopback" in name.lower() or "loopback" in description.lower():
+                kind = "Loopback"
+            else:
+                kind = ""
+
+            # psutil is authoritative for link state where it knows the
+            # adapter; otherwise use the OS adapter status. Neither is assumed.
+            if match is not None:
+                is_up = match.is_up
+            elif adapter is not None:
+                is_up = adapter.status.lower() == "up"
+            else:
+                is_up = True
+
             result.append(
                 CaptureInterface(
                     name=name,
@@ -207,29 +289,61 @@ def list_capture_interfaces(
                     ipv4=match.ipv4_addresses if match else (),
                     ipv6=match.ipv6_addresses if match else (),
                     mac_address=match.mac_address if match else "",
-                    is_up=match.is_up if match else True,
+                    is_up=is_up,
                     source="tshark",
+                    kind=kind,
+                    friendly_name=(
+                        adapter.friendly_name if adapter is not None else description
+                    ),
+                    link_speed=adapter.link_speed if adapter is not None else "",
+                    is_primary=bool(
+                        primary_address
+                        and match is not None
+                        and primary_address in match.ipv4_addresses
+                    ),
                 )
             )
-        result.sort(key=lambda i: (not i.ipv4, i.name.lower()))
+        # Interfaces that can actually see traffic come first: an address is
+        # the strongest signal, then a real medium, then link state.
+        result.sort(
+            key=lambda i: (
+                not i.is_primary,
+                not i.ipv4,
+                i.kind not in ("Wi-Fi", "Ethernet"),
+                not i.is_up,
+                i.display_name.lower(),
+            )
+        )
         return result
 
     LOGGER.warning(
         "TShark did not report any capture interfaces; falling back to the "
         "operating system list. Capture may not work with these names."
     )
-    return [
-        CaptureInterface(
-            name=iface.name,
-            description=iface.description,
-            ipv4=iface.ipv4_addresses,
-            ipv6=iface.ipv6_addresses,
-            mac_address=iface.mac_address,
-            is_up=iface.is_up,
-            source="psutil",
+    by_friendly = {a.friendly_name: a for a in adapters.values() if a.friendly_name}
+    fallback: list[CaptureInterface] = []
+    for iface in os_interfaces.values():
+        # No GUID to join on here, so match the OS adapter name psutil reports.
+        adapter = by_friendly.get(iface.name)
+        fallback.append(
+            CaptureInterface(
+                name=iface.name,
+                description=iface.description,
+                ipv4=iface.ipv4_addresses,
+                ipv6=iface.ipv6_addresses,
+                mac_address=iface.mac_address,
+                is_up=iface.is_up,
+                source="psutil",
+                kind=adapter.kind if adapter is not None else "",
+                friendly_name=iface.name,
+                link_speed=adapter.link_speed if adapter is not None else "",
+                is_primary=bool(
+                    primary_address and primary_address in iface.ipv4_addresses
+                ),
+            )
         )
-        for iface in os_interfaces.values()
-    ]
+    fallback.sort(key=lambda i: (not i.is_primary, not i.ipv4, not i.is_up))
+    return fallback
 
 
 def capture_permission_notes() -> list[str]:

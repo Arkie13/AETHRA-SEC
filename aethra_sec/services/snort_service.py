@@ -17,7 +17,7 @@ from typing import Any
 
 from aethra_sec.analytics.risk_engine import RiskEngine
 from aethra_sec.config.settings import SnortSettings, ToolSettings
-from aethra_sec.core.errors import SnortIngestError
+from aethra_sec.core.errors import SnortIngestError, ValidationFailedError
 from aethra_sec.core.event_bus import EventBus
 from aethra_sec.core.events import (
     ErrorPayload,
@@ -41,11 +41,17 @@ from aethra_sec.models.enums import (
     EvidenceSource,
     ServiceState,
 )
+from aethra_sec.models.threat import TrafficAnomaly
 from aethra_sec.security.audit import AuditAction, AuditCategory, AuditService
 from aethra_sec.security.rbac import AccessControl
 from aethra_sec.services.settings_service import SettingsService
 from aethra_sec.utils.logging import get_logger
-from aethra_sec.utils.net import find_executable
+from aethra_sec.utils.net import (
+    find_executable,
+    host_address_rejection,
+    is_on_link,
+    local_ipv4_networks,
+)
 from aethra_sec.utils.timeutil import utcnow
 
 LOGGER = get_logger("services.snort")
@@ -86,6 +92,9 @@ class SnortService:
         self._store_failures = 0
         self._last_error = ""
         self._started_at: datetime | None = None
+        self._network_lock = threading.Lock()
+        self._networks: tuple[Any, ...] = ()
+        self._networks_read_at: datetime | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -194,7 +203,7 @@ class SnortService:
         if transport is None:
             detail = (
                 "Snort alert ingest is disabled. Set AETHRA_SNORT_TRANSPORT in "
-                ".env to unixsock, file, syslog or tcp - see "
+                "the configuration file to unixsock, file, syslog or tcp - see "
                 "docs/SNORT_INTEGRATION.md."
                 if not self._config.enabled
                 else self._last_error or f"{SNORT_UNAVAILABLE_TEXT}."
@@ -267,6 +276,19 @@ class SnortService:
         try:
             record = self._normalise(alert, transport_name)
             if record is None:
+                return
+
+            # Idempotency first: the same Snort line re-read later is the
+            # same event, however long ago it was first seen. Without this a
+            # re-processed alert file created a second alert *and* a second
+            # incident for an event that happened once.
+            identical = self._alerts.find_identical(record.raw_alert)
+            if identical:
+                alert_id, _count = identical
+                self._alerts.increment_duplicate(
+                    alert_id, record.received_at or utcnow()
+                )
+                self._duplicates += 1
                 return
 
             suppression = max(
@@ -384,19 +406,59 @@ class SnortService:
         return " | ".join(parts)
 
     def _resolve_host(self, ip_address: str) -> int | None:
-        """Attach an alert endpoint to the host inventory when known."""
+        """Attach an alert endpoint to the host inventory when known.
+
+        An alert endpoint is *not* by itself evidence that a host belongs to
+        the monitored network. Most Snort alerts name a remote internet
+        address at one end, and enrolling those created inventory rows for
+        machines that are not on the laboratory LAN at all - Google and
+        Facebook front-ends appeared in Host Inventory as if they were
+        discovered devices.
+
+        So an existing row is always linked, but a *new* row is created only
+        for an address on a network this sensor is actually attached to. A
+        remote endpoint stays recorded on the alert itself, where the source
+        and destination addresses are the evidence; it simply does not become
+        an inventory entry.
+        """
         if not ip_address:
             return None
         try:
             host_id = self._hosts.find_id_by_ip(ip_address)
             if host_id:
                 return host_id
+            if not is_on_link(ip_address, self._local_networks()):
+                return None
+            if host_address_rejection(ip_address, self._local_networks()):
+                return None
             return self._hosts.upsert_observed(
-                ip_address, observed_at=utcnow(), source=EvidenceSource.SNORT
+                ip_address, observed_at=utcnow(), source=EvidenceSource.SNORT,
+                interface="snort", detail="named in an alert",
             ) or None
         except Exception:  # noqa: BLE001
             LOGGER.debug("Could not resolve host %s.", ip_address, exc_info=True)
             return None
+
+    def _local_networks(self) -> tuple[Any, ...]:
+        """The sensor's own subnets, re-read at most once a minute.
+
+        Reading the interface table costs a system call, and alert ingest is
+        the hot path, so the answer is cached. The refresh matters because a
+        laptop changes network without restarting the console.
+        """
+        now = utcnow()
+        with self._network_lock:
+            if (
+                self._networks_read_at is None
+                or (now - self._networks_read_at).total_seconds() > 60
+            ):
+                try:
+                    self._networks = local_ipv4_networks()
+                except Exception:  # noqa: BLE001 - no interface table available
+                    LOGGER.debug("Could not read local subnets.", exc_info=True)
+                    self._networks = ()
+                self._networks_read_at = now
+            return self._networks
 
     def _on_transport_failure(self, message: str) -> None:
         """Record and publish a transport failure (§57)."""
@@ -441,10 +503,131 @@ class SnortService:
         self._access.require(session, Permission.ALERT_VIEW)
         return self._alerts.recent_alerts(limit)
 
+    def search_anomalies(self, session: Session, **filters: Any) -> list[TrafficAnomaly]:
+        """Detections raised by AETHRA-SEC's own rules.
+
+        These are not Snort alerts and must never be presented as though they
+        were: Snort's alerts come from Snort's rules and its alert file, while
+        these come from the capture pipeline and the threshold rules configured
+        on the Detection screen. The Alerts screen shows both because an
+        operator looking for "what did the system detect" reasonably expects
+        one place to look, but each row carries its own origin.
+
+        Gated on ``alert.view``, the same permission that reads the alert list.
+        """
+        self._access.require(session, Permission.ALERT_VIEW)
+        return self._alerts.search_anomalies(**filters)
+
+    def detection_totals(
+        self,
+        session: Session,
+        *,
+        alert_filters: dict[str, Any] | None = None,
+        anomaly_filters: dict[str, Any] | None = None,
+    ) -> dict[str, int]:
+        """Severity totals across both sources for one set of filters.
+
+        Counted in the database over the same predicate that selects the rows,
+        so a summary can never describe a different set from the table beneath
+        it, and the figure reconciles with the Dashboard for the same window.
+
+        ``anomaly_filters`` of ``None`` means "Snort's queue only", which is
+        what a status filter asks for - anomalies have no such workflow state.
+        """
+        self._access.require(session, Permission.ALERT_VIEW)
+        totals = self._alerts.detection_totals(
+            alert_filters=alert_filters if alert_filters is not None else {},
+            anomaly_filters=anomaly_filters,
+        )
+        totals["unreviewed"] = self._alerts.count_unreviewed_matching(
+            alert_filters=alert_filters if alert_filters is not None else {},
+            anomaly_filters=anomaly_filters,
+        )
+        return totals
+
+    def unreviewed_anomaly_count(self, session: Session) -> int:
+        """Anomalies an analyst has not evaluated yet."""
+        self._access.require(session, Permission.ALERT_VIEW)
+        return self._alerts.count_unreviewed_anomalies()
+
     def unresolved_alert_count(self, session: Session) -> int:
         """Stored alerts nobody has reviewed yet (the sidebar counter)."""
         self._access.require(session, Permission.ALERT_VIEW)
         return int(self._alerts.reliability_counters().get("unresolved", 0))
+
+    def mark_all_reviewed(self, session: Session) -> int:
+        """Move every alert still in NEW to REVIEWED, clearing the badge.
+
+        This is deliberately not called "mark as read". The alert badge counts
+        alerts in the NEW state, and leaving that state is an analyst's
+        judgement recorded against the alert - so it needs ``alert.manage``
+        rather than the ``alert.view`` that reading the list needs, and it is
+        audited like any other status change.
+
+        Alerts already acknowledged, escalated or suppressed are left as they
+        are: those are decisions, and a bulk action must not overwrite them.
+        Neither is any ``evaluation`` label written - those are an analyst's
+        verdict and the input to the detection-accuracy statistics, so this
+        records only that the backlog was read.
+
+        Returns:
+            How many detections were marked, across both sources.
+        """
+        live = self._access.require(session, Permission.ALERT_MANAGE)
+        moved = self._alerts.mark_all_reviewed(live.user_id)
+        # The screen shows both detection sources, so the action that clears
+        # its counter has to cover both. Clearing only Snort's queue left the
+        # button doing nothing visible whenever the backlog was AETHRA-SEC's
+        # own detections - which, with Snort quiet, is all of it.
+        marked = self._alerts.mark_all_anomalies_reviewed(live.user_id)
+        if moved or marked:
+            self._audit.record(
+                AuditAction.ALERT_UPDATED,
+                session=live,
+                category=AuditCategory.MONITORING,
+                target_type="detection",
+                target_id=str(moved + marked),
+                detail=(
+                    f"{moved} Snort alert(s) moved from NEW to REVIEWED and "
+                    f"{marked} AETHRA-SEC detection(s) marked reviewed in one "
+                    "action. Alerts in another state were not changed, and no "
+                    "evaluation label was assigned."
+                ),
+            )
+        return moved + marked
+
+    def mark_anomaly_reviewed(self, session: Session, anomaly_id: int) -> bool:
+        """Record that an analyst has read one AETHRA-SEC detection.
+
+        The single-row counterpart of the bulk action. AETHRA-SEC's own
+        detections have no Snort workflow status, only a read receipt, so this
+        is what "mark reviewed" means for them - and it is gated and audited
+        like the alert status change it sits beside, because it is the same
+        claim: an analyst looked at this.
+
+        No ``evaluation`` label is written. That is a verdict and the input to
+        the detection-accuracy statistics, and it stays the analyst's own.
+
+        Returns:
+            True when this call marked it, False when it was already reviewed.
+        """
+        live = self._access.require(
+            session, Permission.ALERT_MANAGE, target=str(anomaly_id)
+        )
+        marked = self._alerts.mark_anomaly_reviewed(anomaly_id, live.user_id)
+        if marked:
+            self._audit.record(
+                AuditAction.ALERT_UPDATED,
+                session=live,
+                category=AuditCategory.DETECTION,
+                target_type="anomaly",
+                target_id=anomaly_id,
+                detail=(
+                    "AETHRA-SEC detection marked reviewed. No evaluation "
+                    "label was assigned."
+                ),
+            )
+        return marked
 
     def set_status(
         self, session: Session, alert_id: int, status: AlertStatus
@@ -463,20 +646,6 @@ class SnortService:
             detail=f"Alert status changed to {status}.",
         )
 
-    def mark_all_reviewed(self, session: Session) -> int:
-        """Move every NEW alert to REVIEWED (the sidebar's "mark all read")."""
-        live = self._access.require(session, Permission.ALERT_MANAGE)
-        count = self._alerts.mark_all_new_reviewed()
-        if count:
-            self._audit.record(
-                AuditAction.ALERT_UPDATED,
-                session=live,
-                category=AuditCategory.DETECTION,
-                target_type="alert",
-                detail=f"{count} alert(s) marked reviewed in bulk.",
-            )
-        return count
-
     def classify(
         self, session: Session, alert_id: int, evaluation: EvaluationLabel
     ) -> None:
@@ -493,6 +662,55 @@ class SnortService:
             target_id=alert_id,
             detail=f"Alert classified as {evaluation}.",
         )
+
+    def classify_anomaly(
+        self, session: Session, anomaly_id: int, evaluation: EvaluationLabel
+    ) -> None:
+        """Record an evaluator's judgement on an AETHRA-SEC detection (§82).
+
+        The same permission and the same audit action as classifying a Snort
+        alert, because it is the same analyst decision about the same kind of
+        question. Only the store differs.
+        """
+        live = self._access.require(
+            session, Permission.EVALUATION_CLASSIFY, target=str(anomaly_id)
+        )
+        if not self._alerts.set_anomaly_evaluation(
+            anomaly_id, evaluation, live.user_id
+        ):
+            raise ValidationFailedError(
+                f"anomaly {anomaly_id} does not exist",
+                user_message="That detection no longer exists.",
+            )
+        self._audit.record(
+            AuditAction.EVALUATION_RECORDED,
+            session=live,
+            category=AuditCategory.DETECTION,
+            target_type="anomaly",
+            target_id=anomaly_id,
+            detail=f"AETHRA-SEC detection classified as {evaluation}.",
+        )
+
+    def review_anomaly(self, session: Session, anomaly_id: int) -> bool:
+        """Stamp one AETHRA-SEC detection as read.
+
+        Needs ``alert.manage`` like the bulk action, and is audited, so a
+        single read receipt is as traceable as clearing the whole queue.
+        """
+        live = self._access.require(
+            session, Permission.ALERT_MANAGE, target=str(anomaly_id)
+        )
+        marked = self._alerts.mark_anomaly_reviewed(anomaly_id, live.user_id)
+        if marked:
+            self._audit.record(
+                AuditAction.ALERT_UPDATED,
+                session=live,
+                category=AuditCategory.DETECTION,
+                target_type="anomaly",
+                target_id=anomaly_id,
+                detail="AETHRA-SEC detection marked reviewed.",
+            )
+        return marked
 
     def evaluation_summary(self, session: Session) -> dict[str, int]:
         """Counts per evaluation label, for detection-accuracy analysis."""

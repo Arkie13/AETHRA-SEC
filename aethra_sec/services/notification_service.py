@@ -9,12 +9,14 @@ if no event happened, the notification list stays empty.
 from __future__ import annotations
 
 import threading
+from datetime import datetime
 from typing import Any
 
 from aethra_sec.core.event_bus import EventBus
 from aethra_sec.core.events import Event, EventType
 from aethra_sec.core.session import Session
 from aethra_sec.database.repositories.settings import (
+    _REFERENCE_MARKER,
     ErrorRepository,
     NotificationRepository,
 )
@@ -22,8 +24,13 @@ from aethra_sec.models.enums import NotificationLevel, Severity
 from aethra_sec.models.system import Notification
 from aethra_sec.services.settings_service import SettingsService
 from aethra_sec.utils.logging import get_logger
+from aethra_sec.utils.timeutil import utcnow
 
 LOGGER = get_logger("services.notifications")
+
+
+#: ``reference_type`` for alerts a security service raises directly.
+SECURITY_ALERT_REFERENCE = "security_alert"
 
 
 class NotificationService:
@@ -121,10 +128,10 @@ class NotificationService:
         )
         if not alert.severity.at_least(minimum):
             return
+        # No CRITICAL branch: a detection cannot reach that severity, so
+        # the mapping starts at HIGH. HIGH keeps the level it always had.
         level = (
-            NotificationLevel.CRITICAL
-            if alert.severity is Severity.CRITICAL
-            else NotificationLevel.WARNING
+            NotificationLevel.WARNING
             if alert.severity is Severity.HIGH
             else NotificationLevel.INFO
         )
@@ -232,6 +239,60 @@ class NotificationService:
             )
         )
 
+    # ------------------------------------------------------------------
+    # Security alerts raised directly by a service
+    # ------------------------------------------------------------------
+    def raise_security_alert(
+        self,
+        *,
+        title: str,
+        message: str,
+        reference: str,
+        user_id: int | None = None,
+    ) -> None:
+        """Store an authentication-security alert for administrators.
+
+        This is the existing notification pipeline, not a second one: the row
+        lands in ``notifications`` with the usual level, category and read
+        state, so it reaches the header badge, the notification list and the
+        "mark all read" action that already exist.
+
+        ``reference`` is the correlation key. It is appended to the stored
+        message behind an invisible marker and stripped before display, so a
+        repeated condition can be recognised without a schema change and
+        without the operator seeing an identifier.
+
+        The level is :attr:`NotificationLevel.WARNING`, the same level a HIGH
+        detection uses. It is deliberately not CRITICAL: that level re-sounds
+        an unacknowledged alert, and a run of failed passwords - which is often
+        somebody's caps lock - should not be able to start an alarm that
+        repeats until an administrator silences it.
+        """
+        self._store(
+            Notification(
+                user_id=user_id,
+                level=NotificationLevel.WARNING,
+                title=title[:190],
+                message=f"{message}{_REFERENCE_MARKER}{reference}"[:512],
+                category="security",
+                reference_type=SECURITY_ALERT_REFERENCE,
+                reference_id=user_id,
+                created_at=utcnow(),
+            )
+        )
+
+    def security_alert_exists(self, reference: str, since: datetime) -> bool:
+        """True when an alert with this correlation key already stands."""
+        try:
+            return self._repository.exists_since(
+                SECURITY_ALERT_REFERENCE, reference, since
+            )
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("Could not check for an existing alert.", exc_info=True)
+            # Reported as present, so a database problem cannot turn into a
+            # flood of duplicate alerts.
+            return True
+
     def _store(self, notification: Notification) -> None:
         """Persist a notification and trim the retained list."""
         try:
@@ -261,10 +322,18 @@ class NotificationService:
         except Exception:  # noqa: BLE001
             return 0
 
-    def mark_read(self, notification_id: int) -> None:
-        """Mark one notification as read."""
-        self._repository.mark_read(notification_id)
+    def mark_read(self, notification_id: int, session: Session | None) -> None:
+        """Record that this reader has read one notification.
+
+        The session is required rather than optional-by-omission: a read is a
+        statement about a person, and a broadcast notification is visible to
+        everyone. Marking it read without saying *who* read it is what let one
+        analyst clear the queue for the whole team.
+        """
+        self._repository.mark_read(
+            notification_id, session.user_id if session else None
+        )
 
     def mark_all_read(self, session: Session | None) -> int:
-        """Mark every visible notification as read."""
+        """Mark everything this reader can see as read by them."""
         return self._repository.mark_all_read(session.user_id if session else None)

@@ -111,7 +111,7 @@ PERMISSION_SPECS: tuple[PermissionSpec, ...] = (
     ),
     PermissionSpec(
         Permission.ALERT_MANAGE, "Manage IDS alerts",
-        "Acknowledge, review and classify IDS alerts.", "detection",
+        "Review and classify IDS alerts.", "detection",
     ),
     PermissionSpec(
         Permission.INCIDENT_VIEW, "View incidents",

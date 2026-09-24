@@ -202,14 +202,22 @@ CREATE TABLE IF NOT EXISTS hosts (
     mac_address         VARCHAR(17)  NOT NULL DEFAULT '',
     hostname            VARCHAR(190) NOT NULL DEFAULT '',
     hostname_checked_at DATETIME(6)  NULL,
+    hostname_source     VARCHAR(64)  NOT NULL DEFAULT '',
     vendor              VARCHAR(128) NOT NULL DEFAULT '',
     os_name             VARCHAR(190) NOT NULL DEFAULT '',
+    os_version          VARCHAR(96)  NOT NULL DEFAULT '',
+    os_cpe              VARCHAR(190) NOT NULL DEFAULT '',
     os_accuracy         TINYINT UNSIGNED NULL,
     status              VARCHAR(16)  NOT NULL DEFAULT 'UNKNOWN',
     risk_level          VARCHAR(16)  NOT NULL DEFAULT 'INFORMATIONAL',
-    discovery_source    VARCHAR(16)  NOT NULL DEFAULT 'PYSHARK',
+    discovery_source    VARCHAR(16)  NOT NULL DEFAULT 'LEGACY',
+    discovery_interface VARCHAR(190) NOT NULL DEFAULT '',
+    discovery_detail    VARCHAR(190) NOT NULL DEFAULT '',
     is_trusted          TINYINT(1)   NOT NULL DEFAULT 0,
     trust_note          VARCHAR(255) NOT NULL DEFAULT '',
+    detected_at         DATETIME(6)  NULL,
+    reviewed_at         DATETIME(6)  NULL,
+    reviewed_by         INT UNSIGNED NULL,
     first_seen          DATETIME(6)  NOT NULL,
     last_seen           DATETIME(6)  NOT NULL,
     created_at          DATETIME(6)  NOT NULL,
@@ -304,8 +312,13 @@ CREATE TABLE IF NOT EXISTS scan_hosts (
     vendor          VARCHAR(128) NOT NULL DEFAULT '',
     status          VARCHAR(16)  NOT NULL DEFAULT 'UNKNOWN',
     os_name         VARCHAR(190) NOT NULL DEFAULT '',
+    os_version      VARCHAR(96)  NOT NULL DEFAULT '',
+    os_cpe          VARCHAR(190) NOT NULL DEFAULT '',
     os_accuracy     TINYINT UNSIGNED NULL,
     os_family       VARCHAR(96)  NOT NULL DEFAULT '',
+    hostname_source VARCHAR(64)  NOT NULL DEFAULT '',
+    os_source       VARCHAR(64)  NOT NULL DEFAULT '',
+    identity_notes  TEXT         NULL,
     PRIMARY KEY (id),
     UNIQUE KEY uq_scan_hosts (scan_id, ip_address),
     KEY ix_scan_hosts_host (host_id),
@@ -423,7 +436,11 @@ CREATE TABLE IF NOT EXISTS traffic_records (
     KEY ix_traffic_src (src_ip, captured_at),
     KEY ix_traffic_dst (dst_ip, captured_at),
     KEY ix_traffic_protocol (protocol),
-    KEY ix_traffic_dst_port (dst_port)
+    KEY ix_traffic_dst_port (dst_port),
+    -- Covering index for the dashboard's top-sources panel: grouping the
+    -- window's packets by source is served straight from the index, without
+    -- reading table rows (measured ~1.9s -> ~0.8s over 100k+ rows).
+    KEY ix_traffic_period_src (captured_at, src_ip, length)
 ) {TABLE_OPTIONS}
 """
 
@@ -773,6 +790,20 @@ CREATE TABLE IF NOT EXISTS notifications (
 ) {TABLE_OPTIONS}
 """
 
+NOTIFICATION_READS = f"""
+CREATE TABLE IF NOT EXISTS notification_reads (
+    notification_id BIGINT UNSIGNED NOT NULL,
+    user_id         INT UNSIGNED    NOT NULL,
+    read_at         DATETIME(6)     NOT NULL,
+    PRIMARY KEY (notification_id, user_id),
+    KEY ix_notification_reads_user (user_id),
+    CONSTRAINT fk_notification_reads_notification
+        FOREIGN KEY (notification_id) REFERENCES notifications (id) ON DELETE CASCADE,
+    CONSTRAINT fk_notification_reads_user
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+) {TABLE_OPTIONS}
+"""
+
 APP_ERRORS = f"""
 CREATE TABLE IF NOT EXISTS app_errors (
     id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -786,6 +817,66 @@ CREATE TABLE IF NOT EXISTS app_errors (
     KEY ix_errors_occurred (occurred_at),
     KEY ix_errors_component (component),
     KEY ix_errors_ack (acknowledged)
+) {TABLE_OPTIONS}
+"""
+
+EVALUATION_RUNS = f"""
+CREATE TABLE IF NOT EXISTS evaluation_runs (
+    id                      BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    reference               VARCHAR(32)  NOT NULL,
+    scenario                VARCHAR(32)  NOT NULL,
+    repetition              INT UNSIGNED NOT NULL DEFAULT 1,
+    attacker_ip             VARCHAR(45)  NOT NULL DEFAULT '',
+    target_ip               VARCHAR(45)  NOT NULL DEFAULT '',
+    initiated_at            DATETIME(6)  NOT NULL,
+    initiation_source       VARCHAR(32)  NOT NULL DEFAULT '',
+    ended_at                DATETIME(6)  NULL,
+    grace_seconds           INT UNSIGNED NOT NULL DEFAULT 60,
+    status                  VARCHAR(16)  NOT NULL DEFAULT 'RUNNING',
+    outcome                 VARCHAR(24)  NOT NULL DEFAULT 'PENDING',
+    first_alert_at          DATETIME(6)  NULL,
+    first_alert_stored_at   DATETIME(6)  NULL,
+    first_alert_source      VARCHAR(16)  NOT NULL DEFAULT '',
+    first_alert_reference   VARCHAR(64)  NOT NULL DEFAULT '',
+    detection_time_seconds  DECIMAL(12,3) NULL,
+    stored_time_seconds     DECIMAL(12,3) NULL,
+    detections_total        INT UNSIGNED NOT NULL DEFAULT 0,
+    detections_matching     INT UNSIGNED NOT NULL DEFAULT 0,
+    classification_correct  TINYINT(1)   NULL,
+    notes                   TEXT         NULL,
+    started_by              INT UNSIGNED NULL,
+    completed_by            INT UNSIGNED NULL,
+    created_at              DATETIME(6)  NOT NULL,
+    updated_at              DATETIME(6)  NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_evaluation_runs_reference (reference),
+    KEY ix_evaluation_runs_scenario (scenario, status),
+    KEY ix_evaluation_runs_initiated (initiated_at),
+    CONSTRAINT fk_evaluation_runs_starter
+        FOREIGN KEY (started_by) REFERENCES users (id) ON DELETE SET NULL,
+    CONSTRAINT fk_evaluation_runs_completer
+        FOREIGN KEY (completed_by) REFERENCES users (id) ON DELETE SET NULL
+) {TABLE_OPTIONS}
+"""
+
+EVALUATION_RUN_DETECTIONS = f"""
+CREATE TABLE IF NOT EXISTS evaluation_run_detections (
+    id                  BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    run_id              BIGINT UNSIGNED NOT NULL,
+    source              VARCHAR(16)  NOT NULL,
+    reference_table     VARCHAR(32)  NOT NULL,
+    reference_id        BIGINT UNSIGNED NOT NULL,
+    category            VARCHAR(32)  NOT NULL DEFAULT '',
+    severity            VARCHAR(16)  NOT NULL DEFAULT '',
+    src_ip              VARCHAR(45)  NOT NULL DEFAULT '',
+    dst_ip              VARCHAR(45)  NOT NULL DEFAULT '',
+    generated_at        DATETIME(6)  NULL,
+    stored_at           DATETIME(6)  NOT NULL,
+    matches_scenario    TINYINT(1)   NOT NULL DEFAULT 0,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_evaluation_detection (run_id, reference_table, reference_id),
+    CONSTRAINT fk_evaluation_detection_run
+        FOREIGN KEY (run_id) REFERENCES evaluation_runs (id) ON DELETE CASCADE
 ) {TABLE_OPTIONS}
 """
 
@@ -821,7 +912,10 @@ CREATE_TABLE_STATEMENTS: tuple[tuple[str, str], ...] = (
     ("system_settings", SYSTEM_SETTINGS),
     ("integration_status", INTEGRATION_STATUS),
     ("notifications", NOTIFICATIONS),
+    ("notification_reads", NOTIFICATION_READS),
     ("app_errors", APP_ERRORS),
+    ("evaluation_runs", EVALUATION_RUNS),
+    ("evaluation_run_detections", EVALUATION_RUN_DETECTIONS),
 )
 
 #: Every table AETHRA-SEC requires; used by the schema diagnostics check.
@@ -835,4 +929,6 @@ EVIDENCE_TABLES: tuple[str, ...] = (
     "traffic_anomalies",
     "incidents",
     "incident_events",
+    "evaluation_runs",
+    "evaluation_run_detections",
 )

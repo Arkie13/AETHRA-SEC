@@ -31,11 +31,11 @@ class SettingSpec(NamedTuple):
 DETECTION_SETTINGS: tuple[SettingSpec, ...] = (
     SettingSpec(
         "detection.icmp_packets_per_second",
-        50,
+        120,
         "int",
         "detection",
         "ICMP packets per second from a single source that constitutes an "
-        "excessive-ICMP observation.",
+        "ICMP flood. Default 120 pps is the manuscript's section 3.9.8 threshold.",
         minimum=1,
         maximum=1_000_000,
     ),
@@ -45,17 +45,18 @@ DETECTION_SETTINGS: tuple[SettingSpec, ...] = (
         "int",
         "detection",
         "UDP packets per second from a single source toward one destination "
-        "that constitutes a UDP flood indicator.",
+        "that constitutes a UDP flood. Default 300 pps is the manuscript's "
+        "section 3.9.8 threshold.",
         minimum=1,
         maximum=1_000_000,
     ),
     SettingSpec(
         "detection.tcp_syn_per_second",
-        100,
+        200,
         "int",
         "detection",
         "TCP SYN packets per second from a single source that constitutes a "
-        "SYN anomaly indicator.",
+        "SYN flood. Default 200 pps is the manuscript's section 3.9.8 threshold.",
         minimum=1,
         maximum=1_000_000,
     ),
@@ -71,11 +72,12 @@ DETECTION_SETTINGS: tuple[SettingSpec, ...] = (
     ),
     SettingSpec(
         "detection.http_requests_per_second",
-        80,
+        10,
         "int",
         "detection",
-        "Decoded HTTP requests per second from a single source that "
-        "constitutes an HTTP flood indicator.",
+        "HTTP requests per second from a single source that constitutes an "
+        "HTTP flood. Default 10 per second is the manuscript's section 3.9.8 "
+        "threshold of 600 requests per minute.",
         minimum=1,
         maximum=1_000_000,
     ),
@@ -107,6 +109,19 @@ DETECTION_SETTINGS: tuple[SettingSpec, ...] = (
         "window before host-sweep behaviour is reported.",
         minimum=2,
         maximum=65_535,
+    ),
+    SettingSpec(
+        "detection.host_sweep_range_concentration",
+        0.75,
+        "float",
+        "detection",
+        "Share of the contacted addresses that must fall inside one /24 "
+        "before host-sweep behaviour is reported. A sweep walks an address "
+        "range; ordinary outbound traffic reaches scattered addresses that "
+        "share no prefix, so counting distinct destinations alone reported "
+        "normal browsing as a sweep.",
+        minimum=0.0,
+        maximum=1.0,
     ),
     SettingSpec(
         "detection.host_sweep_window_seconds",
@@ -201,6 +216,31 @@ CAPTURE_SETTINGS: tuple[SettingSpec, ...] = (
         "counted rather than growing memory without bound.",
         minimum=100,
         maximum=1_000_000,
+    ),
+    SettingSpec(
+        "capture.pcap_ring_mb",
+        64,
+        "int",
+        "capture",
+        "Size of each capture file in the evidence ring, in megabytes. The "
+        "session's packets are written to a series of files of this size and "
+        "TShark deletes the oldest, so a long capture cannot fill the disk. "
+        "Total on disk is this multiplied by the file count. Set either to 0 "
+        "for a single file that grows without limit.",
+        minimum=0,
+        maximum=4_096,
+    ),
+    SettingSpec(
+        "capture.pcap_ring_files",
+        8,
+        "int",
+        "capture",
+        "How many capture files the evidence ring keeps. Once full, the "
+        "oldest is deleted as a new one begins. A packet whose file has been "
+        "recycled can no longer be inspected in detail, and the inspector "
+        "says so rather than showing something else.",
+        minimum=0,
+        maximum=1_000,
     ),
     SettingSpec(
         "capture.persist_packet_metadata",
@@ -346,6 +386,17 @@ HOST_SETTINGS: tuple[SettingSpec, ...] = (
         "How often the background hostname resolver runs.",
         minimum=1,
         maximum=1440,
+    ),
+    SettingSpec(
+        "hosts.offline_after_minutes",
+        15,
+        "int",
+        "hosts",
+        "A host not observed for this many minutes is marked OFFLINE. Its "
+        "history, its assessments and its findings are kept; it returns to UP "
+        "the moment it is observed transmitting again.",
+        minimum=1,
+        maximum=10080,
     ),
 )
 
@@ -524,6 +575,172 @@ NOTIFICATION_SETTINGS: tuple[SettingSpec, ...] = (
         "notifications",
         "Lowest security severity that raises a notification "
         "(INFO/LOW/MEDIUM/HIGH/CRITICAL).",
+    ),
+    SettingSpec(
+        "assessment.auto_enabled",
+        True,
+        "bool",
+        "assessment",
+        "Automatically assess hosts observed on the monitored authorised "
+        "network. When on, a host the capture pipeline observes on the "
+        "subnet of the monitored interface, inside AETHRA_AUTHORIZED_NETWORKS, "
+        "is assessed with real Nmap once and then only after the reassessment "
+        "interval. When that network cannot be determined, automatic "
+        "assessment stops and says so. It can be switched off from the "
+        "Vulnerability Assessment screen.",
+    ),
+    SettingSpec(
+        "assessment.retry_base_minutes",
+        5,
+        "int",
+        "assessment",
+        "Minutes before a failed or timed-out assessment is retried. The delay "
+        "doubles with each consecutive failure and never exceeds the "
+        "reassessment interval.",
+        minimum=1,
+        maximum=1440,
+    ),
+    SettingSpec(
+        "assessment.scan_timeout_seconds",
+        1800,
+        "int",
+        "assessment",
+        "Wall-clock limit for one Nmap run. When it passes, Nmap is stopped "
+        "and the assessment is recorded as TIMEOUT - never as completed.",
+        minimum=30,
+        maximum=86_400,
+    ),
+    SettingSpec(
+        "assessment.max_scope_addresses",
+        1024,
+        "int",
+        "assessment",
+        "Largest monitored network, in addresses, automatic assessment will "
+        "accept. A larger network is not a laboratory segment, so automatic "
+        "assessment reports its scope as unavailable instead of scanning it.",
+        minimum=4,
+        maximum=65_536,
+    ),
+    SettingSpec(
+        "assessment.auto_new_hosts",
+        True,
+        "bool",
+        "assessment",
+        "Assess a newly discovered host the first time it is seen, rather "
+        "than waiting for the reassessment interval.",
+    ),
+    SettingSpec(
+        "assessment.reassess_hours",
+        6,
+        "int",
+        "assessment",
+        "Hours before an already-assessed host is due again. A host is not "
+        "rescanned inside this window however much traffic it sends.",
+        minimum=1,
+        maximum=8760,
+    ),
+    SettingSpec(
+        "assessment.max_concurrent",
+        2,
+        "int",
+        "assessment",
+        "Nmap assessments that may run at once. A burst of newly discovered "
+        "hosts becomes a queue rather than a process per host.",
+        minimum=1,
+        maximum=8,
+    ),
+    SettingSpec(
+        "assessment.max_attempts",
+        3,
+        "int",
+        "assessment",
+        "Consecutive failed or timed-out assessments before a host is retried "
+        "only at the reassessment interval. Prevents a permanently "
+        "unreachable address being scanned every few minutes.",
+        minimum=1,
+        maximum=20,
+    ),
+    SettingSpec(
+        "assessment.auto_profile",
+        "standard",
+        "str",
+        "assessment",
+        "Nmap profile used for automatic assessment, from the fixed profile "
+        "catalogue. Automatic scans cannot use arbitrary Nmap arguments.",
+    ),
+    SettingSpec(
+        "assessment.script_categories",
+        "vuln",
+        "str",
+        "assessment",
+        "Nmap NSE script categories run during automatic assessment, comma "
+        "separated. Only assessment categories are accepted (default, safe, "
+        "banner, vuln); exploit, brute, dos, intrusive, malware and auth are "
+        "refused. 'vuln' is what supplies the CVE evidence a host needs before "
+        "it can be classified Vulnerable - without it an assessment can only "
+        "record which ports are open, which is exposure and not vulnerability. "
+        "Leave empty to run no scripts, which makes scans faster and quieter.",
+    ),
+    SettingSpec(
+        "assessment.excluded_addresses",
+        "",
+        "str",
+        "assessment",
+        "Comma-separated addresses never assessed automatically, whatever "
+        "else the policy says. For equipment that must not be scanned.",
+    ),
+    SettingSpec(
+        "incidents.auto_close_hours",
+        24,
+        "int",
+        "correlation",
+        "Close an untouched incident once its evidence has been quiet for "
+        "this many hours. Correlation refreshes an incident whenever new "
+        "evidence arrives, so anything still happening stays open; this only "
+        "retires the tail nobody will action. Nothing is deleted - the "
+        "incident keeps its evidence and stays searchable. Set to 0 to keep "
+        "every incident open until a person closes it.",
+        minimum=0,
+        maximum=8760,
+    ),
+    SettingSpec(
+        "notifications.sound_enabled",
+        True,
+        "bool",
+        "notifications",
+        "Play a sound when a notification is raised from a real event.",
+    ),
+    SettingSpec(
+        "notifications.sound_min_level",
+        "WARNING",
+        "str",
+        "notifications",
+        "Lowest notification level that is audible "
+        "(INFO/SUCCESS/WARNING/ERROR/CRITICAL). Levels below this stay "
+        "visual only.",
+    ),
+    SettingSpec(
+        "notifications.repeat_critical",
+        True,
+        "bool",
+        "notifications",
+        "Re-sound an unacknowledged CRITICAL notification every 20 seconds "
+        "until it is acknowledged.",
+    ),
+    SettingSpec(
+        "notifications.quiet_mode",
+        False,
+        "bool",
+        "notifications",
+        "Do not disturb: keep notifications visual, suppressing all sound.",
+    ),
+    SettingSpec(
+        "notifications.sound_dedup_seconds",
+        30,
+        "int",
+        "notifications",
+        "Seconds within which repeats of the same finding fold into the "
+        "first sound. The notification record still counts every occurrence.",
     ),
     SettingSpec(
         "notifications.max_retained",

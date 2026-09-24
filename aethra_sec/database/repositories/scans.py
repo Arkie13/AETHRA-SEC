@@ -15,8 +15,10 @@ from aethra_sec.database.repositories.base import (
     as_text,
     limit_clause,
     order_clause,
+    period_bounds,
 )
 from aethra_sec.models.enums import (
+    ScanTrigger,
     EvidenceSource,
     HostStatus,
     RiskLevel,
@@ -32,7 +34,10 @@ from aethra_sec.models.scan import (
 from aethra_sec.utils.timeutil import to_db, utcnow
 
 _SCAN_SORTABLE = {"created_at", "started_at", "finished_at", "target", "status", "id"}
-_SCAN_FILTERABLE = {"status", "target", "profile", "initiated_by", "created_at"}
+_SCAN_FILTERABLE = {
+    "status", "target", "profile", "initiated_by", "created_at",
+    "trigger_source",
+}
 _FINDING_FILTERABLE = {
     "risk_level", "ip_address", "service", "protocol", "port", "created_at",
     "resolved_at", "scan_id", "host_id", "title",
@@ -41,7 +46,8 @@ _FINDING_SORTABLE = {"created_at", "risk_level", "ip_address", "port", "id"}
 
 _SCAN_SELECT = (
     "SELECT s.id, s.target, s.target_kind, s.profile, s.profile_label, "
-    "s.port_spec, s.timing, s.arguments, s.status, s.started_at, s.finished_at, "
+    "s.trigger_source, s.port_spec, s.timing, s.arguments, s.status, "
+    "s.started_at, s.finished_at, "
     "s.duration_seconds, s.hosts_total, s.hosts_up, s.open_ports, "
     "s.findings_count, s.error_message, s.nmap_version, s.command_line, "
     "s.initiated_by, s.created_at, u.username AS initiated_by_username "
@@ -85,6 +91,9 @@ class ScanRepository(Repository):
             error_message=as_text(row.get("error_message")),
             nmap_version=as_text(row.get("nmap_version")),
             command_line=as_text(row.get("command_line")),
+            trigger_source=ScanTrigger.parse(
+                row.get("trigger_source"), ScanTrigger.MANUAL
+            ),
             initiated_by=as_int(row.get("initiated_by")),
             initiated_by_username=as_text(row.get("initiated_by_username")),
             created_at=as_dt(row.get("created_at")),
@@ -132,6 +141,8 @@ class ScanRepository(Repository):
             source=EvidenceSource.parse(row.get("source"), EvidenceSource.NMAP),
             resolved_at=as_dt(row.get("resolved_at")),
             created_at=as_dt(row.get("created_at")),
+            cvss_base_score=as_float(row.get("cvss_base_score")),
+            cvss_source=as_text(row.get("cvss_source")),
         )
 
     @staticmethod
@@ -158,12 +169,20 @@ class ScanRepository(Repository):
             vendor=as_text(row.get("vendor")) or as_text(row.get("known_vendor")),
             status=HostStatus.parse(row.get("status"), HostStatus.UNKNOWN),
             os_name=as_text(row.get("os_name")) or as_text(row.get("known_os_name")),
+            os_version=as_text(row.get("os_version")),
+            os_cpe=as_text(row.get("os_cpe")),
             os_accuracy=(
                 as_int(row.get("os_accuracy"))
                 if as_text(row.get("os_name"))
                 else as_int(row.get("known_os_accuracy"))
             ),
             os_family=as_text(row.get("os_family")),
+            hostname_source=as_text(row.get("hostname_source")),
+            os_source=as_text(row.get("os_source")),
+            identity_notes=tuple(
+                line for line in as_text(row.get("identity_notes")).splitlines()
+                if line.strip()
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -173,22 +192,61 @@ class ScanRepository(Repository):
         """Insert a queued scan and return its id."""
         return self.db.insert(
             "INSERT INTO scans (target, target_kind, profile, profile_label, "
-            "port_spec, timing, arguments, status, initiated_by, created_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            "trigger_source, port_spec, timing, arguments, status, "
+            "initiated_by, created_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 scan.target[:255], scan.target_kind[:16], scan.profile[:32],
-                scan.profile_label[:96], scan.port_spec[:255], scan.timing[:8],
+                scan.profile_label[:96], str(scan.trigger_source),
+                scan.port_spec[:255], scan.timing[:8],
                 scan.arguments[:512], str(scan.status), scan.initiated_by,
                 to_db(scan.created_at or utcnow()),
             ),
         )
 
     def mark_running(self, scan_id: int, command_line: str, nmap_version: str) -> None:
-        """Record that the Nmap process actually started."""
+        """Record that the Nmap process actually started.
+
+        Called once, immediately before Nmap is launched. ``started_at`` is the
+        start of the run and is written here only: an earlier version called
+        this again after Nmap returned, which overwrote the real start with the
+        finish time, so every stored scan claimed to have started when it had
+        already ended. Use :meth:`record_command` to add details afterwards.
+        """
         self.db.execute(
             "UPDATE scans SET status = 'RUNNING', started_at = %s, "
             "command_line = %s, nmap_version = %s WHERE id = %s",
             (to_db(utcnow()), command_line[:512], nmap_version[:64], scan_id),
+        )
+
+    def record_command(self, scan_id: int, command_line: str, nmap_version: str) -> None:
+        """Store the exact command and version Nmap reported, after it ran.
+
+        Deliberately leaves ``status`` and ``started_at`` alone, so recording
+        what ran can never rewrite when it ran.
+        """
+        self.db.execute(
+            "UPDATE scans SET command_line = %s, nmap_version = %s WHERE id = %s",
+            (command_line[:512], nmap_version[:64], scan_id),
+        )
+
+    def note_error(self, scan_id: int, detail: str) -> None:
+        """Attach a caveat to a scan without changing its outcome."""
+        self.db.execute(
+            "UPDATE scans SET error_message = %s WHERE id = %s",
+            (detail[:512], scan_id),
+        )
+
+    def mark_timeout(self, scan_id: int, detail: str) -> None:
+        """Record that Nmap did not finish in time.
+
+        A distinct terminal status, not FAILED and never COMPLETED: the scan
+        produced no finished result, so it must not be read as "no findings".
+        """
+        self.db.execute(
+            "UPDATE scans SET status = 'TIMEOUT', finished_at = %s, "
+            "error_message = %s WHERE id = %s",
+            (to_db(utcnow()), detail[:512], scan_id),
         )
 
     def mark_completed(
@@ -220,6 +278,29 @@ class ScanRepository(Repository):
             (to_db(utcnow()), error[:512], scan_id),
         )
 
+    def reset_stuck_scans(self, reason: str) -> list[int]:
+        """Close scans left RUNNING by a process that never finished.
+
+        Called once at start-up, where the invariant holds absolutely: this
+        process has not started a scan yet, and an Nmap child cannot outlive
+        the console that spawned it. So every row still marked RUNNING is the
+        residue of a run that was killed, crashed or lost power.
+
+        Left alone those rows are worse than useless - the scan list paints
+        RUNNING in the same colour as healthy activity, so a scan that died
+        four days ago reads as one still in progress. They are marked FAILED
+        with the real reason rather than deleted: the attempt happened, and
+        the record of it is evidence.
+
+        Returns:
+            The ids that were closed, so the caller can report a real count.
+        """
+        rows = self.db.query("SELECT id FROM scans WHERE status = 'RUNNING'")
+        ids = [int(row["id"]) for row in rows]
+        for scan_id in ids:
+            self.mark_failed(scan_id, reason)
+        return ids
+
     def mark_cancelled(self, scan_id: int) -> None:
         """Record that the operator stopped the scan."""
         self.db.execute(
@@ -231,18 +312,37 @@ class ScanRepository(Repository):
     # Results
     # ------------------------------------------------------------------
     def add_scan_host(self, scan_id: int, host: ScanHostResult) -> int:
-        """Insert one host result and return its row id."""
+        """Insert one host result and return its row id.
+
+        The three provenance fields are stored alongside the values. The
+        identity probe worked them out - which lookup produced the name, what
+        named the OS, and what was tried and came back empty - and they were
+        then dropped on the way to the database, so the detail view's
+        "Hostname source" and "OS source" rows could only ever show a dash and
+        the notes never appeared at all. An answer with no account of how it
+        was reached is the one thing this inventory is not allowed to give.
+        """
         return self.db.insert(
             "INSERT INTO scan_hosts (scan_id, host_id, ip_address, hostname, "
-            "mac_address, vendor, status, os_name, os_accuracy, os_family) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "mac_address, vendor, status, os_name, os_version, os_cpe, "
+            "os_accuracy, os_family, hostname_source, os_source, "
+            "identity_notes) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
             "ON DUPLICATE KEY UPDATE hostname = VALUES(hostname), "
             "mac_address = VALUES(mac_address), status = VALUES(status), "
-            "os_name = VALUES(os_name), os_accuracy = VALUES(os_accuracy)",
+            "os_name = VALUES(os_name), os_version = VALUES(os_version), "
+            "os_cpe = VALUES(os_cpe), os_accuracy = VALUES(os_accuracy), "
+            "os_family = VALUES(os_family), "
+            "hostname_source = VALUES(hostname_source), "
+            "os_source = VALUES(os_source), "
+            "identity_notes = VALUES(identity_notes)",
             (
                 scan_id, host.host_id, host.ip_address[:45], host.hostname[:190],
                 host.mac_address[:17], host.vendor[:128], str(host.status),
-                host.os_name[:190], host.os_accuracy, host.os_family[:96],
+                host.os_name[:190], host.os_version[:96], host.os_cpe[:190],
+                host.os_accuracy, host.os_family[:96],
+                host.hostname_source[:64], host.os_source[:64],
+                "\n".join(host.identity_notes) or None,
             ),
         )
 
@@ -267,6 +367,42 @@ class ScanRepository(Repository):
             ],
         )
 
+    def supersede_host_findings(self, host_id: int, scan_id: int) -> int:
+        """Close a host's still-open findings from *earlier* assessments.
+
+        A finding records what one assessment observed. Nothing closed the
+        previous one, so every completed scan added a fresh set and the host
+        accumulated the union of everything it had ever exposed: on this
+        installation one host held 20 open findings - the same four ports,
+        five times over, once per scan - while its latest assessment found
+        four. Another held eleven for a host whose most recent assessment
+        found none at all, which is worse than a duplicate: it presents
+        withdrawn exposure as current.
+
+        When a later assessment completes *and the host answers*, that
+        assessment is the current picture of the host. Anything an earlier one
+        reported and this one did not is no longer observed, which is exactly
+        what ``resolved_at`` means.
+
+        Nothing is deleted. Each row keeps its scan id, its evidence, its
+        rating and its timestamps; it simply stops counting as open, so the
+        inventory reports what the host exposes now. The history stays
+        readable through the scan it belongs to.
+
+        Only older scans are touched (``scan_id <``), and an already-resolved
+        finding is left alone so an analyst's own resolution is not restamped.
+
+        Returns:
+            How many findings were superseded.
+        """
+        if not host_id or not scan_id:
+            return 0
+        return self.db.execute(
+            "UPDATE scan_findings SET resolved_at = %s "
+            "WHERE host_id = %s AND scan_id < %s AND resolved_at IS NULL",
+            (to_db(utcnow()), int(host_id), int(scan_id)),
+        )
+
     def add_findings(self, findings: list[ScanFinding]) -> int:
         """Batch-insert derived security findings."""
         if not findings:
@@ -276,9 +412,10 @@ class ScanRepository(Repository):
             "INSERT INTO scan_findings (scan_id, scan_host_id, host_id, "
             "ip_address, port, protocol, service, title, observation, concern, "
             "risk_level, risk_rationale, evidence, reference_id, "
-            "reference_source, verification_required, source, created_at) "
+            "reference_source, verification_required, source, "
+            "cvss_base_score, cvss_source, created_at) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-            "%s, %s, %s, %s)",
+            "%s, %s, %s, %s, %s, %s)",
             [
                 (
                     f.scan_id, f.scan_host_id, f.host_id, f.ip_address[:45],
@@ -286,7 +423,8 @@ class ScanRepository(Repository):
                     f.observation, f.concern, str(f.risk_level),
                     f.risk_rationale, f.evidence, f.reference[:64],
                     f.reference_source[:64],
-                    1 if f.verification_required else 0, str(f.source), now,
+                    1 if f.verification_required else 0, str(f.source),
+                    f.cvss_base_score, f.cvss_source[:64], now,
                 )
                 for f in findings
             ],
@@ -307,8 +445,10 @@ class ScanRepository(Repository):
             return None
         host_rows = self.db.query(
             "SELECT sh.id, sh.scan_id, sh.host_id, sh.ip_address, sh.hostname, "
-            "sh.mac_address, sh.vendor, sh.status, sh.os_name, sh.os_accuracy, "
-            "sh.os_family, h.hostname AS known_hostname, "
+            "sh.mac_address, sh.vendor, sh.status, sh.os_name, sh.os_version, "
+            "sh.os_cpe, sh.os_accuracy, "
+            "sh.os_family, sh.hostname_source, sh.os_source, "
+            "sh.identity_notes, h.hostname AS known_hostname, "
             "h.mac_address AS known_mac, h.vendor AS known_vendor, "
             "h.os_name AS known_os_name, h.os_accuracy AS known_os_accuracy "
             "FROM scan_hosts sh LEFT JOIN hosts h ON h.id = sh.host_id "
@@ -443,10 +583,36 @@ class ScanRepository(Repository):
         return self.count("SELECT COUNT(*) FROM scans")
 
     def count_open_findings(self) -> int:
-        """Findings not yet marked resolved."""
+        """Findings not yet marked resolved.
+
+        Current state, not a daily figure: an unresolved exposure is still
+        unresolved tomorrow morning, so this is never bounded by the
+        Dashboard's reporting period.
+        """
         return self.count(
             "SELECT COUNT(*) FROM scan_findings WHERE resolved_at IS NULL"
         )
+
+    def count_findings_in_period(
+        self, start: datetime | None, end: datetime | None = None
+    ) -> int:
+        """Findings *discovered* inside ``[start, end)``.
+
+        The daily counterpart to :meth:`count_open_findings`.
+        """
+        clauses, params = period_bounds("created_at", start, end)
+        return self.count(f"SELECT COUNT(*) FROM scan_findings {clauses}", params)
+
+    def count_scans_in_period(
+        self, start: datetime | None, end: datetime | None = None
+    ) -> int:
+        """Assessments recorded inside ``[start, end)``.
+
+        Bounded on ``created_at`` rather than ``started_at``: a queued scan has
+        no start time yet, and a period figure must not silently omit it.
+        """
+        clauses, params = period_bounds("created_at", start, end)
+        return self.count(f"SELECT COUNT(*) FROM scans {clauses}", params)
 
     def count_findings_by_risk(self) -> dict[str, int]:
         """Open finding counts by risk level."""

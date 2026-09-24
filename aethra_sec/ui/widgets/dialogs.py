@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import tkinter as tk
+from dataclasses import dataclass
 from tkinter import ttk
 from typing import Any, Callable, Sequence
 
 from aethra_sec.ui.theme import PALETTE, Fonts, configure_text_widget
+from aethra_sec.ui.widgets.cards import ScrollableFrame
 
 
 class ModalDialog(tk.Toplevel):
@@ -20,8 +22,18 @@ class ModalDialog(tk.Toplevel):
         width: int = 520,
         height: int = 340,
         resizable: bool = False,
+        scrollable: bool = True,
     ) -> None:
-        """Create and centre the dialog."""
+        """Create and centre the dialog.
+
+        Args:
+            scrollable: give :attr:`body` its own scrolling viewport. On by
+                default, because a dialog whose content is longer than its
+                window otherwise simply clips it - the operator cannot reach
+                the rest, and there is nothing on screen to say anything is
+                missing. Pass ``False`` from a dialog that scrolls its own
+                content, so the two do not nest.
+        """
         super().__init__(parent)
         self.title(title)
         self.configure(background=PALETTE.background)
@@ -29,10 +41,23 @@ class ModalDialog(tk.Toplevel):
         self.resizable(resizable, resizable)
         self.result: Any = None
 
-        self.body = ttk.Frame(self, style="TFrame", padding=18)
-        self.body.pack(fill="both", expand=True)
+        # The footer is packed first, against the bottom edge. Tk gives space
+        # to earlier children when it runs short, so a footer packed after an
+        # expanding body is the first thing squeezed off the window - which is
+        # how Save and Cancel became unreachable on a long form.
         self.buttons = ttk.Frame(self, style="TFrame", padding=(18, 0, 18, 16))
-        self.buttons.pack(fill="x")
+        self.buttons.pack(side="bottom", fill="x")
+
+        if scrollable:
+            self._scroller: ScrollableFrame | None = ScrollableFrame(
+                self, padding=18, autohide=True
+            )
+            self._scroller.pack(side="top", fill="both", expand=True)
+            self.body = self._scroller.interior
+        else:
+            self._scroller = None
+            self.body = ttk.Frame(self, style="TFrame", padding=18)
+            self.body.pack(side="top", fill="both", expand=True)
 
         self.update_idletasks()
         self._centre(width, height)
@@ -40,14 +65,27 @@ class ModalDialog(tk.Toplevel):
         self.bind("<Escape>", lambda _event: self.cancel())
 
     def _centre(self, width: int, height: int) -> None:
-        """Position the dialog over the parent window."""
+        """Position the dialog over the parent window, inside the screen.
+
+        The requested height is a preference, not a promise: a form with many
+        fields asked for more than the display was tall, so it opened with its
+        lower edge - and its buttons - past the bottom of the screen. What is
+        placed here is the smaller of what the dialog wants and what the
+        display can actually show.
+        """
         parent = self.master.winfo_toplevel()
+        margin = 80  # taskbar, title bar and a little breathing room
+        width = max(320, min(width, self.winfo_screenwidth() - 40))
+        height = max(200, min(height, self.winfo_screenheight() - margin))
         try:
             x = parent.winfo_rootx() + max(0, (parent.winfo_width() - width) // 2)
             y = parent.winfo_rooty() + max(0, (parent.winfo_height() - height) // 3)
         except tk.TclError:  # pragma: no cover - parent not yet mapped
             x = y = 100
-        self.geometry(f"{width}x{height}+{max(0, x)}+{max(0, y)}")
+        # Nudge back on screen if centring would push an edge off it.
+        x = max(0, min(x, self.winfo_screenwidth() - width))
+        y = max(0, min(y, self.winfo_screenheight() - height - margin // 2))
+        self.geometry(f"{width}x{height}+{x}+{y}")
 
     def show(self) -> Any:
         """Display modally and return :attr:`result`."""
@@ -84,7 +122,7 @@ class ConfirmDialog(ModalDialog):
             ttk.Label(
                 self.body, text=detail, style="Muted.TLabel", wraplength=430,
                 justify="left",
-            ).pack(anchor="w", pady=(16, 0))
+            ).pack(anchor="w", pady=(10, 0))
 
         ttk.Button(
             self.buttons, text="Cancel", style="Ghost.TButton", command=self.cancel
@@ -257,7 +295,7 @@ class FormDialog(ModalDialog):
         for field in self._fields:
             self._build_field(canvas_host, field)
 
-        self._error.pack(anchor="w", pady=(16, 0))
+        self._error.pack(anchor="w", pady=(10, 0))
         ttk.Button(
             self.buttons, text="Cancel", style="Ghost.TButton", command=self.cancel
         ).pack(side="right")
@@ -339,6 +377,24 @@ class FormDialog(ModalDialog):
         self.destroy()
 
 
+@dataclass(frozen=True)
+class DetailSection:
+    """One block in a :class:`DetailDialog`.
+
+    A section can carry key/value rows, free text, or both. ``tone`` picks the
+    heading colour so one block can be set apart from the rest without a
+    second dialog class, and ``collapsed`` hides the body behind a toggle -
+    used for raw sensor evidence, which must stay available in full without
+    pushing the analysis off the first screenful.
+    """
+
+    heading: str
+    body: str = ""
+    rows: Sequence[tuple[str, str]] = ()
+    tone: str = "accent"
+    collapsed: bool = False
+
+
 class DetailDialog(ModalDialog):
     """A read-only detail view with key/value rows and free text sections."""
 
@@ -348,13 +404,26 @@ class DetailDialog(ModalDialog):
         title: str,
         rows: Sequence[tuple[str, str]],
         *,
-        sections: Sequence[tuple[str, str]] = (),
+        sections: Sequence[tuple[str, str] | DetailSection] = (),
+        actions: Sequence[tuple[str, Callable[[], None]]] = (),
         fonts: Fonts | None = None,
         width: int = 760,
         height: int = 560,
     ) -> None:
-        """Create the detail view."""
-        super().__init__(parent, title, width=width, height=height, resizable=True)
+        """Create the detail view.
+
+        Args:
+            sections: ``(heading, body)`` pairs, or :class:`DetailSection`
+                instances where a block needs rows, its own tone or a
+                collapsed body.
+            actions: extra buttons beside Close, as ``(label, callback)``.
+                Used for links out of the dialog, such as opening the
+                mitigation entry an alert resolved to.
+        """
+        super().__init__(
+            parent, title, width=width, height=height, resizable=True,
+            scrollable=False,
+        )
         text = tk.Text(self.body, wrap="word")
         if fonts:
             configure_text_widget(text, fonts)
@@ -363,21 +432,109 @@ class DetailDialog(ModalDialog):
         text.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
+        bold = fonts.body_bold if fonts else ("TkDefaultFont", 10, "bold")
         text.tag_configure("key", foreground=PALETTE.text_muted)
         text.tag_configure(
-            "heading", foreground=PALETTE.accent,
-            font=(fonts.body_bold if fonts else ("TkDefaultFont", 10, "bold")),
-            spacing1=8, spacing3=4,
+            "heading", foreground=PALETTE.accent, font=bold, spacing1=8, spacing3=4,
         )
+        # A second heading tone, so a block an analyst is expected to act on
+        # reads differently from the record around it.
+        text.tag_configure(
+            "heading_action", foreground=PALETTE.ok, font=bold, spacing1=10,
+            spacing3=4,
+        )
+        text.tag_configure(
+            "heading_warn", foreground=PALETTE.high, font=bold, spacing1=10,
+            spacing3=4,
+        )
+        text.tag_configure("toggle", foreground=PALETTE.accent, underline=True)
 
-        for key, value in rows:
-            text.insert("end", f"{key}: ", "key")
-            text.insert("end", f"{value}\n")
-        for heading, body in sections:
-            text.insert("end", f"\n{heading}\n", "heading")
-            text.insert("end", f"{body}\n")
+        def write_rows(pairs: Sequence[tuple[str, str]]) -> None:
+            for key, value in pairs:
+                text.insert("end", f"{key}: ", "key")
+                text.insert("end", f"{value}\n")
+
+        write_rows(rows)
+
+        self._collapsed: dict[str, bool] = {}
+        for index, entry in enumerate(sections):
+            section = (
+                entry
+                if isinstance(entry, DetailSection)
+                else DetailSection(heading=entry[0], body=entry[1])
+            )
+            tag = {
+                "action": "heading_action",
+                "warn": "heading_warn",
+            }.get(section.tone, "heading")
+            text.insert("end", f"\n{section.heading}\n", tag)
+            if section.collapsed:
+                self._add_toggle(text, index, section)
+            else:
+                write_rows(section.rows)
+                if section.body:
+                    text.insert("end", f"{section.body}\n")
         text.configure(state="disabled")
+        self._text = text
 
         ttk.Button(
             self.buttons, text="Close", style="Accent.TButton", command=self.cancel
         ).pack(side="right")
+        for label, command in actions:
+            ttk.Button(
+                self.buttons, text=label, style="Ghost.TButton", command=command
+            ).pack(side="right", padx=(0, 8))
+
+    def _add_toggle(
+        self, text: tk.Text, index: int, section: DetailSection
+    ) -> None:
+        """Render a collapsed section behind a clickable show/hide line.
+
+        The body is inserted in full and elided rather than withheld, so the
+        evidence is always present in the widget - expanding it is a display
+        change, and a copy of the whole dialog still carries it.
+        """
+        name = f"collapsed{index}"
+        show = f"show{index}"
+        hide = f"hide{index}"
+        lines = section.body.count("\n") + 1 if section.body else 0
+        counted = f"{lines} line{'' if lines == 1 else 's'}"
+
+        # Both labels are inserted once and one of them is always elided, so
+        # toggling never rewrites the widget - no index arithmetic to drift.
+        text.insert("end", f"[+] Show ({counted})\n", ("toggle", show))
+        text.insert("end", f"[-] Hide ({counted})\n", ("toggle", hide))
+        for key, value in section.rows:
+            text.insert("end", f"{key}: ", ("key", name))
+            text.insert("end", f"{value}\n", name)
+        if section.body:
+            text.insert("end", f"{section.body}\n", name)
+        text.tag_configure(hide, elide=True)
+        text.tag_configure(name, elide=True)
+        self._collapsed[name] = True
+
+        def toggle(_event: tk.Event) -> str:
+            collapsed = not self._collapsed[name]
+            self._collapsed[name] = collapsed
+            text.tag_configure(name, elide=collapsed)
+            text.tag_configure(show, elide=not collapsed)
+            text.tag_configure(hide, elide=collapsed)
+            return "break"
+
+        text.tag_bind(show, "<Button-1>", toggle)
+        text.tag_bind(hide, "<Button-1>", toggle)
+
+    def is_collapsed(self, index: int = 0) -> bool:
+        """Whether a collapsed section is currently hidden (used by tests)."""
+        return self._collapsed.get(f"collapsed{index}", False)
+
+    def toggle_section(self, index: int = 0) -> None:
+        """Expand or collapse a section without a mouse (used by tests)."""
+        name = f"collapsed{index}"
+        if name not in self._collapsed:
+            return
+        collapsed = not self._collapsed[name]
+        self._collapsed[name] = collapsed
+        self._text.tag_configure(name, elide=collapsed)
+        self._text.tag_configure(f"show{index}", elide=not collapsed)
+        self._text.tag_configure(f"hide{index}", elide=collapsed)

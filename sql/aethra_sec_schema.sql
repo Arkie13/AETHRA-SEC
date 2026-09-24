@@ -18,7 +18,7 @@
 -- To use a different schema name, change it in the two statements below and
 -- set AETHRA_DB_NAME in your .env to match.
 --
--- Contains: 31 tables plus the reference rows a working installation needs
+-- Contains: 34 tables plus the reference rows a working installation needs
 --           (roles, permissions, settings, mitigation knowledge base).
 -- Contains NO user accounts and NO security records: hosts, packets, scans,
 -- findings, alerts, anomalies and incidents are created empty and fill only
@@ -52,7 +52,7 @@ SET FOREIGN_KEY_CHECKS = 1;
 
 
 -- --------------------------------------------------------------------------
--- 2. Tables (31), in dependency order
+-- 2. Tables (34), in dependency order
 -- --------------------------------------------------------------------------
 
 -- Ordering matters: incidents and mitigation_recommendations are
@@ -229,14 +229,22 @@ CREATE TABLE IF NOT EXISTS hosts (
     mac_address         VARCHAR(17)  NOT NULL DEFAULT '',
     hostname            VARCHAR(190) NOT NULL DEFAULT '',
     hostname_checked_at DATETIME(6)  NULL,
+    hostname_source     VARCHAR(64)  NOT NULL DEFAULT '',
     vendor              VARCHAR(128) NOT NULL DEFAULT '',
     os_name             VARCHAR(190) NOT NULL DEFAULT '',
+    os_version          VARCHAR(96)  NOT NULL DEFAULT '',
+    os_cpe              VARCHAR(190) NOT NULL DEFAULT '',
     os_accuracy         TINYINT UNSIGNED NULL,
     status              VARCHAR(16)  NOT NULL DEFAULT 'UNKNOWN',
     risk_level          VARCHAR(16)  NOT NULL DEFAULT 'INFORMATIONAL',
-    discovery_source    VARCHAR(16)  NOT NULL DEFAULT 'PYSHARK',
+    discovery_source    VARCHAR(16)  NOT NULL DEFAULT 'LEGACY',
+    discovery_interface VARCHAR(190) NOT NULL DEFAULT '',
+    discovery_detail    VARCHAR(190) NOT NULL DEFAULT '',
     is_trusted          TINYINT(1)   NOT NULL DEFAULT 0,
     trust_note          VARCHAR(255) NOT NULL DEFAULT '',
+    detected_at         DATETIME(6)  NULL,
+    reviewed_at         DATETIME(6)  NULL,
+    reviewed_by         INT UNSIGNED NULL,
     first_seen          DATETIME(6)  NOT NULL,
     last_seen           DATETIME(6)  NOT NULL,
     created_at          DATETIME(6)  NOT NULL,
@@ -327,8 +335,13 @@ CREATE TABLE IF NOT EXISTS scan_hosts (
     vendor          VARCHAR(128) NOT NULL DEFAULT '',
     status          VARCHAR(16)  NOT NULL DEFAULT 'UNKNOWN',
     os_name         VARCHAR(190) NOT NULL DEFAULT '',
+    os_version      VARCHAR(96)  NOT NULL DEFAULT '',
+    os_cpe          VARCHAR(190) NOT NULL DEFAULT '',
     os_accuracy     TINYINT UNSIGNED NULL,
     os_family       VARCHAR(96)  NOT NULL DEFAULT '',
+    hostname_source VARCHAR(64)  NOT NULL DEFAULT '',
+    os_source       VARCHAR(64)  NOT NULL DEFAULT '',
+    identity_notes  TEXT         NULL,
     PRIMARY KEY (id),
     UNIQUE KEY uq_scan_hosts (scan_id, ip_address),
     KEY ix_scan_hosts_host (host_id),
@@ -442,7 +455,11 @@ CREATE TABLE IF NOT EXISTS traffic_records (
     KEY ix_traffic_src (src_ip, captured_at),
     KEY ix_traffic_dst (dst_ip, captured_at),
     KEY ix_traffic_protocol (protocol),
-    KEY ix_traffic_dst_port (dst_port)
+    KEY ix_traffic_dst_port (dst_port),
+    -- Covering index for the dashboard's top-sources panel: grouping the
+    -- window's packets by source is served straight from the index, without
+    -- reading table rows (measured ~1.9s -> ~0.8s over 100k+ rows).
+    KEY ix_traffic_period_src (captured_at, src_ip, length)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- traffic_aggregates
@@ -779,6 +796,19 @@ CREATE TABLE IF NOT EXISTS notifications (
         FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- notification_reads
+CREATE TABLE IF NOT EXISTS notification_reads (
+    notification_id BIGINT UNSIGNED NOT NULL,
+    user_id         INT UNSIGNED    NOT NULL,
+    read_at         DATETIME(6)     NOT NULL,
+    PRIMARY KEY (notification_id, user_id),
+    KEY ix_notification_reads_user (user_id),
+    CONSTRAINT fk_notification_reads_notification
+        FOREIGN KEY (notification_id) REFERENCES notifications (id) ON DELETE CASCADE,
+    CONSTRAINT fk_notification_reads_user
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 -- app_errors
 CREATE TABLE IF NOT EXISTS app_errors (
     id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -792,6 +822,64 @@ CREATE TABLE IF NOT EXISTS app_errors (
     KEY ix_errors_occurred (occurred_at),
     KEY ix_errors_component (component),
     KEY ix_errors_ack (acknowledged)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- evaluation_runs
+CREATE TABLE IF NOT EXISTS evaluation_runs (
+    id                      BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    reference               VARCHAR(32)  NOT NULL,
+    scenario                VARCHAR(32)  NOT NULL,
+    repetition              INT UNSIGNED NOT NULL DEFAULT 1,
+    attacker_ip             VARCHAR(45)  NOT NULL DEFAULT '',
+    target_ip               VARCHAR(45)  NOT NULL DEFAULT '',
+    initiated_at            DATETIME(6)  NOT NULL,
+    initiation_source       VARCHAR(32)  NOT NULL DEFAULT '',
+    ended_at                DATETIME(6)  NULL,
+    grace_seconds           INT UNSIGNED NOT NULL DEFAULT 60,
+    status                  VARCHAR(16)  NOT NULL DEFAULT 'RUNNING',
+    outcome                 VARCHAR(24)  NOT NULL DEFAULT 'PENDING',
+    first_alert_at          DATETIME(6)  NULL,
+    first_alert_stored_at   DATETIME(6)  NULL,
+    first_alert_source      VARCHAR(16)  NOT NULL DEFAULT '',
+    first_alert_reference   VARCHAR(64)  NOT NULL DEFAULT '',
+    detection_time_seconds  DECIMAL(12,3) NULL,
+    stored_time_seconds     DECIMAL(12,3) NULL,
+    detections_total        INT UNSIGNED NOT NULL DEFAULT 0,
+    detections_matching     INT UNSIGNED NOT NULL DEFAULT 0,
+    classification_correct  TINYINT(1)   NULL,
+    notes                   TEXT         NULL,
+    started_by              INT UNSIGNED NULL,
+    completed_by            INT UNSIGNED NULL,
+    created_at              DATETIME(6)  NOT NULL,
+    updated_at              DATETIME(6)  NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_evaluation_runs_reference (reference),
+    KEY ix_evaluation_runs_scenario (scenario, status),
+    KEY ix_evaluation_runs_initiated (initiated_at),
+    CONSTRAINT fk_evaluation_runs_starter
+        FOREIGN KEY (started_by) REFERENCES users (id) ON DELETE SET NULL,
+    CONSTRAINT fk_evaluation_runs_completer
+        FOREIGN KEY (completed_by) REFERENCES users (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- evaluation_run_detections
+CREATE TABLE IF NOT EXISTS evaluation_run_detections (
+    id                  BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    run_id              BIGINT UNSIGNED NOT NULL,
+    source              VARCHAR(16)  NOT NULL,
+    reference_table     VARCHAR(32)  NOT NULL,
+    reference_id        BIGINT UNSIGNED NOT NULL,
+    category            VARCHAR(32)  NOT NULL DEFAULT '',
+    severity            VARCHAR(16)  NOT NULL DEFAULT '',
+    src_ip              VARCHAR(45)  NOT NULL DEFAULT '',
+    dst_ip              VARCHAR(45)  NOT NULL DEFAULT '',
+    generated_at        DATETIME(6)  NULL,
+    stored_at           DATETIME(6)  NOT NULL,
+    matches_scenario    TINYINT(1)   NOT NULL DEFAULT 0,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_evaluation_detection (run_id, reference_table, reference_id),
+    CONSTRAINT fk_evaluation_detection_run
+        FOREIGN KEY (run_id) REFERENCES evaluation_runs (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- --------------------------------------------------------------------------
@@ -812,7 +900,7 @@ INSERT INTO permissions (code, name, description, category) VALUES
     ('host.view', 'View host inventory', 'View discovered hosts and host detail pages.', 'inventory'),
     ('host.manage', 'Manage host inventory', 'Edit host labels, trust status and inventory records.', 'inventory'),
     ('alert.view', 'View IDS alerts', 'View Snort alerts and their evidence.', 'detection'),
-    ('alert.manage', 'Manage IDS alerts', 'Acknowledge, review and classify IDS alerts.', 'detection'),
+    ('alert.manage', 'Manage IDS alerts', 'Review and classify IDS alerts.', 'detection'),
     ('incident.view', 'View incidents', 'View correlated threat incidents and investigations.', 'detection'),
     ('incident.manage', 'Manage incidents', 'Change incident status, assign owners and add investigation notes.', 'detection'),
     ('mitigation.view', 'View mitigation guidance', 'View mitigation recommendations for threats and findings.', 'mitigation'),
@@ -896,7 +984,7 @@ WHERE r.name = 'USER'
 ON DUPLICATE KEY UPDATE granted_at = role_permissions.granted_at;
 
 -- --------------------------------------------------------------------------
--- 4. Tunable settings (49)
+-- 4. Tunable settings (70)
 -- --------------------------------------------------------------------------
 
 -- Detection thresholds, correlation, capture, retention, interface,
@@ -904,14 +992,15 @@ ON DUPLICATE KEY UPDATE granted_at = role_permissions.granted_at;
 -- the Settings screen; the values here are the documented defaults.
 
 INSERT INTO system_settings (setting_key, setting_value, value_type, category, description, updated_at) VALUES
-    ('detection.icmp_packets_per_second', '50', 'int', 'detection', 'ICMP packets per second from a single source that constitutes an excessive-ICMP observation.', UTC_TIMESTAMP(6)),
-    ('detection.udp_packets_per_second', '300', 'int', 'detection', 'UDP packets per second from a single source toward one destination that constitutes a UDP flood indicator.', UTC_TIMESTAMP(6)),
-    ('detection.tcp_syn_per_second', '100', 'int', 'detection', 'TCP SYN packets per second from a single source that constitutes a SYN anomaly indicator.', UTC_TIMESTAMP(6)),
+    ('detection.icmp_packets_per_second', '120', 'int', 'detection', 'ICMP packets per second from a single source that constitutes an ICMP flood. Default 120 pps is the manuscript''s section 3.9.8 threshold.', UTC_TIMESTAMP(6)),
+    ('detection.udp_packets_per_second', '300', 'int', 'detection', 'UDP packets per second from a single source toward one destination that constitutes a UDP flood. Default 300 pps is the manuscript''s section 3.9.8 threshold.', UTC_TIMESTAMP(6)),
+    ('detection.tcp_syn_per_second', '200', 'int', 'detection', 'TCP SYN packets per second from a single source that constitutes a SYN flood. Default 200 pps is the manuscript''s section 3.9.8 threshold.', UTC_TIMESTAMP(6)),
     ('detection.tcp_syn_unanswered_ratio', '0.8', 'float', 'detection', 'Minimum proportion of SYN packets without an observed SYN/ACK reply before a SYN flood indicator is raised.', UTC_TIMESTAMP(6)),
-    ('detection.http_requests_per_second', '80', 'int', 'detection', 'Decoded HTTP requests per second from a single source that constitutes an HTTP flood indicator.', UTC_TIMESTAMP(6)),
+    ('detection.http_requests_per_second', '10', 'int', 'detection', 'HTTP requests per second from a single source that constitutes an HTTP flood. Default 10 per second is the manuscript''s section 3.9.8 threshold of 600 requests per minute.', UTC_TIMESTAMP(6)),
     ('detection.port_scan_distinct_ports', '20', 'int', 'detection', 'Distinct destination ports contacted by one source inside the port scan window before port-scanning behaviour is reported.', UTC_TIMESTAMP(6)),
     ('detection.port_scan_window_seconds', '10', 'int', 'detection', 'Sliding window, in seconds, used by the port-scan rule.', UTC_TIMESTAMP(6)),
     ('detection.host_sweep_distinct_hosts', '15', 'int', 'detection', 'Distinct destination hosts contacted by one source inside the sweep window before host-sweep behaviour is reported.', UTC_TIMESTAMP(6)),
+    ('detection.host_sweep_range_concentration', '0.75', 'float', 'detection', 'Share of the contacted addresses that must fall inside one /24 before host-sweep behaviour is reported. A sweep walks an address range; ordinary outbound traffic reaches scattered addresses that share no prefix, so counting distinct destinations alone reported normal browsing as a sweep.', UTC_TIMESTAMP(6)),
     ('detection.host_sweep_window_seconds', '10', 'int', 'detection', 'Sliding window, in seconds, used by the host-sweep rule.', UTC_TIMESTAMP(6)),
     ('detection.rate_window_seconds', '5', 'int', 'detection', 'Sliding window, in seconds, used by the packet-rate flood rules.', UTC_TIMESTAMP(6)),
     ('detection.suppression_window_seconds', '120', 'int', 'detection', 'Minimum interval between two identical traffic anomalies for the same source before a new record is written (false-positive control).', UTC_TIMESTAMP(6)),
@@ -921,6 +1010,8 @@ INSERT INTO system_settings (setting_key, setting_value, value_type, category, d
     ('correlation.enabled', 'true', 'bool', 'correlation', 'Master switch for the threat correlation engine.', UTC_TIMESTAMP(6)),
     ('correlation.min_events_for_incident', '1', 'int', 'correlation', 'Number of correlated evidence events required before an incident is created. 1 means every qualifying security event yields an incident.', UTC_TIMESTAMP(6)),
     ('capture.queue_size', '20000', 'int', 'capture', 'Maximum number of decoded packets buffered between the capture reader and the processing worker. Excess packets are dropped and counted rather than growing memory without bound.', UTC_TIMESTAMP(6)),
+    ('capture.pcap_ring_mb', '64', 'int', 'capture', 'Size of each capture file in the evidence ring, in megabytes. The session''s packets are written to a series of files of this size and TShark deletes the oldest, so a long capture cannot fill the disk. Total on disk is this multiplied by the file count. Set either to 0 for a single file that grows without limit.', UTC_TIMESTAMP(6)),
+    ('capture.pcap_ring_files', '8', 'int', 'capture', 'How many capture files the evidence ring keeps. Once full, the oldest is deleted as a new one begins. A packet whose file has been recycled can no longer be inspected in detail, and the inspector says so rather than showing something else.', UTC_TIMESTAMP(6)),
     ('capture.persist_packet_metadata', 'true', 'bool', 'capture', 'Persist per-packet metadata to traffic_records. Aggregates are stored regardless of this setting.', UTC_TIMESTAMP(6)),
     ('capture.persist_batch_size', '200', 'int', 'capture', 'Number of packet metadata rows written per batched INSERT.', UTC_TIMESTAMP(6)),
     ('capture.persist_flush_seconds', '2', 'int', 'capture', 'Maximum age of a partially filled packet batch before it is flushed.', UTC_TIMESTAMP(6)),
@@ -935,6 +1026,7 @@ INSERT INTO system_settings (setting_key, setting_value, value_type, category, d
     ('retention.prune_interval_minutes', '60', 'int', 'retention', 'How often the retention job runs.', UTC_TIMESTAMP(6)),
     ('hosts.auto_resolve_hostnames', 'false', 'bool', 'hosts', 'Look up hostnames for newly observed addresses in the background. Each lookup is one reverse DNS query; addresses with no record are asked once and then left alone.', UTC_TIMESTAMP(6)),
     ('hosts.resolve_interval_minutes', '5', 'int', 'hosts', 'How often the background hostname resolver runs.', UTC_TIMESTAMP(6)),
+    ('hosts.offline_after_minutes', '15', 'int', 'hosts', 'A host not observed for this many minutes is marked OFFLINE. Its history, its assessments and its findings are kept; it returns to UP the moment it is observed transmitting again.', UTC_TIMESTAMP(6)),
     ('backup.automatic_enabled', 'false', 'bool', 'backup', 'Run a database backup automatically once the interval below has elapsed since the newest existing backup.', UTC_TIMESTAMP(6)),
     ('backup.interval_hours', '24', 'int', 'backup', 'Hours between automatic backups. The countdown is measured from the newest backup already on disk, so restarting does not reset it.', UTC_TIMESTAMP(6)),
     ('backup.directory', '', 'str', 'backup', 'Where backups are written. Leave empty to use the ''backups'' folder beside the report output directory.', UTC_TIMESTAMP(6)),
@@ -952,11 +1044,28 @@ INSERT INTO system_settings (setting_key, setting_value, value_type, category, d
     ('security.audit_hash_chain', 'true', 'bool', 'security', 'Maintain chained SHA-256 integrity hashes over audit records.', UTC_TIMESTAMP(6)),
     ('notifications.enabled', 'true', 'bool', 'notifications', 'Raise in-application notifications for genuine system events.', UTC_TIMESTAMP(6)),
     ('notifications.min_severity', 'MEDIUM', 'str', 'notifications', 'Lowest security severity that raises a notification (INFO/LOW/MEDIUM/HIGH/CRITICAL).', UTC_TIMESTAMP(6)),
+    ('assessment.auto_enabled', 'true', 'bool', 'assessment', 'Automatically assess hosts observed on the monitored authorised network. When on, a host the capture pipeline observes on the subnet of the monitored interface, inside AETHRA_AUTHORIZED_NETWORKS, is assessed with real Nmap once and then only after the reassessment interval. When that network cannot be determined, automatic assessment stops and says so. It can be switched off from the Vulnerability Assessment screen.', UTC_TIMESTAMP(6)),
+    ('assessment.retry_base_minutes', '5', 'int', 'assessment', 'Minutes before a failed or timed-out assessment is retried. The delay doubles with each consecutive failure and never exceeds the reassessment interval.', UTC_TIMESTAMP(6)),
+    ('assessment.scan_timeout_seconds', '1800', 'int', 'assessment', 'Wall-clock limit for one Nmap run. When it passes, Nmap is stopped and the assessment is recorded as TIMEOUT - never as completed.', UTC_TIMESTAMP(6)),
+    ('assessment.max_scope_addresses', '1024', 'int', 'assessment', 'Largest monitored network, in addresses, automatic assessment will accept. A larger network is not a laboratory segment, so automatic assessment reports its scope as unavailable instead of scanning it.', UTC_TIMESTAMP(6)),
+    ('assessment.auto_new_hosts', 'true', 'bool', 'assessment', 'Assess a newly discovered host the first time it is seen, rather than waiting for the reassessment interval.', UTC_TIMESTAMP(6)),
+    ('assessment.reassess_hours', '6', 'int', 'assessment', 'Hours before an already-assessed host is due again. A host is not rescanned inside this window however much traffic it sends.', UTC_TIMESTAMP(6)),
+    ('assessment.max_concurrent', '2', 'int', 'assessment', 'Nmap assessments that may run at once. A burst of newly discovered hosts becomes a queue rather than a process per host.', UTC_TIMESTAMP(6)),
+    ('assessment.max_attempts', '3', 'int', 'assessment', 'Consecutive failed or timed-out assessments before a host is retried only at the reassessment interval. Prevents a permanently unreachable address being scanned every few minutes.', UTC_TIMESTAMP(6)),
+    ('assessment.auto_profile', 'standard', 'str', 'assessment', 'Nmap profile used for automatic assessment, from the fixed profile catalogue. Automatic scans cannot use arbitrary Nmap arguments.', UTC_TIMESTAMP(6)),
+    ('assessment.script_categories', 'vuln', 'str', 'assessment', 'Nmap NSE script categories run during automatic assessment, comma separated. Only assessment categories are accepted (default, safe, banner, vuln); exploit, brute, dos, intrusive, malware and auth are refused. ''vuln'' is what supplies the CVE evidence a host needs before it can be classified Vulnerable - without it an assessment can only record which ports are open, which is exposure and not vulnerability. Leave empty to run no scripts, which makes scans faster and quieter.', UTC_TIMESTAMP(6)),
+    ('assessment.excluded_addresses', '', 'str', 'assessment', 'Comma-separated addresses never assessed automatically, whatever else the policy says. For equipment that must not be scanned.', UTC_TIMESTAMP(6)),
+    ('incidents.auto_close_hours', '24', 'int', 'correlation', 'Close an untouched incident once its evidence has been quiet for this many hours. Correlation refreshes an incident whenever new evidence arrives, so anything still happening stays open; this only retires the tail nobody will action. Nothing is deleted - the incident keeps its evidence and stays searchable. Set to 0 to keep every incident open until a person closes it.', UTC_TIMESTAMP(6)),
+    ('notifications.sound_enabled', 'true', 'bool', 'notifications', 'Play a sound when a notification is raised from a real event.', UTC_TIMESTAMP(6)),
+    ('notifications.sound_min_level', 'WARNING', 'str', 'notifications', 'Lowest notification level that is audible (INFO/SUCCESS/WARNING/ERROR/CRITICAL). Levels below this stay visual only.', UTC_TIMESTAMP(6)),
+    ('notifications.repeat_critical', 'true', 'bool', 'notifications', 'Re-sound an unacknowledged CRITICAL notification every 20 seconds until it is acknowledged.', UTC_TIMESTAMP(6)),
+    ('notifications.quiet_mode', 'false', 'bool', 'notifications', 'Do not disturb: keep notifications visual, suppressing all sound.', UTC_TIMESTAMP(6)),
+    ('notifications.sound_dedup_seconds', '30', 'int', 'notifications', 'Seconds within which repeats of the same finding fold into the first sound. The notification record still counts every occurrence.', UTC_TIMESTAMP(6)),
     ('notifications.max_retained', '500', 'int', 'notifications', 'Maximum notifications retained per user.', UTC_TIMESTAMP(6))
 ON DUPLICATE KEY UPDATE description = VALUES(description), category = VALUES(category), value_type = VALUES(value_type);
 
 -- --------------------------------------------------------------------------
--- 5. Mitigation knowledge base (15 entries)
+-- 5. Mitigation knowledge base (13 entries)
 -- --------------------------------------------------------------------------
 
 -- Guidance text, not security data. Each entry explains what the
@@ -1063,31 +1172,6 @@ INSERT INTO threat_mitigation_mapping
      condition_min_severity, is_active)
 SELECT 'SERVICE_EXPOSURE', id, 100, '', '', 1
 FROM mitigation_recommendations WHERE code = 'MIT-SERVICE-EXPOSURE'
-ON DUPLICATE KEY UPDATE priority = VALUES(priority);
-
--- MIT-BRUTE-FORCE: Authentication Brute-Force Indicators
-INSERT INTO mitigation_recommendations
-    (code, threat_name, category, severity, applies_to_service,
-     detection_source, explanation, why_it_matters, immediate_action,
-     long_term_action, verification_steps, reference_notes,
-     is_active, is_builtin, created_at, updated_at)
-VALUES (
-    'MIT-BRUTE-FORCE', 'Authentication Brute-Force Indicators',
-    'BRUTE_FORCE', 'HIGH',
-    '', 'SNORT',
-    'Repeated authentication attempts against a service were observed, matching an intrusion detection signature or a repeated-connection pattern in the captured traffic.',
-    'Repeated authentication attempts indicate credential guessing. If the account uses a weak or reused password, a successful login can follow, giving the attacker legitimate-looking access that is much harder to detect afterwards.',
-    '1. Review the authentication logs on the destination host for the same time window and determine whether any attempt succeeded.\n2. Identify the source address and whether it belongs to a known asset.\n3. If a login succeeded, treat the account as compromised: reset its credentials and review what the session did.\n4. Consider restricting access from the source network after validating that the activity is unauthorised.',
-    '1. Enforce a strong password policy and, where supported, a second authentication factor.\n2. Apply account lockout or rate limiting on repeated failures.\n3. Restrict administrative services to management networks.\n4. Monitor for successful logins that follow a burst of failures.',
-    '1. Confirm the attempt rate drops after the control is applied.\n2. Confirm no unexpected successful authentication occurred.\n3. Re-check the alert list for the same signature over the following days.',
-    '', 1, 1, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6)
-)
-ON DUPLICATE KEY UPDATE updated_at = mitigation_recommendations.updated_at;
-INSERT INTO threat_mitigation_mapping
-    (category, recommendation_id, priority, condition_service,
-     condition_min_severity, is_active)
-SELECT 'BRUTE_FORCE', id, 100, '', '', 1
-FROM mitigation_recommendations WHERE code = 'MIT-BRUTE-FORCE'
 ON DUPLICATE KEY UPDATE priority = VALUES(priority);
 
 -- MIT-TCP-SYN-FLOOD: Potential TCP SYN Flood
@@ -1265,31 +1349,6 @@ SELECT 'DENIAL_OF_SERVICE', id, 100, '', '', 1
 FROM mitigation_recommendations WHERE code = 'MIT-DOS'
 ON DUPLICATE KEY UPDATE priority = VALUES(priority);
 
--- MIT-MALWARE-INDICATOR: Malware-Related Indicator
-INSERT INTO mitigation_recommendations
-    (code, threat_name, category, severity, applies_to_service,
-     detection_source, explanation, why_it_matters, immediate_action,
-     long_term_action, verification_steps, reference_notes,
-     is_active, is_builtin, created_at, updated_at)
-VALUES (
-    'MIT-MALWARE-INDICATOR', 'Malware-Related Indicator',
-    'MALWARE_INDICATOR', 'CRITICAL',
-    '', 'SNORT',
-    'An intrusion detection signature associated with malware behaviour - such as command-and-control communication or a known malicious download - matched observed traffic.',
-    'A malware indicator suggests a host may already be compromised. The priority shifts from prevention to containment and verification of what the host has done.',
-    '1. Identify the internal host involved.\n2. Review its recent traffic on the Host Detail screen for other unusual destinations.\n3. Inspect the host: running processes, scheduled tasks, persistence entries, and local security logs.\n4. Follow your incident response procedure for a potentially compromised host; involve the responsible administrator before isolating it.',
-    '1. Ensure endpoint protection is deployed and current.\n2. Keep IDS rules updated.\n3. Review how the host could have been infected and close that path.',
-    '1. Confirm the indicator does not recur after remediation.\n2. Confirm the host makes no further connections to the flagged destination.\n3. Re-scan the host and compare against its previous assessment.',
-    '', 1, 1, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6)
-)
-ON DUPLICATE KEY UPDATE updated_at = mitigation_recommendations.updated_at;
-INSERT INTO threat_mitigation_mapping
-    (category, recommendation_id, priority, condition_service,
-     condition_min_severity, is_active)
-SELECT 'MALWARE_INDICATOR', id, 100, '', '', 1
-FROM mitigation_recommendations WHERE code = 'MIT-MALWARE-INDICATOR'
-ON DUPLICATE KEY UPDATE priority = VALUES(priority);
-
 -- MIT-POLICY-VIOLATION: Policy Violation
 INSERT INTO mitigation_recommendations
     (code, threat_name, category, severity, applies_to_service,
@@ -1352,9 +1411,24 @@ INSERT INTO schema_migrations (version, name, applied_at) VALUES
     (2, 'password_recovery_requests', UTC_TIMESTAMP(6)),
     (3, 'incident_read_state', UTC_TIMESTAMP(6)),
     (4, 'hostname_lookup_state', UTC_TIMESTAMP(6)),
-    (5, 'windows_firewall_events', UTC_TIMESTAMP(6)),
-    (6, 'drop_windows_firewall_events', UTC_TIMESTAMP(6))
+    (5, 'os_detail_columns', UTC_TIMESTAMP(6)),
+    (6, 'anomaly_detected_at', UTC_TIMESTAMP(6)),
+    (7, 'anomaly_review_marker', UTC_TIMESTAMP(6)),
+    (8, 'manuscript_scope_alignment', UTC_TIMESTAMP(6)),
+    (9, 'assessment_queue', UTC_TIMESTAMP(6)),
+    (10, 'offlink_mac_correction', UTC_TIMESTAMP(6)),
+    (11, 'group_mac_correction', UTC_TIMESTAMP(6)),
+    (12, 'per_user_notification_reads', UTC_TIMESTAMP(6)),
+    (13, 'enable_auto_assessment', UTC_TIMESTAMP(6)),
+    (14, 'manuscript_alignment_rev9', UTC_TIMESTAMP(6)),
+    (15, 'manuscript_flood_thresholds', UTC_TIMESTAMP(6)),
+    (16, 'traffic_topsource_index', UTC_TIMESTAMP(6)),
+    (17, 'host_provenance', UTC_TIMESTAMP(6)),
+    (18, 'no_response_assessment_state', UTC_TIMESTAMP(6)),
+    (19, 'supersede_stale_findings', UTC_TIMESTAMP(6)),
+    (20, 'identity_provenance', UTC_TIMESTAMP(6)),
+    (21, 'host_hostname_source', UTC_TIMESTAMP(6))
 ON DUPLICATE KEY UPDATE name = VALUES(name);
 
--- Schema version 6. After applying this file, create the
+-- Schema version 21. After applying this file, create the
 -- first administrator with:  python scripts/create_admin.py

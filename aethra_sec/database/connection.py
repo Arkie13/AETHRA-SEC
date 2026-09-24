@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Iterable, Iterator, Sequence
@@ -26,6 +27,12 @@ from aethra_sec.utils.logging import get_logger
 from aethra_sec.utils.timeutil import utcnow
 
 LOGGER = get_logger("database.connection")
+
+#: A pooled connection idle at least this long is health-checked before reuse;
+#: one used more recently is trusted, so an active application does not pay a
+#: ping round-trip per statement. MySQL's default wait_timeout is 28,800s, so
+#: 30s is far inside the window where a connection is certainly still alive.
+PING_IDLE_SECONDS = 30.0
 
 try:  # pragma: no cover - import availability differs per installation
     import mysql.connector
@@ -154,13 +161,15 @@ class DatabaseManager:
                 user_message=(
                     "DATABASE OFFLINE - could not connect to MySQL at "
                     f"{settings.host}:{settings.port}. Check that the MySQL "
-                    "service is running and that the credentials in .env are "
+                    "service is running and that the database credentials in the "
+                    "configuration file are "
                     "correct."
                 ),
             ) from exc
         with self._lock:
             self._created += 1
         self._set_state(True)
+        connection._aethra_checked_at = time.monotonic()  # noqa: SLF001
         return connection
 
     @contextmanager
@@ -183,12 +192,22 @@ class DatabaseManager:
         except queue.Empty:
             conn = None
 
-        if conn is not None and not self._is_healthy(conn):
-            self._discard(conn)
-            conn = None
+        # Only ping a connection that has sat idle long enough to have plausibly
+        # been dropped by the server. Pinging on every checkout added a network
+        # round-trip to every statement - including the ones the UI thread makes
+        # for the sidebar badges - which is pure latency on a connection used
+        # seconds ago. A freshly used connection is trusted; a failed statement
+        # is still caught below and the connection discarded.
+        if conn is not None:
+            idle = time.monotonic() - getattr(conn, "_aethra_checked_at", 0.0)
+            if idle >= PING_IDLE_SECONDS and not self._is_healthy(conn):
+                self._discard(conn)
+                conn = None
 
         if conn is None:
             conn = self._new_connection()
+        else:
+            conn._aethra_checked_at = time.monotonic()  # noqa: SLF001
 
         try:
             yield conn

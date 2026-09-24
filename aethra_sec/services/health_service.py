@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from aethra_sec.config import paths
 from aethra_sec.config.environment import describe_environment, loaded_env_file
 from aethra_sec.config.settings import AppSettings
 from aethra_sec.core.event_bus import EventBus
@@ -56,7 +57,7 @@ class SubsystemProbes:
     event_bus_stats: Callable[[], dict[str, Any]] | None = None
     session_count: Callable[[], int] | None = None
     password_algorithm: Callable[[], str] | None = None
-    otp_status: Callable[[], Any] | None = None
+    smtp_status: Callable[[], Any] | None = None
     mitigation_count: Callable[[], int] | None = None
 
 
@@ -354,17 +355,31 @@ class HealthService:
         self._check_dependencies(add)
 
         # --- Configuration ----------------------------------------------
+        # The *expected* location is reported alongside the loaded one, because
+        # "no configuration found" is only actionable if it says where it
+        # looked - and that differs between a checkout and an installed build.
         env_file = loaded_env_file()
+        expected = paths.config_file()
+        locations = paths.describe()
         add(
             "Configuration file",
             "configuration",
             CheckResult.PASS if env_file else CheckResult.WARNING,
-            f"Loaded {env_file}" if env_file else "No .env file found; defaults are in use.",
+            f"Loaded {env_file}"
+            if env_file
+            else f"Not found at {expected}; built-in defaults are in use.",
             detail=(
+                f"Mode: {locations['mode']}. "
+                f"Data directory: {locations['data_dir']}. "
                 "Non-secret AETHRA_* variables: "
                 + ", ".join(f"{k}={v}" for k, v in list(describe_environment().items())[:12])
             ),
-            remedy="" if env_file else "Copy .env.example to .env and set your values.",
+            remedy=(
+                ""
+                if env_file
+                else "Run setup to create it (AETHRA-SEC.exe --setup), or copy "
+                     f".env.example to {expected} and set your values."
+            ),
         )
         invalid = self._settings.authorization.invalid_networks
         add(
@@ -402,7 +417,7 @@ class HealthService:
                 if db_status.is_healthy
                 else (
                     "Check that the MySQL service is running and that "
-                    "AETHRA_DB_* values in .env are correct."
+                    "AETHRA_DB_* values in the configuration file are correct."
                 )
             ),
         )
@@ -562,19 +577,33 @@ class HealthService:
                     else "Install argon2-cffi for the preferred hashing algorithm."
                 ),
             )
-        if self._probes.otp_status is not None:
-            otp = self._probes.otp_status()
-            add(
-                "Two-factor authentication",
-                "security",
-                CheckResult.PASS if getattr(otp, "operational", False) else CheckResult.WARNING,
-                str(getattr(otp, "detail", "Not configured")),
-                remedy=(
-                    ""
-                    if getattr(otp, "operational", False)
-                    else "Optional. Set AETHRA_OTP_ENABLED and the SMTP values in .env to enable."
-                ),
-            )
+        if self._probes.smtp_status is not None:
+            smtp = self._probes.smtp_status() or {}
+            configured = bool(smtp.get("configured"))
+            failed = int(smtp.get("failed", 0) or 0)
+            last_error = str(smtp.get("last_error", "") or "")
+            # Three honest states, and "configured" is not one of the passing
+            # ones by itself. A relay that has refused every message so far is
+            # configured and is not working, and the health screen has to be
+            # able to say the second thing.
+            if not configured:
+                result = CheckResult.SKIPPED
+                summary = "SMTP NOT CONFIGURED - notifications are not emailed"
+                remedy = (
+                    "Optional. Sign-in never uses email; set the SMTP values "
+                    "in the configuration file to receive notifications."
+                )
+            elif failed and last_error:
+                result = CheckResult.WARNING
+                summary = f"{smtp.get('status')} - last send failed: {last_error}"
+                remedy = "Check the SMTP host, port, TLS setting and credentials."
+            else:
+                result = CheckResult.PASS
+                summary = str(
+                    smtp.get("status", "SMTP CONFIGURED")
+                ) + f" - {smtp.get('sent', 0)} sent, {failed} failed"
+                remedy = ""
+            add("Email notifications", "notifications", result, summary, remedy=remedy)
         if self._probes.mitigation_count is not None:
             count = self._probes.mitigation_count()
             add(

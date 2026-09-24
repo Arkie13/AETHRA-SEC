@@ -35,12 +35,14 @@ class BaseChart(tk.Canvas):
         empty_message: str = "No data available",
         empty_detail: str = "",
         padding: tuple[int, int, int, int] = (46, 12, 12, 24),
+        surface: str = "",
     ) -> None:
         """Create an empty chart canvas."""
+        self._surface = surface or PALETTE.background
         super().__init__(
             parent,
             height=height,
-            background=PALETTE.surface,
+            background=self._surface,
             highlightthickness=0,
             borderwidth=0,
         )
@@ -101,7 +103,12 @@ class BaseChart(tk.Canvas):
             ratio = index / lines
             y = bottom - (bottom - top) * ratio
             self.create_line(left, y, right, y, fill=PALETTE.grid, width=1)
-            value = maximum * ratio
+            # The gridline value is a float share of the maximum, but every
+            # axis here counts whole things - packets, alerts, bytes - and the
+            # formatters are documented as taking an int. Passing the raw
+            # float rendered labels like "111.2625" on a packets-per-second
+            # axis, which is precision the measurement does not have.
+            value = int(round(maximum * ratio))
             self.create_text(
                 left - 6, y, text=formatter(value), anchor="e",
                 fill=PALETTE.text_dim, font=("TkDefaultFont", 7),
@@ -150,7 +157,7 @@ class TimeSeriesChart(BaseChart):
         parent: tk.Misc,
         *,
         height: int = 160,
-        colour: str = PALETTE.accent,
+        colour: str = "",
         empty_message: str = "Waiting for live network data...",
         empty_detail: str = "",
         value_formatter=format_count,
@@ -163,7 +170,7 @@ class TimeSeriesChart(BaseChart):
             empty_detail=empty_detail,
         )
         self._points: list[tuple[datetime, float]] = []
-        self._colour = colour
+        self._colour = colour or PALETTE.accent
         self._formatter = value_formatter
         self._fill = fill
         self._series_label = series_label
@@ -240,7 +247,7 @@ class TimeSeriesChart(BaseChart):
         peak_y = bottom - (bottom - top) * (peak / maximum)
         self.create_oval(
             peak_x - 3, peak_y - 3, peak_x + 3, peak_y + 3,
-            fill=self._colour, outline=PALETTE.surface,
+            fill=self._colour, outline=self._surface,
         )
 
         first_local = to_local(self._points[0][0])
@@ -266,7 +273,7 @@ class TimeSeriesChart(BaseChart):
             y = bottom - (bottom - top) * (value / maximum)
             self.create_line(x, top, x, bottom, fill=PALETTE.border_strong, width=1)
             self.create_oval(
-                x - 4, y - 4, x + 4, y + 4, fill=PALETTE.surface,
+                x - 4, y - 4, x + 4, y + 4, fill=self._surface,
                 outline=self._colour, width=2,
             )
             local = to_local(stamp)
@@ -454,6 +461,15 @@ class DonutChart(BaseChart):
         if on_select is not None:
             self.bind("<Button-1>", self._on_click)
 
+    def set_centre_label(self, text: str) -> None:
+        """Restate what the figure in the middle is counted over.
+
+        A caption reading "(24h)" beside a figure counted over a calendar day
+        is simply wrong, and it becomes wrong on its own at midnight.
+        """
+        self._centre_label = str(text)
+        self.redraw()
+
     def set_items(self, items: Sequence[tuple[str, float]]) -> None:
         """Supply real ``(label, value)`` pairs and redraw."""
         self._items = [
@@ -526,7 +542,7 @@ class DonutChart(BaseChart):
                 left + inset, top + inset,
                 left + diameter - inset, top + diameter - inset,
                 start=start, extent=extent, fill=colour,
-                outline=PALETTE.text if hovered else PALETTE.surface,
+                outline=PALETTE.text if hovered else self._surface,
                 width=1, style="pieslice",
             )
             start += extent
@@ -535,7 +551,7 @@ class DonutChart(BaseChart):
         offset = (diameter - hole) / 2
         self.create_oval(
             left + offset, top + offset, left + offset + hole, top + offset + hole,
-            fill=PALETTE.surface, outline="",
+            fill=self._surface, outline="",
         )
         self.create_text(
             left + diameter / 2, top + diameter / 2 - 6,
@@ -662,15 +678,16 @@ class SparkBar(BaseChart):
     """A compact bar sparkline used inside stat cards."""
 
     def __init__(
-        self, parent: tk.Misc, *, height: int = 34, colour: str = PALETTE.accent
+        self, parent: tk.Misc, *, height: int = 34, colour: str = ""
     ) -> None:
         """Create the sparkline."""
         super().__init__(
-            parent, height=height, empty_message="", padding=(0, 2, 0, 2)
+            parent, height=height, empty_message="", padding=(0, 2, 0, 2),
+            surface=PALETTE.surface,
         )
         self.configure(width=40)  # see Sparkline: do not dictate the tile width
         self._values: list[float] = []
-        self._colour = colour
+        self._colour = colour or PALETTE.accent
 
     def set_values(self, values: Sequence[float]) -> None:
         """Supply real values and redraw."""
@@ -710,7 +727,7 @@ class Sparkline(BaseChart):
         parent: tk.Misc,
         *,
         height: int = 26,
-        colour: str = PALETTE.accent,
+        colour: str = "",
         value_formatter=format_count,
         label: str = "",
     ) -> None:
@@ -723,7 +740,7 @@ class Sparkline(BaseChart):
         # it only needs to request enough to exist.
         self.configure(width=40)
         self._values: list[float] = []
-        self._colour = colour
+        self._colour = colour or PALETTE.accent
         self._formatter = value_formatter
         self._label = label
         self._hover_index: int | None = None
@@ -784,7 +801,7 @@ class Sparkline(BaseChart):
             y = (height - 3) - (height - 6) * (value / maximum)
             self.create_oval(
                 x - 2.5, y - 2.5, x + 2.5, y + 2.5,
-                fill=PALETTE.surface, outline=self._colour,
+                fill=self._surface, outline=self._colour,
             )
             text = self._formatter(value)
             if self._label:

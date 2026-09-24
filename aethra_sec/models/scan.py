@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from aethra_sec.models.enums import EvidenceSource, HostStatus, RiskLevel, ScanStatus
+from aethra_sec.models.enums import ScanTrigger, EvidenceSource, HostStatus, RiskLevel, ScanStatus
 
 
 @dataclass
@@ -87,6 +87,25 @@ class ScanFinding:
     source: EvidenceSource = EvidenceSource.NMAP
     resolved_at: datetime | None = None
     created_at: datetime | None = None
+    #: CVSS v3.1 base score, only when a real source supplied one: a score the
+    #: ``vulners`` NSE script printed beside a CVE, or one an administrator
+    #: recorded in the vulnerability knowledge base. Never estimated.
+    cvss_base_score: float | None = None
+    #: Where the score came from ("Nmap NSE vulners", "Configured knowledge
+    #: base"); empty when there is no score.
+    cvss_source: str = ""
+
+    @property
+    def effective_rating(self) -> RiskLevel:
+        """The rating §3.9.9 classifies on: the CVSS band where scored, else
+        the rating the finding was recorded with."""
+        if self.cvss_base_score is not None:
+            from aethra_sec.models.host import cvss_band
+
+            band = cvss_band(self.cvss_base_score)
+            if band is not None:
+                return band
+        return self.risk_level
 
     @property
     def status_text(self) -> str:
@@ -101,6 +120,10 @@ class ScanFinding:
         return "Potential exposure identified; further vulnerability verification required."
 
 
+#: Shown where Nmap ran a probe and it returned nothing. Distinct from an
+#: empty value, which would read as though the field was never examined.
+NOT_DETECTED = "Not detected"
+
 @dataclass
 class ScanHostResult:
     """One host inside a scan result."""
@@ -114,10 +137,52 @@ class ScanHostResult:
     vendor: str = ""
     status: HostStatus = HostStatus.UNKNOWN
     os_name: str = ""
+    os_version: str = ""
+    os_cpe: str = ""
     os_accuracy: int | None = None
     os_family: str = ""
+    #: How the hostname and OS were established ("SMB", "NetBIOS", "reverse
+    #: DNS", "Nmap fingerprint"), so a result can be judged on its source.
+    hostname_source: str = ""
+    os_source: str = ""
+    #: Why a field is unknown, when it is.
+    identity_notes: tuple[str, ...] = ()
     ports: list[PortResult] = field(default_factory=list)
     findings: list[ScanFinding] = field(default_factory=list)
+
+    @property
+    def hostname_text(self) -> str:
+        """The hostname, or ``Not detected`` when discovery found none.
+
+        "Not detected" rather than "Unknown": it states that a probe ran and
+        returned nothing, which is a result, instead of implying the field was
+        never examined.
+        """
+        return self.hostname.strip() or NOT_DETECTED
+
+    @property
+    def os_text(self) -> str:
+        """The operating system with its version and confidence, or Unknown.
+
+        Accuracy is shown when the answer came from a fingerprint, because a
+        fingerprint is an inference. A value the host reported about itself
+        over SMB needs no such qualifier.
+        """
+        if not self.os_name:
+            # A family without a specific match is still an answer worth
+            # showing - "Windows" narrows the field even when the build does
+            # not. It is labelled so nobody reads it as a precise match.
+            return (
+                f"{self.os_family} (family only)"
+                if self.os_family
+                else NOT_DETECTED
+            )
+        text = self.os_name
+        if self.os_version and self.os_version not in text:
+            text = f"{text} {self.os_version}"
+        if self.os_accuracy:
+            text = f"{text} ({self.os_accuracy}%)"
+        return text
 
     @property
     def open_ports(self) -> list[PortResult]:
@@ -158,6 +223,10 @@ class Scan:
     error_message: str = ""
     nmap_version: str = ""
     command_line: str = ""
+    #: What caused this assessment to run. Recorded so automatic assessment
+    #: is demonstrable: a history in which every row reads MANUAL proves
+    #: nothing about automation.
+    trigger_source: ScanTrigger = ScanTrigger.MANUAL
     initiated_by: int | None = None
     initiated_by_username: str = ""
     created_at: datetime | None = None
@@ -179,6 +248,38 @@ class Scan:
             f"{self.hosts_up} host(s) up, {self.open_ports} open port(s), "
             f"{self.findings_count} finding(s)"
         )
+
+    #: Ports named inline before the summary falls back to a bare count.
+    OPEN_PORT_PREVIEW = 12
+
+    @property
+    def open_ports_line(self) -> str:
+        """The open ports themselves, per host, not just how many there are.
+
+        A count answers "is there anything here"; it does not answer "what".
+        An operator reading "6 open port(s)" still has to go and find out
+        which six, so the six are named here as well.
+
+        Returns an empty string when the scan is not finished or found no open
+        port - there is then nothing to name, and an empty line says that more
+        honestly than "none" beside a zero that is already on screen.
+        """
+        parts: list[str] = []
+        for host in self.hosts:
+            ports = host.open_ports
+            if not ports:
+                continue
+            ordered = sorted(ports, key=lambda p: (p.protocol, p.port))
+            shown = ordered[: self.OPEN_PORT_PREVIEW]
+            listed = ", ".join(
+                f"{port.port}/{port.protocol}"
+                + (f" ({port.service})" if port.service else "")
+                for port in shown
+            )
+            if len(ordered) > len(shown):
+                listed += f", and {len(ordered) - len(shown)} more"
+            parts.append(f"{host.ip_address}: {listed}")
+        return "   ".join(parts)
 
 
 @dataclass

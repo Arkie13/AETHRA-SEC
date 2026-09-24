@@ -19,6 +19,7 @@ from starting - it is reported on the System Health screen instead (§58).
 from __future__ import annotations
 
 import threading
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -60,12 +61,14 @@ from aethra_sec.security.authentication import (
     AuthenticationPolicy,
     AuthenticationService,
 )
-from aethra_sec.security.otp import OtpService
 from aethra_sec.security.password import PasswordHashService
 from aethra_sec.security.rbac import AccessControl
 from aethra_sec.services import (
+    AssessmentQueueService,
+    AudioAlertService,
     CorrelationService,
     DashboardService,
+    EmailNotifier,
     HealthService,
     BackupService,
     HostService,
@@ -121,7 +124,10 @@ class ApplicationContext:
         self.sessions = SessionManager()
         self.risk_engine = RiskEngine()
         self.passwords = PasswordHashService()
-        self.otp = OtpService(self.settings.otp)
+        # Email is a notification channel. It is constructed here, before the
+        # database, precisely because nothing about signing in depends on it -
+        # if it were part of authentication its failure would be a lockout.
+        self.email = EmailNotifier(self.settings.smtp, audit=self._audit_email)
         self.startup = StartupReport()
         self._lock = threading.RLock()
         self._started = False
@@ -141,10 +147,14 @@ class ApplicationContext:
         self.mitigation: MitigationService | None = None
         self.correlation: CorrelationService | None = None
         self.dashboard: DashboardService | None = None
+        #: Declared here like every other service, so a start-up path
+        #: that does not build it still leaves a defined attribute.
+        self.assessment_queue: AssessmentQueueService | None = None
         self.hosts: HostService | None = None
         self.reports: ReportService | None = None
         self.logs: LogService | None = None
         self.notifications: NotificationService | None = None
+        self.audio_alerts: AudioAlertService | None = None
         self.health: HealthService | None = None
         self.retention: RetentionService | None = None
         self.backup: BackupService | None = None
@@ -274,8 +284,8 @@ class ApplicationContext:
             self.startup = report
             self._started = True
             LOGGER.info(
-                "Startup complete: database=%s schema=%s snort=%s "
-                "(%d warning(s), %d error(s))",
+                "Startup complete: database=%s schema=%s snort=%s (%d warning(s), "
+                "%d error(s))",
                 report.database_connected, report.schema_ok, report.snort_started,
                 len(warnings), len(errors),
             )
@@ -305,7 +315,7 @@ class ApplicationContext:
         self.settings_service = SettingsService(settings_repo, self.access, self.audit)
 
         self.authentication = AuthenticationService(
-            user_repo, self.sessions, self.passwords, self.audit, self.otp,
+            user_repo, self.sessions, self.passwords, self.audit,
             self._authentication_policy(),
         )
         self.users = UserService(
@@ -322,34 +332,80 @@ class ApplicationContext:
         self.nmap = NmapService(
             scan_repo, host_repo, self.event_bus, self.audit, self.access,
             self.settings.tools, self.settings.authorization, self.risk_engine,
+            timeout_provider=lambda: self.settings_service.get_int(
+                "assessment.scan_timeout_seconds", 1800
+            ),
         )
         self.capture = PacketCaptureService(
             traffic_repo, host_repo, alert_repo, self.settings_service,
             self.event_bus, self.audit, self.access, self.settings.tools,
-            self.settings.capture,
+            self.settings.capture, self.settings.capture_dir,
         )
         self.snort = SnortService(
             alert_repo, host_repo, self.settings_service, self.event_bus,
             self.audit, self.access, self.settings.snort, self.settings.tools,
             self.risk_engine,
         )
-        self.mitigation = MitigationService(mitigation_repo, self.audit, self.access)
+        self.mitigation = MitigationService(
+            mitigation_repo, self.audit, self.access, incident_repo
+        )
         self.correlation = CorrelationService(
             incident_repo, alert_repo, scan_repo, host_repo, self.mitigation,
             self.settings_service, self.event_bus, self.audit, self.access,
             self.risk_engine,
         )
         self.dashboard = DashboardService(
-            traffic_repo, alert_repo, incident_repo, scan_repo, host_repo,
+            traffic_repo, alert_repo, scan_repo, host_repo,
             audit_repo, self.access,
         )
+        #: Automatic assessment of hosts the capture pipeline has observed.
+        #: Bounded by the *monitored* authorised network: the subnet of the
+        #: adapter capture is using, inside the configured authorised ranges
+        #: Nmap also enforces. Not "any private address".
+        self.assessment_queue = AssessmentQueueService(
+            host_repo, self.nmap, self.settings_service,
+            authorized_networks=self.settings.authorization.networks,
+            scope_provider=self.assessment_scope,
+            audit=self.audit,
+            sessions=self.sessions,
+        )
+        self.dashboard.set_scope_provider(self.assessment_queue.scope)
+        # Anything left SCANNING by a process that did not finish would never
+        # be assessed again, so the claim is released at start-up.
+        try:
+            released = host_repo.reset_stuck_assessments()
+            if released:
+                LOGGER.info(
+                    "Released %d host(s) left mid-assessment by a previous run.",
+                    released,
+                )
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("Could not release stuck assessments.", exc_info=True)
+
+        # The same reasoning for the scan rows themselves: an Nmap child
+        # cannot outlive the console, so anything still RUNNING at start-up
+        # belongs to a run that died. Closing it keeps the scan list honest
+        # about what is actually happening now.
+        try:
+            abandoned = scan_repo.reset_stuck_scans(
+                "Interrupted: the console stopped before this scan finished."
+            )
+            if abandoned:
+                LOGGER.warning(
+                    "Closed %d scan(s) left running by a previous session: %s",
+                    len(abandoned),
+                    ", ".join(str(scan_id) for scan_id in abandoned),
+                )
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("Could not close abandoned scans.", exc_info=True)
+
         self.hosts = HostService(
-            host_repo, scan_repo, alert_repo, incident_repo, traffic_repo,
+            host_repo, scan_repo, alert_repo, traffic_repo,
             self.audit, self.access,
         )
         self.reports = ReportService(
             ReportBuilder(scan_repo, alert_repo, incident_repo, host_repo,
-                          traffic_repo, audit_repo),
+                          traffic_repo, audit_repo, mitigation=self.mitigation),
             report_repo, self.event_bus, self.audit, self.access,
             self.settings.report_dir,
         )
@@ -359,6 +415,14 @@ class ApplicationContext:
         self.notifications = NotificationService(
             notification_repo, error_repo, self.settings_service, self.event_bus
         )
+        # Sign-in security alerts go through the notification service that
+        # already exists rather than a parallel one. Attached here because the
+        # authentication service is constructed earlier in the start-up order.
+        self.authentication.attach_notifications(self.notifications)
+        # Sounds for notifications the service above has already raised from
+        # real evidence. It observes; it never detects, so it cannot originate
+        # an event of its own.
+        self.audio_alerts = AudioAlertService(self.settings_service)
         self.retention = RetentionService(
             db, traffic_repo, alert_repo, scan_repo, report_repo,
             self.settings_service, self.audit, self.access,
@@ -382,9 +446,51 @@ class ApplicationContext:
                 event_bus_stats=self.event_bus.statistics,
                 session_count=self.sessions.count,
                 password_algorithm=lambda: self.passwords.algorithm_description,
-                otp_status=self.otp.status,
+                smtp_status=self.email.statistics,
                 mitigation_count=self.mitigation.count_active,
             ),
+        )
+
+    def assessment_scope(self) -> Any:
+        """The automatic assessment scope for the interface being monitored.
+
+        Read fresh on every call from the live adapter table, so it follows the
+        machine if it moves network. The capture service's interface is the
+        one currently or most recently monitored; before capture has run on
+        anything, there is no monitored network and the scope is unavailable.
+        """
+        from aethra_sec.analytics.assessment_scope import resolve_scope
+
+        interface = self.capture.interface if self.capture is not None else ""
+        max_addresses = 1024
+        if self.settings_service is not None:
+            max_addresses = self.settings_service.get_int(
+                "assessment.max_scope_addresses", 1024
+            )
+        return resolve_scope(
+            interface,
+            self.settings.authorization.networks,
+            max_addresses=max_addresses,
+        )
+
+    def _audit_email(self, delivered: bool, recipient: str, detail: str) -> None:
+        """Record a notification email's real outcome in the audit trail.
+
+        The address is already masked by the notifier and the credential never
+        reaches this point, so what is written says what happened without
+        disclosing who or with what.
+        """
+        if self.audit is None:
+            return
+        self.audit.record(
+            AuditAction.NOTIFICATION_EMAIL_SENT
+            if delivered
+            else AuditAction.NOTIFICATION_EMAIL_FAILED,
+            category=AuditCategory.SYSTEM,
+            result="SUCCESS" if delivered else "FAILURE",
+            target_type="email",
+            target_id=recipient,
+            detail=detail,
         )
 
     def _authentication_policy(self) -> AuthenticationPolicy:
@@ -446,6 +552,13 @@ class ApplicationContext:
             self.scheduler.add_job(
                 "retention", retention_interval * 60.0, self._safe(self.retention.run)
             )
+        if self.assessment_queue is not None:
+            # Deliberately infrequent: the cycle only *selects* hosts, and each
+            # selection may start a real Nmap process against a real machine.
+            self.scheduler.add_job(
+                "assessment-queue", 60.0,
+                self._safe(self.assessment_queue.run_cycle),
+            )
         if self.hosts is not None:
             # Capture cannot see a hostname, so an inventory it built has none
             # until something asks DNS. This is the something - when an
@@ -458,6 +571,13 @@ class ApplicationContext:
             self.scheduler.add_job(
                 "hostname-resolve", resolve_interval * 60.0,
                 self._safe(self._resolve_hostnames_if_enabled),
+            )
+            # A host that stops sending is marked OFFLINE after a configured
+            # gap, without erasing its history or its assessments (§20). The
+            # job runs every minute and the cutoff is read each time, so the
+            # interval takes effect without re-registering the job.
+            self.scheduler.add_job(
+                "host-liveness", 60.0, self._safe(self._mark_stale_hosts_offline)
             )
         if self.backup is not None:
             # The job ticks every minute and the service decides whether a
@@ -490,6 +610,25 @@ class ApplicationContext:
             return
         self.hosts.resolve_pending()
 
+    def _mark_stale_hosts_offline(self) -> None:
+        """Mark hosts not seen within the configured window as OFFLINE (§20).
+
+        History and assessments are retained; a host returns to UP the moment
+        capture observes it transmitting again.
+        """
+        if self._db is None or self.settings_service is None:
+            return
+        from datetime import timedelta
+
+        from aethra_sec.utils.timeutil import utcnow
+
+        minutes = max(1, self.settings_service.get_int("hosts.offline_after_minutes", 15))
+        cutoff = utcnow() - timedelta(minutes=minutes)
+        host_repo = HostRepository(self.db)
+        marked = host_repo.mark_stale_offline(cutoff)
+        if marked:
+            LOGGER.info("Marked %d host(s) OFFLINE (not seen in %d min).", marked, minutes)
+
     @staticmethod
     def _safe(action: Any) -> Any:
         """Wrap a job so its failure is logged rather than raised."""
@@ -517,24 +656,106 @@ class ApplicationContext:
     # Session handling
     # ------------------------------------------------------------------
     def set_session(self, session: Session | None) -> None:
-        """Record the signed-in session for the interface to use."""
+        """Record the signed-in session, and give automation its own.
+
+        Automatic assessment runs *as somebody*: every scan it starts is
+        audited against a session and refused without ``scan.run``. The queue
+        stays idle until a session is attached, so this is where the loop from
+        discovery to assessment is actually closed - without it the background
+        cycle observes hosts, finds them due, and starts nothing.
+
+        The queue gets a **separate** session rather than the operator's own.
+        The operator's session idles out after ``security.session_timeout_minutes``
+        (60 by default) while the reassessment cooldown is six hours, so by the
+        time a host was due again the session had always expired: every scan
+        was then refused with "Your session has expired" and the host was
+        recorded as SKIPPED. Automation stopped roughly an hour after the
+        operator stopped clicking, which is exactly the artificial timeout it
+        must not have.
+
+        The separate session keeps the interactive idle-logout intact - an
+        unattended console still expires - while the background cycle refreshes
+        only its own. It is still attributed to the operator who signed in, so
+        nothing runs unattributed, and it is revoked below on sign-out.
+        """
+        previous = getattr(self, "_automation_session", None)
+        if previous is not None and self.sessions is not None:
+            # Never leave a live automation session behind for a user who has
+            # gone: one operator's automation must not outlive their sign-in.
+            self.sessions.invalidate(previous.token)
+        self._automation_session = None
+
         self.current_session = session
+        if self.assessment_queue is None:
+            return
+        if session is None or self.sessions is None:
+            self.assessment_queue.attach_session(None)
+            return
+        self._automation_session = self.sessions.create(
+            user_id=session.user_id,
+            username=session.username,
+            role=session.role,
+            permissions=session.permissions,
+            host_context="automatic-assessment",
+        )
+        self.assessment_queue.attach_session(self._automation_session)
 
     def sign_out(self, reason: str = "logout") -> None:
         """Sign the current session out."""
         if self.authentication and self.current_session:
             self.authentication.logout(self.current_session, reason)
-        self.current_session = None
+        # Detach through set_session so the assessment queue stops attributing
+        # automatic scans to a session that no longer exists.
+        self.set_session(None)
 
     # ------------------------------------------------------------------
     # Shutdown (§74)
     # ------------------------------------------------------------------
+    def _log_shutdown_origin(self, reason: str) -> None:
+        """Record who asked for shutdown, from where, and what was still up."""
+        caller = "unknown"
+        try:
+            # Skip this frame and shutdown() itself to name the real requester.
+            stack = traceback.extract_stack()[:-2]
+            trail = [
+                f"{frame.filename.rsplit(chr(92), 1)[-1]}:{frame.lineno} {frame.name}"
+                for frame in stack[-4:]
+            ]
+            caller = " <- ".join(reversed(trail))
+        except Exception:  # noqa: BLE001 - diagnostics must not break shutdown
+            pass
+
+        capture_state = "no capture service"
+        if self.capture is not None:
+            try:
+                capture_state = str(self.capture.state)
+            except Exception:  # noqa: BLE001
+                capture_state = "unreadable"
+
+        LOGGER.info(
+            "APPLICATION SHUTDOWN REQUEST reason=%s thread=%s capture=%s "
+            "scheduler=%s source=%s",
+            reason,
+            threading.current_thread().name,
+            capture_state,
+            "running" if self.scheduler.is_running else "stopped",
+            caller,
+        )
+        LOGGER.info("%s shutting down (%s).", APP_NAME, reason)
+
     def shutdown(self, reason: str = "normal shutdown") -> None:
-        """Stop every subsystem safely and close the database pool."""
+        """Stop every subsystem safely and close the database pool.
+
+        Shutdown is recorded with its origin, not just its reason. An
+        application that closes on its own is only diagnosable if the log says
+        who asked: a console interrupt, a worker, the operator's Exit button
+        and the process-exit handler all arrive here, and they look identical
+        once the subsystems start stopping.
+        """
         with self._lock:
             if not self._started:
                 return
-            LOGGER.info("%s shutting down (%s).", APP_NAME, reason)
+            self._log_shutdown_origin(reason)
 
             for label, action in (
                 ("capture", lambda: self.capture.shutdown() if self.capture else None),
@@ -545,6 +766,11 @@ class ApplicationContext:
                     "notifications",
                     lambda: self.notifications.close() if self.notifications else None,
                 ),
+                (
+                    "audio alerts",
+                    lambda: self.audio_alerts.close() if self.audio_alerts else None,
+                ),
+                ("email", self.email.close),
             ):
                 try:
                     action()

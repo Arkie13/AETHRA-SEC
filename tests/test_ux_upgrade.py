@@ -6,10 +6,11 @@ What is pinned here is behaviour an analyst depends on, not styling:
   the way an operator expects - ✕, Esc, or a click outside;
 * the drawer's content is shaped from stored records only, and says so plainly
   where a record holds nothing;
-* the palette reaches real hosts, incidents and alerts, through the services,
+* the palette reaches real hosts and alerts, through the services,
   under the session's own permissions;
-* the dashboard's time range is passed to the query rather than filtered in
-  the interface, and a range the data cannot cover is not offered;
+* the dashboard's reporting period is passed to the query rather than
+  filtered in the interface, and both halves of the page are assembled
+  from the same one;
 * a table's quick filter narrows *with* the screen's filters, never instead of
   them, and hiding a column never discards its data.
 
@@ -20,6 +21,7 @@ the way the sign-out and bug-fix suites do; everything callable is called.
 from __future__ import annotations
 
 import inspect
+from datetime import date
 
 import pytest
 
@@ -31,7 +33,6 @@ from aethra_sec.ui import base as base_module
 from aethra_sec.ui import detail_panels
 from aethra_sec.ui.screens import dashboard as dashboard_module
 from aethra_sec.ui.screens import hosts as hosts_module
-from aethra_sec.ui.screens import incidents as incidents_module
 from aethra_sec.ui.screens import vulnerabilities as vulnerabilities_module
 from aethra_sec.ui.widgets import drawer as drawer_module
 from aethra_sec.ui.widgets import palette as palette_module
@@ -97,7 +98,6 @@ class TestDrawerDismissal:
         """A drawer must never outlive the page it belongs to."""
         for module, screen in (
             (hosts_module, "HostsScreen"),
-            (incidents_module, "IncidentsScreen"),
             (vulnerabilities_module, "VulnerabilitiesScreen"),
         ):
             source = inspect.getsource(getattr(module, screen).on_hide)
@@ -120,7 +120,9 @@ class TestDrawerContent:
         assert rows["Risk level"] == "HIGH"
         assert "Open ports" in titles
         assert "Vulnerability findings" in titles
-        assert "Related incidents" in titles
+        # The incidents section went with the Threat Incidents screen; its
+        # alerts section above carries the same events.
+        assert "Related incidents" not in titles
         assert "Related alerts" in titles
 
     def test_missing_values_are_stated_not_guessed(self) -> None:
@@ -130,7 +132,11 @@ class TestDrawerContent:
                 {"host": _host(hostname="", mac_address="", os_name="", vendor="")}
             )[0].rows
         )
-        assert rows["Hostname"] == "not resolved"
+        # The identity row says "Unknown"; the row beneath it says which
+        # absence that is. "Not checked" in the identity row read as "this
+        # host was skipped" when it sat beside a completed assessment.
+        assert rows["Hostname"] == "Unknown"
+        assert rows["Hostname lookup"] == "Not looked up yet"
         assert rows["MAC address"] == "not observed"
         # "not scanned" rather than "not fingerprinted": it names the action
         # that would fill the field, and matches what the inventory table now
@@ -176,39 +182,10 @@ class TestDrawerContent:
         assert "22/tcp" in sections[1].text
         assert "ssh exposed" in sections[2].text
 
-    def test_an_address_outside_the_inventory_says_so(self) -> None:
-        """An incident can name an address the inventory has never seen."""
-        sections = detail_panels.unknown_device_sections(
-            {"ip": "203.0.113.9", "role": "source"}
-        )
-        assert dict(sections[0].rows)["IP address"] == "203.0.113.9"
-        assert "not in the host inventory" in sections[1].text
-
     def test_a_section_carries_rows_or_text(self) -> None:
         """The two shapes the drawer knows how to draw."""
         assert DrawerSection("t", rows=[("a", "b")]).rows
         assert DrawerSection("t", text="x").text
-
-
-class TestIncidentDeviceInspection:
-    """Following a device must not cost the analyst their place."""
-
-    def test_double_click_inspects_in_place(self) -> None:
-        """The drawer, not a navigation away from the incident."""
-        source = inspect.getsource(incidents_module.IncidentsScreen._build_summary_tab)
-        assert "on_activate=self._inspect_device" in source
-
-    def test_the_full_page_is_still_one_click_away(self) -> None:
-        """Inspecting in place is the default, not the only option."""
-        source = inspect.getsource(incidents_module.IncidentsScreen._build_summary_tab)
-        assert "Open in host inventory" in source
-        primary = inspect.getsource(incidents_module.IncidentsScreen._show_device_drawer)
-        assert "Open in Host Inventory" in primary
-
-    def test_an_unknown_address_still_opens(self) -> None:
-        """It is real - the incident named it - so it is still inspectable."""
-        source = inspect.getsource(incidents_module.IncidentsScreen._inspect_device)
-        assert "unknown_device_sections" in source
 
 
 # ---------------------------------------------------------------------------
@@ -221,20 +198,22 @@ class TestPaletteRecordSearch:
         """No new query path: the screens' own search methods."""
         source = inspect.getsource(app_module.MainWindow._record_commands)
         assert "hosts.search(session" in source
-        assert "correlation.search(" in source
+        # The palette no longer searches incidents: there is no screen to
+        # open one in. Alerts are the security event of record.
+        assert "correlation.search(" not in source
         assert "snort.search(session" in source
 
     def test_each_source_is_permission_checked(self) -> None:
         """The palette can only surface what this role may read."""
         source = inspect.getsource(app_module.MainWindow._record_commands)
-        for permission in ("host.view", "incident.view", "alert.view"):
+        for permission in ("host.view", "alert.view"):
             assert f'self._may("{permission}")' in source
 
     def test_results_open_through_existing_routing(self) -> None:
         """Navigation, not a new detail path."""
         source = inspect.getsource(app_module.MainWindow._record_commands)
         assert 'self.navigate(\n                            "hosts", focus_host=' in source
-        assert '"incidents", focus_incident=' in source
+        assert '"incidents", focus_incident=' not in source
 
     def test_the_search_runs_off_the_tk_thread(self) -> None:
         """It is a database query; the palette must stay responsive."""
@@ -276,47 +255,68 @@ class TestPaletteRecordSearch:
 # Dashboard time range
 # ---------------------------------------------------------------------------
 class TestDashboardRanges:
-    """The range is a query parameter, not a display filter."""
+    """The reporting period is a query parameter, not a display filter.
 
-    def test_the_offered_ranges(self) -> None:
-        """The five the operator asked for, in ascending order."""
-        labels = [label for label, _hours in dashboard_module.TIME_RANGES]
-        assert labels == ["15m", "1h", "6h", "24h", "7d"]
-        hours = [h for _label, h in dashboard_module.TIME_RANGES]
-        assert hours == sorted(hours)
-        assert hours[0] == pytest.approx(0.25)
-        assert hours[-1] == pytest.approx(168.0)
+    This replaced a set of trailing windows (15m/1h/6h/24h/7d). They were
+    genuinely useful for a live incident, but they could not answer the
+    question the tiles claimed to answer: "packets today" over a rolling 24
+    hours still counts most of yesterday at 00:05, and there is no moment at
+    which a new day starts. The periods are calendar-bounded instead, and the
+    daily rollover has its own suite in ``test_dashboard_daily_reset``.
+    """
 
-    def test_the_window_reaches_the_query(self) -> None:
+    def test_the_offered_periods(self) -> None:
+        """Today, one day, one month, one year, everything, or your own."""
+        from aethra_sec.models.periods import PeriodMode
+
+        modes = [mode for _label, mode, _choice in dashboard_module.PERIOD_BUTTONS]
+        assert modes == [
+            PeriodMode.TODAY, PeriodMode.DAY, PeriodMode.MONTH,
+            PeriodMode.YEAR, PeriodMode.ALL, PeriodMode.CUSTOM,
+        ]
+
+    def test_the_period_reaches_the_query(self) -> None:
         """Not filtered in the interface - asked of the database."""
         source = inspect.getsource(dashboard_module.DashboardScreen.refresh)
-        assert "dashboard.snapshot(session, window_hours=window)" in source
-        assert "network_overview(session, window_hours=window)" in source
+        assert "dashboard.snapshot(session, period=period)" in source
+        assert "network_overview(session, period=period)" in source
 
-    def test_the_service_accepts_a_sub_hour_window(self) -> None:
-        """A 15-minute view during a live incident has to be answerable."""
+    def test_both_halves_of_the_page_get_the_same_period_object(self) -> None:
+        """Two windows would let the tiles and the talkers panel disagree."""
+        source = inspect.getsource(dashboard_module.DashboardScreen.refresh)
+        assert source.count("period=period") == 2
+
+    def test_the_period_is_read_on_the_tk_thread(self) -> None:
+        """A worker must not read screen state, and a rollover landing
+        mid-load must not split the two queries across two windows."""
+        source = inspect.getsource(dashboard_module.DashboardScreen.refresh)
+        worker_at = source.index("self.run_async")
+        assert "period = self._period.refreshed()" in source[:worker_at]
+
+    def test_the_service_takes_a_period(self) -> None:
         from aethra_sec.services.dashboard_service import DashboardService
 
         signature = inspect.signature(DashboardService.snapshot)
-        assert signature.parameters["window_hours"].default == pytest.approx(24.0)
-        source = inspect.getsource(DashboardService.snapshot)
-        assert "max(0.05, float(window_hours))" in source
+        assert "period" in signature.parameters
+        assert signature.parameters["period"].default is None
 
-    def test_a_range_the_data_cannot_cover_is_disabled(self) -> None:
-        """An empty chart is not an answer; not offering it is."""
-        source = inspect.getsource(dashboard_module.DashboardScreen._paint_range_buttons)
-        assert "disabled" in source
-        assert "covered" in source
+    def test_the_dates_covered_are_spelled_out(self) -> None:
+        """"Today" alone does not say which today, and that matters most at
+        the moment the day changes."""
+        source = inspect.getsource(dashboard_module.DashboardScreen._paint_period)
+        assert "self._period.detail" in source
 
-    def test_coverage_is_read_from_the_stored_series(self) -> None:
-        """What the database actually holds decides, not a guess."""
-        source = inspect.getsource(dashboard_module.DashboardScreen._note_coverage)
-        assert "snapshot.traffic_series" in source
+    def test_the_active_period_is_marked(self) -> None:
+        source = inspect.getsource(dashboard_module.DashboardScreen._paint_period)
+        assert "ToolAccent.TButton" in source
 
-    def test_nothing_stored_leaves_every_range_available(self) -> None:
-        """A fresh installation must not have its controls greyed out."""
-        source = inspect.getsource(dashboard_module.DashboardScreen._paint_range_buttons)
-        assert "covered is None" in source
+    def test_a_period_the_operator_did_not_enter_is_never_guessed(self) -> None:
+        """A malformed date reports on the wrong day; refusing is correct."""
+        assert dashboard_module._parse_date("not a date") is None
+        assert dashboard_module._parse_date("") is None
+        assert dashboard_module._parse_date("2026-09-06") == date(2026, 9, 6)
+        assert dashboard_module._parse_year("26xx") is None
+        assert dashboard_module._parse_year("2026") == 2026
 
 
 class TestStatTiles:
@@ -342,13 +342,36 @@ class TestStatTiles:
         assert "self._seen_a_value" in source
 
     def test_tiles_reflow_rather_than_clip(self) -> None:
-        """Six metrics on a narrow window wrap; they do not get cut off."""
-        source = inspect.getsource(dashboard_module.DashboardScreen._layout_stat_row)
+        """Six metrics on a narrow window wrap; they do not get cut off.
+
+        The reflow used to live on the dashboard because the figures were six
+        separate cards it gridded itself. They are now one shared KpiStrip, so
+        the behaviour - and this guarantee - belongs to that component and
+        holds for every screen that uses it.
+        """
+        from aethra_sec.ui.widgets import kpi as kpi_module
+
+        source = inspect.getsource(kpi_module.KpiStrip._layout)
         assert "divmod(index, columns)" in source
-        configure = inspect.getsource(
-            dashboard_module.DashboardScreen._on_stat_row_configure
-        )
-        assert "MIN_TILE_WIDTH" in configure
+        configure = inspect.getsource(kpi_module.KpiStrip._on_configure)
+        assert "MIN_CELL_WIDTH" in configure
+
+    def test_the_headline_figures_are_a_strip_not_a_grid_of_cards(self) -> None:
+        """The composition being rejected was six elevated cards on a grid.
+
+        What is pinned here is the replacement: one band whose cells are
+        divided by a hairline and sit on the page ground rather than each
+        being its own surface.
+        """
+        from aethra_sec.ui.widgets import kpi as kpi_module
+
+        cell = inspect.getsource(kpi_module._KpiCell.__init__)
+        assert 'style="Card.TFrame"' in cell, "a cell sits on the page ground"
+        layout = inspect.getsource(kpi_module.KpiStrip._layout)
+        assert "background=PALETTE.border, width=1" in layout, "divided, not boxed"
+        build = inspect.getsource(dashboard_module.DashboardScreen._build_stat_row)
+        assert "KpiStrip(" in build
+        assert "MetricTile(" not in build
 
 
 # ---------------------------------------------------------------------------
@@ -400,12 +423,6 @@ class TestTableInteractions:
         source = inspect.getsource(tables_module.DataTable.__init__)
         assert '"<Shift-F10>"' in source
         assert "except tk.TclError" in source
-
-    def test_a_small_embedded_table_keeps_its_chrome_off(self) -> None:
-        """A filter box over four rows is noise, not a feature."""
-        source = inspect.getsource(incidents_module.IncidentsScreen._build_summary_tab)
-        assert "show_toolbar=False" in source
-
 
 class TestLoadingFeedback:
     """Slow work is visible, and never blocks the console."""

@@ -21,9 +21,13 @@ from typing import Any
 
 from aethra_sec.config.environment import describe_environment, loaded_env_file
 from aethra_sec.models.system import SystemSetting
+from aethra_sec.core.errors import AethraError
+from aethra_sec.services.email_service import mask_email
 from aethra_sec.ui.base import Screen
-from aethra_sec.ui.theme import PALETTE, configure_text_widget
+from aethra_sec.ui.theme import METRICS, PALETTE, configure_text_widget
 from aethra_sec.ui.widgets import (
+    Fact,
+    FactGrid,
     Card,
     Column,
     DataTable,
@@ -55,6 +59,14 @@ BACKUP_COLUMNS = (
 )
 
 
+#: The stored preference the switch and the audio service both read.
+SETTING_SOUND_ENABLED = "notifications.sound_enabled"
+
+#: Both positions of the switch, so its two labels are defined together.
+SOUND_ON_LABEL = "\U0001F50A Sound ON"
+SOUND_OFF_LABEL = "\U0001F507 Sound OFF"
+
+
 class SettingsScreen(Screen):
     """Edit tunable settings and inspect deployment configuration."""
 
@@ -75,6 +87,10 @@ class SettingsScreen(Screen):
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True)
 
+        security = ttk.Frame(notebook, style="TFrame", padding=10)
+        notebook.add(security, text="Security")
+        self._build_security(security)
+
         tunable = ttk.Frame(notebook, style="TFrame", padding=10)
         notebook.add(tunable, text="Tunable settings")
         self._build_tunable(tunable)
@@ -91,9 +107,117 @@ class SettingsScreen(Screen):
         notebook.add(backup, text="Database backup")
         self._build_backup(backup)
 
+    def _build_security(self, parent: tk.Misc) -> None:
+        """How sign-in works here, and where notifications go.
+
+        Read-only on purpose. Everything on this card is deployment
+        configuration - the operator changes it in the configuration file or
+        through the setup wizard, not from inside a signed-in session.
+        """
+        card = Card(
+            parent, "Authentication and notifications",
+            subtitle="how sign-in works, and where alerts are sent",
+            fonts=self.fonts, padding=12,
+        )
+        card.pack(fill="x")
+
+        self._security_facts = FactGrid(card, fonts=self.fonts)
+        self._security_facts.pack(fill="x")
+
+        self._security_note = ttk.Label(
+            card, text="", style="CardDim.TLabel", justify="left"
+        )
+        self._security_note.pack(anchor="w", pady=(METRICS.space_md, 0))
+        card.bind(
+            "<Configure>",
+            lambda event: self._security_note.configure(
+                wraplength=max(360, event.width - 2 * METRICS.space_lg)
+            ),
+            add="+",
+        )
+        self._render_security()
+
+    def _render_security(self) -> None:
+        """Report the real sign-in method and the real email status."""
+        session = self.session
+        # The address is read from the signed-in account, never invented.
+        email = ""
+        try:
+            if session is not None and self.context.users is not None:
+                account = self.context.users.get(session, session.user_id)
+                email = getattr(account, "email", "") or ""
+        except Exception:  # noqa: BLE001 - the panel must not break the screen
+            email = ""
+
+        notifier = getattr(self.context, "email", None)
+        stats: dict[str, object] = {}
+        if notifier is not None:
+            try:
+                stats = dict(notifier.statistics())
+            except Exception:  # noqa: BLE001
+                stats = {}
+        configured = bool(stats.get("configured"))
+        smtp_state = str(stats.get("status", "SMTP NOT CONFIGURED"))
+
+        algorithm = ""
+        try:
+            algorithm = self.context.passwords.algorithm_description
+        except Exception:  # noqa: BLE001
+            algorithm = "unknown"
+
+        facts = [
+            Fact("Sign-in", "Username and password", colour=PALETTE.ok),
+            Fact("Password storage", algorithm),
+            Fact(
+                "Notification email",
+                smtp_state,
+                colour=PALETTE.ok if configured else PALETTE.medium,
+            ),
+            Fact(
+                "Your address",
+                mask_email(email) if email else "None registered",
+                colour=PALETTE.text if email else PALETTE.medium,
+            ),
+        ]
+        if configured:
+            facts.append(
+                Fact(
+                    "Delivery so far",
+                    f"{stats.get('sent', 0)} sent, {stats.get('failed', 0)} failed",
+                    span=True,
+                )
+            )
+            last_error = str(stats.get("last_error", "") or "")
+            if last_error:
+                facts.append(
+                    Fact("Last failure", last_error, colour=PALETTE.critical, span=True)
+                )
+        self._security_facts.set_facts(facts)
+
+        if configured:
+            self._security_note.configure(
+                text=(
+                    "Email carries notifications only. Sign-in is a username "
+                    "and a password, so a mail outage never prevents anyone "
+                    "from getting in, and this system will never send anyone "
+                    "a login code."
+                ),
+                foreground=PALETTE.text_dim,
+            )
+        else:
+            self._security_note.configure(
+                text=(
+                    "SMTP is not configured, so notifications are shown in the "
+                    "application only and are not emailed. Sign-in is "
+                    "unaffected: it has never used email. Configure SMTP in "
+                    "the setup wizard or the configuration file to enable it."
+                ),
+                foreground=PALETTE.medium,
+            )
+
     def _build_tunable(self, parent: tk.Misc) -> None:
         """Editable settings table."""
-        card = Card(parent, "Settings", fonts=self.fonts, padding=18)
+        card = Card(parent, "Settings", fonts=self.fonts, padding=12)
         card.pack(fill="both", expand=True)
 
         controls = ttk.Frame(card, style="Card.TFrame")
@@ -110,6 +234,17 @@ class SettingsScreen(Screen):
         toolbar.pack(side="left")
         toolbar.add_button("Edit selected", self._edit_setting, style="Accent.TButton")
         toolbar.add_button("Refresh", self.refresh)
+        # The sound switch is a button rather than a row in the table below,
+        # because it is the one setting an operator reaches for in a hurry -
+        # during an incident, or when the console is on a shared desk. Its
+        # state is the stored setting, so it is the same switch the table
+        # shows and it survives a restart.
+        self._sound_button = toolbar.add_button(
+            SOUND_ON_LABEL, self._toggle_alert_sound
+        )
+        toolbar.add_button("Test security sound", self._test_alert_sound)
+        toolbar.add_button("Mark all notifications read", self._mark_all_read)
+        self._paint_sound_button()
 
         ttk.Label(
             card,
@@ -126,11 +261,114 @@ class SettingsScreen(Screen):
         )
         self._table.pack(fill="both", expand=True)
 
+    # ------------------------------------------------------------------
+    # Alert sound
+    # ------------------------------------------------------------------
+    def _sound_is_on(self) -> bool:
+        """The stored preference, which is the only source of truth."""
+        settings = self.context.settings_service
+        if settings is None:
+            return False
+        return settings.get_bool(SETTING_SOUND_ENABLED, True)
+
+    def _paint_sound_button(self) -> None:
+        """Show the switch's current position."""
+        button = getattr(self, "_sound_button", None)
+        if button is None:
+            return
+        on = self._sound_is_on()
+        button.configure(text=SOUND_ON_LABEL if on else SOUND_OFF_LABEL)
+
+    def _toggle_alert_sound(self) -> None:
+        """Turn the alert sound on or off, and store the choice.
+
+        Written through the settings service, so it lands in
+        ``system_settings`` like any other preference: it persists across a
+        restart, it is audited as a setting change, and the same value is what
+        the audio service reads before every sound.
+        """
+        settings = self.context.settings_service
+        session = self.session
+        if settings is None or session is None:
+            return
+        wanted = not self._sound_is_on()
+        try:
+            settings.set(session, SETTING_SOUND_ENABLED, wanted)
+        except AethraError as exc:
+            show_message(
+                self, "Alert sound", exc.user_message, fonts=self.fonts
+            )
+            return
+        self._paint_sound_button()
+        self.refresh()
+        self.status(
+            "Security alert sound ON."
+            if wanted
+            else "Security alert sound OFF. Alerts remain visual."
+        )
+
+    def _test_alert_sound(self) -> None:
+        """Play the packaged security sound, creating nothing.
+
+        Deliberately does not raise a notification, an incident or an alert:
+        the operator needs to hear the sound, not to find a fabricated
+        security record in the database afterwards. Nothing is written.
+
+        If the packaged file cannot be played the reason is shown here rather
+        than left to be discovered as silence during an incident.
+        """
+        audio = getattr(self.context, "audio_alerts", None)
+        if audio is None:
+            show_message(
+                self, "Test security sound",
+                "The audio alert service is not running.", fonts=self.fonts,
+            )
+            return
+
+        usable, detail = audio.sound_status()
+        if not usable:
+            show_message(
+                self, "Test security sound",
+                "The security alert sound cannot be played.",
+                detail=(
+                    f"{detail}\n\nSecurity alerts are still raised and still "
+                    "appear in the notification list; they will use the "
+                    "system sound instead."
+                ),
+                fonts=self.fonts,
+            )
+            return
+        if not self._sound_is_on():
+            show_message(
+                self, "Test security sound",
+                "Alert sound is currently OFF.",
+                detail=(
+                    f"{detail}\n\nTurn the sound on with the switch beside "
+                    "this button to hear alerts."
+                ),
+                fonts=self.fonts,
+            )
+            return
+
+        audio.test_sound("CRITICAL", security=True)
+        self.status(
+            f"Played the security alert sound. {detail} No notification or "
+            "security record was created."
+        )
+
+    def _mark_all_read(self) -> None:
+        """Clear the unread notification badge."""
+        notifications = self.context.notifications
+        if notifications is None:
+            return
+        cleared = notifications.mark_all_read(self.session)
+        self.status(f"{cleared} notification(s) marked read.")
+
     def _build_deployment(self, parent: tk.Misc) -> None:
         """Read-only deployment configuration."""
         card = Card(
             parent, "Deployment configuration", subtitle="read-only - edit .env and restart",
-            fonts=self.fonts, padding=18,
+            fonts=self.fonts, padding=12,
         )
         card.pack(fill="both", expand=True)
         toolbar = Toolbar(card)
@@ -149,7 +387,7 @@ class SettingsScreen(Screen):
 
     def _build_maintenance(self, parent: tk.Misc) -> None:
         """Retention, backup and database maintenance (§110, §111)."""
-        card = Card(parent, "Data maintenance", fonts=self.fonts, padding=18)
+        card = Card(parent, "Data maintenance", fonts=self.fonts, padding=12)
         card.pack(fill="both", expand=True)
 
         toolbar = Toolbar(card)
@@ -175,7 +413,7 @@ class SettingsScreen(Screen):
         can_maintain = self.can("data.maintain")
 
         status_card = Card(
-            parent, "Backup status", fonts=self.fonts, padding=18,
+            parent, "Backup status", fonts=self.fonts, padding=12,
             subtitle="read from the files that exist on disk",
         )
         status_card.pack(fill="x")
@@ -184,8 +422,8 @@ class SettingsScreen(Screen):
         )
         self._backup_status_label.pack(anchor="w")
 
-        schedule_card = Card(parent, "Automatic backup", fonts=self.fonts, padding=18)
-        schedule_card.pack(fill="x", pady=(16, 0))
+        schedule_card = Card(parent, "Automatic backup", fonts=self.fonts, padding=12)
+        schedule_card.pack(fill="x", pady=(10, 0))
         ttk.Label(
             schedule_card,
             text=(
@@ -241,8 +479,8 @@ class SettingsScreen(Screen):
         if not can_maintain:
             choose.state(["disabled"])
 
-        files_card = Card(parent, "Backups on disk", fonts=self.fonts, padding=18)
-        files_card.pack(fill="both", expand=True, pady=(16, 0))
+        files_card = Card(parent, "Backups on disk", fonts=self.fonts, padding=12)
+        files_card.pack(fill="both", expand=True, pady=(10, 0))
 
         toolbar = Toolbar(files_card)
         toolbar.pack(fill="x", pady=(0, 6))
@@ -425,7 +663,10 @@ class SettingsScreen(Screen):
         lines.append(
             f"  {'Password hashing':<22}: {self.context.passwords.algorithm_description}"
         )
-        lines.append(f"  {'Two-factor':<22}: {self.context.otp.status().display}")
+        lines.append(f"  {'Sign-in':<22}: Username and password (no second factor)")
+        lines.append(
+            f"  {'Notification email':<22}: {self.context.settings.smtp.status_text()}"
+        )
 
         lines.extend(["", "PATHS"])
         lines.append(f"  {'Log directory':<22}: {settings.log_dir}")
@@ -502,8 +743,8 @@ class SettingsScreen(Screen):
             [
                 "",
                 "NOTES",
-                "  - Evidence attached to an incident is never pruned "
-                "automatically.",
+                "  - Evidence the correlation engine has grouped is never "
+                "pruned automatically.",
                 "  - Audit records are pruned only on explicit request, and "
                 "pruning is itself audited.",
                 "  - Retention periods are configured on the Tunable settings "
@@ -525,7 +766,8 @@ class SettingsScreen(Screen):
             self, "Run retention", "Run data retention pruning now?",
             detail=(
                 "Records older than the configured retention are deleted. "
-                "Evidence linked to an incident is retained regardless."
+                "Evidence the correlation engine has grouped is retained "
+                "regardless."
             ),
             confirm_label="Run retention", danger=True,
         ):

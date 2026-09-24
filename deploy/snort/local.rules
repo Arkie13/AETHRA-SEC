@@ -23,6 +23,18 @@ alert tcp any any -> $HOME_NET 443 (msg:"TCP SYN to HTTPS port"; flags:S; sid:10
 # --- Flood / DoS (rate-based: N from one source within T seconds) ---
 alert icmp any any -> $HOME_NET any (msg:"ICMP flood - possible ping flood/DoS"; itype:8; threshold: type both, track by_src, count 20, seconds 5; sid:1000006; rev:2; classtype:attempted-dos;)
 alert tcp any any -> $HOME_NET any (msg:"TCP SYN flood - possible DoS"; flags:S; threshold: type both, track by_src, count 30, seconds 5; sid:1000007; rev:2; classtype:attempted-dos;)
-alert udp any any -> $HOME_NET any (msg:"UDP flood - possible DoS"; threshold: type both, track by_src, count 50, seconds 5; sid:1000008; rev:2; classtype:attempted-dos;)
+# Return traffic from a server this host connected to is not a flood.
+# Excluding source port 443 removes QUIC/HTTPS responses, which are the
+# single largest source of false positives here: streaming a video sends
+# far more than 50 UDP packets in 5 seconds from one address, and the
+# previous rule reported every one of those as an attempted DoS. The
+# threshold is raised too, because a genuine flood is orders of
+# magnitude above ordinary traffic.
+#
+# Trade-off, stated plainly: a real UDP flood spoofed FROM source port
+# 443 would now be missed. That is accepted deliberately - a rule that
+# fires constantly on normal browsing trains an operator to ignore the
+# alert screen, which costs more detection than this exclusion does.
+alert udp !$HOME_NET !443 -> $HOME_NET any (msg:"UDP flood - possible DoS"; threshold: type both, track by_src, count 300, seconds 5; sid:1000008; rev:3; classtype:attempted-dos;)
 alert tcp any any -> $HOME_NET 80 (msg:"HTTP port SYN flood - possible web server DoS"; flags:S; threshold: type both, track by_src, count 20, seconds 5; sid:1000009; rev:2; classtype:attempted-dos;)
 alert tcp any any -> $HOME_NET 443 (msg:"HTTPS port SYN flood - possible web server DoS"; flags:S; threshold: type both, track by_src, count 20, seconds 5; sid:1000010; rev:2; classtype:attempted-dos;)

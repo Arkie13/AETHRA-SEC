@@ -15,6 +15,7 @@ from typing import Any, Callable, Sequence
 from aethra_sec.ui.theme import (
     PALETTE,
     Fonts,
+    motion_enabled,
     severity_colour,
     state_colour,
     status_colour,
@@ -41,7 +42,7 @@ class Card(tk.Canvas):
     """
 
     #: Corner radius, matching the metric tiles so panels read as one family.
-    RADIUS = 10
+    RADIUS = 14
 
     def __init__(
         self,
@@ -49,14 +50,15 @@ class Card(tk.Canvas):
         title: str = "",
         *,
         subtitle: str = "",
-        padding: int = 16,
+        padding: int = 0,
         fonts: Fonts | None = None,
         accent: str = "",
         page: str = "",
     ) -> None:
         """Create a card with an optional header."""
         self._page = page or PALETTE.background
-        self._fill = PALETTE.surface
+        # A section takes the page colour: it is a grouping, not an object.
+        self._fill = self._page
         super().__init__(
             parent, background=self._page, highlightthickness=0, borderwidth=0,
         )
@@ -72,9 +74,9 @@ class Card(tk.Canvas):
 
         if title:
             self.header = ttk.Frame(self.body, style="Card.TFrame")
-            self.header.pack(fill="x", pady=(0, 12))
-            tk.Frame(self.header, background=self._accent, width=3, height=14).pack(
-                side="left", padx=(0, 10)
+            self.header.pack(fill="x", pady=(0, 10))
+            tk.Frame(self.header, background=self._accent, width=2, height=11).pack(
+                side="left", padx=(0, 8)
             )
             self.title_label = ttk.Label(
                 self.header, text=title.upper(), style="CardTitle.TLabel"
@@ -93,6 +95,24 @@ class Card(tk.Canvas):
         """Repaint the surface and take in any newly added children."""
         self._adopt()
         self._redraw(int(event.width), int(event.height))
+        # The header's own geometry is not settled during this event, so the
+        # rule is drawn again once the layout pass has actually run.
+        if self.header is not None:
+            self.after_idle(self._draw_rule)
+
+    def _draw_rule(self) -> None:
+        """Draw the header rule from settled geometry."""
+        try:
+            width = int(self.winfo_width())
+        except tk.TclError:  # pragma: no cover - torn down
+            return
+        if width <= 2:
+            return
+        y = self._rule_y()
+        self.delete("rule")
+        if y > 0:
+            self.create_line(0, y, width - 1, y, fill=PALETTE.border, tags="rule")
+            self.tag_lower("rule")
 
     def _adopt(self) -> None:
         """Move children the screen parented to the card into its body.
@@ -113,29 +133,39 @@ class Card(tk.Canvas):
                 continue
 
     def _redraw(self, width: int, height: int) -> None:
-        """Paint the rounded body and its lit top edge."""
+        """Paint the section's header rule - and nothing else.
+
+        This used to draw a filled, rounded, outlined rectangle behind every
+        section, which is what made the console read as a stack of boxes. A
+        section is now defined by its label and a single hairline beneath it;
+        the separation between sections comes from whitespace. The rule is
+        drawn only when the section is titled, because an untitled group has
+        nothing to underline.
+        """
         if width <= 2 or height <= 2 or (width, height) == self._drawn:
             return
         self._drawn = (width, height)
         self.delete("panel")
-        right, bottom = width - 1, height - 1
-        rounded_rectangle(
-            self, 0, 0, right, bottom, self.RADIUS,
-            fill=self._fill, outline="", tags="panel",
-        )
-        lit = _blend(self._fill, "#FFFFFF", 0.05)
-        self.create_arc(
-            0, 0, self.RADIUS * 2, self.RADIUS * 2, start=90, extent=90,
-            style="arc", outline=lit, width=1, tags="panel",
-        )
+        if self.header is None:
+            return
+        # Sits under the header text, inset by the accent marker's width so
+        # the rule starts where the label does.
+        y = self._rule_y()
+        if y <= 0:
+            return
         self.create_line(
-            self.RADIUS, 1, right - self.RADIUS, 1, fill=lit, tags="panel",
-        )
-        self.create_arc(
-            right - self.RADIUS * 2, 0, right, self.RADIUS * 2,
-            start=0, extent=90, style="arc", outline=lit, width=1, tags="panel",
+            0, y, width - 1, y, fill=PALETTE.border, tags="panel",
         )
         self.tag_lower("panel")
+
+    def _rule_y(self) -> int:
+        """Y position of the header rule, measured from the real header."""
+        try:
+            if not self.header.winfo_ismapped():  # type: ignore[union-attr]
+                return 0
+            return int(self.header.winfo_y() + self.header.winfo_height() + 5)  # type: ignore[union-attr]
+        except (tk.TclError, AttributeError):  # pragma: no cover - not mapped
+            return 0
 
     def set_subtitle(self, text: str) -> None:
         """Update (or create) the right-hand subtitle."""
@@ -186,14 +216,18 @@ class StatCard(ttk.Frame):
         *,
         value: str = "0",
         detail: str = "",
-        accent: str = PALETTE.accent,
+        accent: str = "",
         fonts: Fonts | None = None,
         on_click: Callable[[], None] | None = None,
         sparkline: bool = False,
         tooltip: str = "",
     ) -> None:
         """Create the metric tile."""
-        super().__init__(parent, style="Panel.TFrame", padding=(0, 0))
+        super().__init__(parent, style="Tile.TFrame", padding=(0, 0))
+        # Resolved here, not in the signature: a default argument is
+        # evaluated once at import, which would pin this to whichever
+        # theme was active then and never follow a switch.
+        accent = accent or PALETTE.accent
         self._accent = accent
         self._fonts = fonts
         #: The first value is the baseline, not a change, so it never flashes.
@@ -202,30 +236,30 @@ class StatCard(ttk.Frame):
 
         # A full-height accent edge, flush with the panel's own border, so a
         # row of tiles reads as a colour-coded strip before any number is read.
-        self._bar = tk.Frame(self, background=accent, width=4)
+        self._bar = tk.Frame(self, background=accent, width=3)
         self._bar.pack(side="left", fill="y")
 
-        content = ttk.Frame(self, style="Card.TFrame", padding=(14, 12, 14, 12))
+        content = ttk.Frame(self, style="Tile.TFrame", padding=(12, 10, 12, 10))
         content.pack(side="left", fill="both", expand=True)
 
-        heading = ttk.Frame(content, style="Card.TFrame")
+        heading = ttk.Frame(content, style="Tile.TFrame")
         heading.pack(fill="x")
-        self._label = ttk.Label(heading, text=label.upper(), style="CardDim.TLabel")
+        self._label = ttk.Label(heading, text=label.upper(), style="TileLabel.TLabel")
         self._label.pack(side="left")
 
         # The trend sits beside the value rather than the label: values are
         # short, so the two never compete for the tile's width.
-        value_row = ttk.Frame(content, style="Card.TFrame")
+        value_row = ttk.Frame(content, style="Tile.TFrame")
         value_row.pack(fill="x", pady=(2, 0))
-        self._value = ttk.Label(value_row, text=value, style="Metric.TLabel")
+        self._value = ttk.Label(value_row, text=value, style="TileValue.TLabel")
         self._value.pack(side="left")
-        self._trend = ttk.Label(value_row, text="", style="CardDim.TLabel")
+        self._trend = ttk.Label(value_row, text="", style="TileLabel.TLabel")
         self._trend.pack(side="right", pady=(8, 0))
         # The detail line wraps rather than widening the tile: a long caption
         # would otherwise force every tile on the row wider and push the last
         # one off the screen.
         self._detail = ttk.Label(
-            content, text=detail, style="CardMuted.TLabel",
+            content, text=detail, style="TileMuted.TLabel",
             wraplength=DETAIL_WRAP, justify="left",
         )
         self._detail.pack(anchor="w", fill="x")
@@ -257,11 +291,11 @@ class StatCard(ttk.Frame):
 
     def _on_enter(self, _event: tk.Event) -> None:
         """Lift the tile while the pointer is over it."""
-        self.configure(style="PanelHover.TFrame")
+        self.configure(style="TileHover.TFrame")
 
     def _on_leave(self, _event: tk.Event) -> None:
         """Restore the resting surface."""
-        self.configure(style="Panel.TFrame")
+        self.configure(style="Tile.TFrame")
 
     def update_value(
         self, value: str, detail: str = "", accent: str | None = None
@@ -279,7 +313,7 @@ class StatCard(ttk.Frame):
             self._accent = accent
             self._bar.configure(background=accent)
             self._value.configure(foreground=PALETTE.text)
-        if changed and self._seen_a_value:
+        if changed and self._seen_a_value and motion_enabled():
             self._flash()
         self._seen_a_value = True
 
@@ -291,7 +325,7 @@ class StatCard(ttk.Frame):
             except (tk.TclError, ValueError):  # pragma: no cover - already fired
                 pass
         try:
-            self._bar.configure(background=PALETTE.text, width=7)
+            self._bar.configure(background=PALETTE.text, width=5)
         except tk.TclError:  # pragma: no cover - widget torn down
             return
         self._flash_job = self.after(FLASH_MS, self._settle)
@@ -300,7 +334,7 @@ class StatCard(ttk.Frame):
         """Return the accent edge to its resting appearance."""
         self._flash_job = None
         try:
-            self._bar.configure(background=self._accent, width=4)
+            self._bar.configure(background=self._accent, width=3)
         except tk.TclError:  # pragma: no cover - widget torn down
             pass
 
@@ -354,7 +388,7 @@ class StatusIndicator(ttk.Frame):
         super().__init__(parent, style="Card.TFrame", padding=(0, 4))
         self._dot = tk.Canvas(
             self, width=12, height=12, highlightthickness=0,
-            background=PALETTE.surface,
+            background=PALETTE.background,
         )
         self._dot.pack(side="left", padx=(0, 8))
         self._circle = self._dot.create_oval(
@@ -485,104 +519,6 @@ class KeyValueList(ttk.Frame):
         self.columnconfigure(1, weight=1)
 
 
-class RiskFactorList(ttk.Frame):
-    """The severity calculation, factor by factor, as labelled bars (§28).
-
-    Each row is one stored scoring factor: its name, the points it contributed
-    drawn to scale, and the recorded reason. Nothing is inferred here - the rows
-    are exactly what the risk engine wrote when the incident was scored, so an
-    operator can audit the number instead of trusting it.
-    """
-
-    def __init__(self, parent: tk.Misc, *, fonts: Fonts | None = None) -> None:
-        """Create an empty breakdown."""
-        super().__init__(parent, style="Card.TFrame")
-        self._fonts = fonts
-        self._rows: list[tk.Widget] = []
-
-    def set_factors(
-        self, factors: Sequence[tuple[str, int, str]], *, total: int | None = None
-    ) -> None:
-        """Replace the breakdown."""
-        for widget in self._rows:
-            widget.destroy()
-        self._rows.clear()
-
-        if not factors:
-            label = ttk.Label(
-                self,
-                text="No scoring breakdown was recorded for this incident.",
-                style="CardDim.TLabel",
-            )
-            label.pack(anchor="w")
-            self._rows.append(label)
-            return
-
-        scored = [points for _name, points, _reason in factors if points > 0]
-        largest = max(scored) if scored else 1
-
-        for name, points, reason in factors:
-            row = ttk.Frame(self, style="Card.TFrame")
-            row.pack(fill="x", pady=(0, 6))
-            self._rows.append(row)
-
-            heading = ttk.Frame(row, style="Card.TFrame")
-            heading.pack(fill="x")
-            ttk.Label(
-                heading, text=name, style="Card.TLabel",
-                font=self._fonts.small_bold if self._fonts else None,
-            ).pack(side="left")
-            if points:
-                ttk.Label(
-                    heading, text=f"+{points}", style="Card.TLabel",
-                    foreground=PALETTE.accent,
-                    font=self._fonts.small_bold if self._fonts else None,
-                ).pack(side="right")
-
-            if points:
-                track = tk.Canvas(
-                    row, height=6, background=PALETTE.surface_alt,
-                    highlightthickness=0, borderwidth=0, width=40,
-                )
-                track.pack(fill="x", pady=(3, 2))
-                track.bind(
-                    "<Configure>",
-                    lambda event, value=points, peak=largest: self._draw_bar(
-                        event.widget, value, peak
-                    ),
-                )
-
-            if reason:
-                ttk.Label(
-                    row, text=reason, style="CardMuted.TLabel", wraplength=760,
-                    justify="left",
-                ).pack(anchor="w")
-
-        if total is not None:
-            footer = ttk.Frame(self, style="Card.TFrame")
-            footer.pack(fill="x", pady=(4, 0))
-            self._rows.append(footer)
-            ttk.Label(
-                footer, text=f"Total score {total}", style="Card.TLabel",
-                font=self._fonts.small_bold if self._fonts else None,
-            ).pack(side="left")
-            ttk.Label(
-                footer,
-                text="score thresholds: 80+ critical · 55+ high · 30+ medium · 12+ low",
-                style="CardDim.TLabel",
-            ).pack(side="right")
-
-    @staticmethod
-    def _draw_bar(canvas: tk.Canvas, points: int, largest: int) -> None:
-        """Draw one factor's bar to scale."""
-        canvas.delete("all")
-        width = max(int(canvas.winfo_width()), 1)
-        length = max(2, int(width * (points / max(1, largest))))
-        canvas.create_rectangle(
-            0, 1, length, 5, fill=PALETTE.accent, outline=""
-        )
-
-
 #: Widget classes that scroll themselves. The wheel is left alone over these so
 #: a table or a text pane inside a scrollable page keeps its own scrolling.
 _SELF_SCROLLING_CLASSES = frozenset(
@@ -602,7 +538,8 @@ class ScrollableFrame(ttk.Frame):
         *,
         padding: int = 0,
         style: str = "TFrame",
-        background: str = PALETTE.background,
+        background: str = "",
+        autohide: bool = False,
     ) -> None:
         """Create the scroll host; add children to :attr:`interior`.
 
@@ -611,6 +548,10 @@ class ScrollableFrame(ttk.Frame):
         where the canvas meets its surroundings.
         """
         super().__init__(parent, style=style)
+        # Resolved here rather than in the signature: a palette value used
+        # as a default argument is evaluated at import and would keep the
+        # starting theme's colour for the life of the process.
+        background = background or PALETTE.background
         self._canvas = tk.Canvas(
             self, background=background, highlightthickness=0, borderwidth=0
         )
@@ -632,6 +573,12 @@ class ScrollableFrame(ttk.Frame):
         # and packing it first leaves the scrollbar with no room at all.
         self._scrollbar.pack(side="right", fill="y")
         self._canvas.pack(side="left", fill="both", expand=True)
+        #: True while the scrollbar is on screen.
+        self._bar_shown = True
+        #: Opt-in: hide the scrollbar while the content fits. Off by default,
+        #: because a host too narrow to give the bar its width later (the
+        #: sidebar) needs it reserved from the start.
+        self._autohide = autohide
 
         self._wheel_bound: set[str] = set()
         self.interior.bind("<Configure>", self._on_interior_configure)
@@ -644,10 +591,29 @@ class ScrollableFrame(ttk.Frame):
         # Children are added after construction, so this is where they become
         # visible to the wheel.
         self._bind_wheel_to_descendants(self.interior)
+        self._sync_scrollbar()
 
     def _on_canvas_configure(self, event: tk.Event) -> None:
         """Keep the interior as wide as the canvas."""
         self._canvas.itemconfigure(self._window, width=event.width)
+        self._sync_scrollbar()
+
+    def _sync_scrollbar(self) -> None:
+        """Show the scrollbar only while the content overflows."""
+        if not self._autohide:
+            return
+        try:
+            needed = self.interior.winfo_reqheight() > self._canvas.winfo_height() + 1
+        except tk.TclError:  # pragma: no cover - during teardown
+            return
+        if needed == self._bar_shown:
+            return
+        self._bar_shown = needed
+        if needed:
+            self._scrollbar.pack(side="right", fill="y", before=self._canvas)
+        else:
+            self._scrollbar.pack_forget()
+            self._canvas.yview_moveto(0)
 
     # ------------------------------------------------------------------
     # Wheel routing
@@ -1005,6 +971,26 @@ class Toolbar(ControlBar):
         self._place(_BarItem(widget=label, side=side, padx=self._gap(side)))
         return label
 
+    def add_checkbox(
+        self,
+        text: str,
+        variable: tk.BooleanVar,
+        command: Callable[[], None],
+        *,
+        side: str = "left",
+    ) -> ttk.Checkbutton:
+        """Add a toggle and return it.
+
+        Used for a filter an operator flips often enough that it belongs on
+        the toolbar rather than behind a menu.
+        """
+        box = ttk.Checkbutton(
+            self, text=text, variable=variable, command=command,
+            style="Toolbar.TCheckbutton",
+        )
+        self._place(_BarItem(widget=box, side=side, padx=self._gap(side)))
+        return box
+
     def add_separator(self) -> None:
         """Add a vertical rule."""
         rule = tk.Frame(self, background=PALETTE.border, width=1)
@@ -1017,8 +1003,6 @@ class Toolbar(ControlBar):
     def _gap(self, side: str) -> tuple[int, int]:
         """Padding that puts the gap on the inward side of the control."""
         return (self.GAP, 0) if side == "right" else (0, self.GAP)
-        for spare in self._lines[len(lines):]:
-            spare.pack_forget()
 
 
 @dataclass(frozen=True)
@@ -1031,6 +1015,10 @@ class SummaryCell:
     #: Opened when the cell is clicked, where the screen offers a filtered view.
     on_click: Callable[[], None] | None = None
     tooltip: str = ""
+    #: A short line under the label - a threshold, a unit, a qualifier. It is
+    #: the accessible form of whatever the tooltip explains at length, so a
+    #: cell never depends on hover alone to be understood.
+    caption: str = ""
 
 
 class SummaryStrip(ttk.Frame):
@@ -1057,30 +1045,40 @@ class SummaryStrip(ttk.Frame):
         fonts: Fonts | None = None,
     ) -> None:
         """Build the strip; call :meth:`update_counts` to fill it in."""
-        super().__init__(parent, style="Panel.TFrame", padding=(2, 2))
+        super().__init__(parent, style="Tile.TFrame", padding=(1, 1))
         self._fonts = fonts
         self._cells = list(cells)
         self._values: dict[str, ttk.Label] = {}
         self._frames: dict[str, ttk.Frame] = {}
         self._columns = 0
 
-        self._grid = ttk.Frame(self, style="Card.TFrame")
+        self._grid = ttk.Frame(self, style="Tile.TFrame")
         self._grid.pack(fill="x")
         for cell in self._cells:
-            holder = ttk.Frame(self._grid, style="Card.TFrame", padding=(16, 12))
+            holder = ttk.Frame(self._grid, style="Tile.TFrame", padding=(14, 10))
             accent = cell.colour or PALETTE.accent
-            tk.Frame(holder, background=accent, width=3, height=30).pack(
+            tk.Frame(holder, background=accent, width=2, height=26).pack(
                 side="left", padx=(0, 12)
             )
-            text = ttk.Frame(holder, style="Card.TFrame")
+            text = ttk.Frame(holder, style="Tile.TFrame")
             text.pack(side="left", fill="x", expand=True)
-            value = ttk.Label(text, text="-", style="SummaryValue.TLabel")
+            value = ttk.Label(text, text="-", style="TileValueSm.TLabel")
             value.pack(anchor="w")
-            ttk.Label(text, text=cell.label.upper(), style="SummaryLabel.TLabel").pack(
+            ttk.Label(text, text=cell.label.upper(), style="TileLabel.TLabel").pack(
                 anchor="w"
             )
+            if cell.caption:
+                # Dim and small, so a third line costs the strip very little
+                # height. It carries the same fact as the tooltip, in text,
+                # for anyone who does not hover.
+                ttk.Label(
+                    text, text=cell.caption, style="TileDim.TLabel",
+                ).pack(anchor="w")
             value.configure(foreground=accent)
             if cell.tooltip:
+                # One tooltip per cell, bound to the holder. The tooltip
+                # component owns its own show/hide and destroys its window
+                # with the widget, so this cannot accumulate on a rebuild.
                 attach_tooltip(holder, cell.tooltip)
             if cell.on_click is not None:
                 for widget in (holder, text, value):

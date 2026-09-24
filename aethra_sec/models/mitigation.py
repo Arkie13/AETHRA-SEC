@@ -129,3 +129,118 @@ class ThreatMitigationMapping:
     condition_service: str = ""
     condition_min_severity: Severity | None = None
     is_active: bool = True
+
+
+#: How a detection reached the entry it did, strongest first. Shown to the
+#: operator so the mapping can be read rather than taken on trust.
+MATCH_SERVICE = "service"
+MATCH_SEVERITY = "severity"
+MATCH_CATEGORY = "category"
+MATCH_MAPPING = "mapping"
+
+_MATCH_TEXT = {
+    MATCH_SERVICE: (
+        "the entry's service condition matched the service observed on this "
+        "detection"
+    ),
+    MATCH_SEVERITY: "the entry's category and severity both matched",
+    MATCH_CATEGORY: "the entry's category matched",
+    MATCH_MAPPING: (
+        "the threat-to-mitigation mapping names this entry for the category, "
+        "and no more specific entry applied"
+    ),
+}
+
+#: Shown when the knowledge base itself could not be read. Distinct from
+#: "nothing is configured", which is a fact about the data rather than a
+#: failure to look.
+LOOKUP_FAILED_TEXT = (
+    "Mitigation recommendation unavailable: the mitigation knowledge base "
+    "could not be read. This is a lookup failure, not a statement that no "
+    "guidance exists for this detection - the recorded error is in the "
+    "application log."
+)
+
+
+@dataclass(frozen=True)
+class MitigationMatch:
+    """One real detection resolved against the mitigation knowledge base.
+
+    Carries *how* the entry was reached as well as the entry itself. An
+    analyst acting on guidance needs to see which category the detection was
+    filed under and which mapping produced the advice, because a plausible
+    recommendation attached to the wrong category is worse than none.
+
+    The three outcomes are kept apart deliberately:
+
+    * a recommendation was found (``resolved``);
+    * the knowledge base was read and holds nothing for this category
+      (``recommendation is None`` and not ``lookup_failed``);
+    * the knowledge base could not be read at all (``lookup_failed``).
+
+    The middle one is a fact about the configuration. The last is a fault, and
+    reporting it as "no recommendation is configured" would tell the operator
+    something untrue about their own system.
+    """
+
+    recommendation: MitigationRecommendation | None = None
+    category: ThreatCategory = ThreatCategory.UNCLASSIFIED
+    #: Where the category came from - the detection's own stored category, or
+    #: the keyword rules read over a Snort signature's text.
+    category_source: str = ""
+    #: One of the ``MATCH_*`` constants; empty when nothing was found.
+    matched_on: str = ""
+    #: The service the detection was seen against, when one could be named
+    #: from the observed port. Never guessed from the category.
+    observed_service: str = ""
+    lookup_failed: bool = False
+    failure_detail: str = ""
+
+    @property
+    def resolved(self) -> bool:
+        """True when real guidance was found for this detection."""
+        return self.recommendation is not None and not self.lookup_failed
+
+    @property
+    def status_text(self) -> str:
+        """The knowledge-base entry's own state, or why there is none."""
+        if self.lookup_failed:
+            return "Lookup failed"
+        if self.recommendation is None:
+            return "No mapping configured"
+        return self.recommendation.status_text
+
+    def mapping_lines(self) -> tuple[str, ...]:
+        """The resolution chain, end to end, in the operator's terms."""
+        if self.lookup_failed:
+            return (
+                "Could not be resolved: the knowledge base could not be read.",
+            )
+        chain = (
+            f"{self.category_source or 'detection'} "
+            f"-> category {self.category} "
+            "-> threat_mitigation_mapping"
+        )
+        if self.recommendation is None:
+            return (
+                f"{chain} -> no active entry",
+                (
+                    "No entry in the mitigation knowledge base is mapped to "
+                    f"category {self.category}."
+                ),
+            )
+        lines = [f"{chain} -> {self.recommendation.code}"]
+        reason = _MATCH_TEXT.get(self.matched_on, "")
+        if reason:
+            lines.append(f"Selected because {reason}.")
+        if self.observed_service:
+            lines.append(f"Service observed on this detection: {self.observed_service}.")
+        elif self.recommendation.applies_to_service:
+            # The entry is service-specific but the detection named no
+            # service, so say so rather than implying the two were compared.
+            lines.append(
+                "No service could be named from the observed port, so the "
+                f"entry's service condition ({self.recommendation.applies_to_service}) "
+                "was not verified against this detection."
+            )
+        return tuple(lines)

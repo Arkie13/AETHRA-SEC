@@ -18,8 +18,7 @@ from aethra_sec.security.integrity import IntegrityReport
 from aethra_sec.ui.base import Screen
 from aethra_sec.ui.theme import PALETTE, configure_text_widget
 from aethra_sec.ui.widgets import (
-    Card, Column, DataTable, DetailDialog, FilterBar, ScrollableFrame, Toolbar,
-    show_message,
+    Card, Column, DataTable, DetailDialog, FilterBar, Toolbar, show_message,
 )
 from aethra_sec.utils.formatting import format_count, truncate
 from aethra_sec.utils.timeutil import format_local, utcnow
@@ -59,20 +58,11 @@ class LogsScreen(Screen):
     # Layout
     # ------------------------------------------------------------------
     def build(self) -> None:
-        """Construct the logs screen.
+        """Construct the logs screen."""
+        self._build_filters()
 
-        Wrapped in a :class:`ScrollableFrame`, matching the Alerts screen: a
-        fixed-height page must never leave content unreachable whenever it is
-        taller than the window (§ layout).
-        """
-        scroller = ScrollableFrame(self)
-        scroller.pack(fill="both", expand=True)
-        root = scroller.interior
-
-        self._build_filters(root)
-
-        notebook = ttk.Notebook(root)
-        notebook.pack(fill="both", expand=True, pady=(16, 0))
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill="both", expand=True, pady=(10, 0))
 
         audit_tab = ttk.Frame(notebook, style="TFrame", padding=10)
         notebook.add(audit_tab, text="Audit trail")
@@ -86,9 +76,9 @@ class LogsScreen(Screen):
         notebook.add(app_tab, text="Application log")
         self._build_application_log(app_tab)
 
-    def _build_filters(self, parent: tk.Misc) -> None:
+    def _build_filters(self) -> None:
         """Audit search and filter controls."""
-        card = Card(parent, "Search and filter", fonts=self.fonts, padding=18)
+        card = Card(self, "Search and filter", fonts=self.fonts, padding=12)
         card.pack(fill="x")
         row = FilterBar(card)
         row.pack(fill="x")
@@ -146,7 +136,7 @@ class LogsScreen(Screen):
 
     def _build_audit(self, parent: tk.Misc) -> None:
         """Audit trail table with integrity controls."""
-        card = Card(parent, "Audit records", fonts=self.fonts, padding=18)
+        card = Card(parent, "Audit records", fonts=self.fonts, padding=12)
         card.pack(fill="both", expand=True)
 
         toolbar = Toolbar(card)
@@ -171,7 +161,7 @@ class LogsScreen(Screen):
 
     def _build_errors(self, parent: tk.Misc) -> None:
         """Recorded subsystem errors (§57, §58)."""
-        card = Card(parent, "Recorded subsystem failures", fonts=self.fonts, padding=18)
+        card = Card(parent, "Recorded subsystem failures", fonts=self.fonts, padding=12)
         card.pack(fill="both", expand=True)
         toolbar = Toolbar(card)
         toolbar.pack(fill="x", pady=(0, 6))
@@ -182,7 +172,7 @@ class LogsScreen(Screen):
 
     def _build_application_log(self, parent: tk.Misc) -> None:
         """Tail of the rotating diagnostic log."""
-        card = Card(parent, "Application log", fonts=self.fonts, padding=18)
+        card = Card(parent, "Application log", fonts=self.fonts, padding=12)
         card.pack(fill="both", expand=True)
         toolbar = Toolbar(card)
         toolbar.pack(fill="x", pady=(0, 6))

@@ -294,48 +294,6 @@ _MITIGATIONS: tuple[dict[str, Any], ...] = (
         ),
     },
     {
-        "code": "MIT-BRUTE-FORCE",
-        "threat_name": "Authentication Brute-Force Indicators",
-        "category": ThreatCategory.BRUTE_FORCE,
-        "severity": Severity.HIGH,
-        "service": "",
-        "source": EvidenceSource.SNORT,
-        "explanation": (
-            "Repeated authentication attempts against a service were observed, "
-            "matching an intrusion detection signature or a repeated-connection "
-            "pattern in the captured traffic."
-        ),
-        "why": (
-            "Repeated authentication attempts indicate credential guessing. If "
-            "the account uses a weak or reused password, a successful login can "
-            "follow, giving the attacker legitimate-looking access that is much "
-            "harder to detect afterwards."
-        ),
-        "immediate": (
-            "1. Review the authentication logs on the destination host for the "
-            "same time window and determine whether any attempt succeeded.\n"
-            "2. Identify the source address and whether it belongs to a known "
-            "asset.\n"
-            "3. If a login succeeded, treat the account as compromised: reset "
-            "its credentials and review what the session did.\n"
-            "4. Consider restricting access from the source network after "
-            "validating that the activity is unauthorised."
-        ),
-        "long_term": (
-            "1. Enforce a strong password policy and, where supported, a second "
-            "authentication factor.\n"
-            "2. Apply account lockout or rate limiting on repeated failures.\n"
-            "3. Restrict administrative services to management networks.\n"
-            "4. Monitor for successful logins that follow a burst of failures."
-        ),
-        "verify": (
-            "1. Confirm the attempt rate drops after the control is applied.\n"
-            "2. Confirm no unexpected successful authentication occurred.\n"
-            "3. Re-check the alert list for the same signature over the "
-            "following days."
-        ),
-    },
-    {
         "code": "MIT-TCP-SYN-FLOOD",
         "threat_name": "Potential TCP SYN Flood",
         "category": ThreatCategory.TCP_SYN_FLOOD,
@@ -597,46 +555,6 @@ _MITIGATIONS: tuple[dict[str, Any], ...] = (
             "chart.\n"
             "2. Confirm service availability from a normal client position.\n"
             "3. Review logs for anything that occurred during the disruption."
-        ),
-    },
-    {
-        "code": "MIT-MALWARE-INDICATOR",
-        "threat_name": "Malware-Related Indicator",
-        "category": ThreatCategory.MALWARE_INDICATOR,
-        "severity": Severity.CRITICAL,
-        "service": "",
-        "source": EvidenceSource.SNORT,
-        "explanation": (
-            "An intrusion detection signature associated with malware "
-            "behaviour - such as command-and-control communication or a known "
-            "malicious download - matched observed traffic."
-        ),
-        "why": (
-            "A malware indicator suggests a host may already be compromised. "
-            "The priority shifts from prevention to containment and "
-            "verification of what the host has done."
-        ),
-        "immediate": (
-            "1. Identify the internal host involved.\n"
-            "2. Review its recent traffic on the Host Detail screen for other "
-            "unusual destinations.\n"
-            "3. Inspect the host: running processes, scheduled tasks, "
-            "persistence entries, and local security logs.\n"
-            "4. Follow your incident response procedure for a potentially "
-            "compromised host; involve the responsible administrator before "
-            "isolating it."
-        ),
-        "long_term": (
-            "1. Ensure endpoint protection is deployed and current.\n"
-            "2. Keep IDS rules updated.\n"
-            "3. Review how the host could have been infected and close that "
-            "path."
-        ),
-        "verify": (
-            "1. Confirm the indicator does not recur after remediation.\n"
-            "2. Confirm the host makes no further connections to the flagged "
-            "destination.\n"
-            "3. Re-scan the host and compare against its previous assessment."
         ),
     },
     {

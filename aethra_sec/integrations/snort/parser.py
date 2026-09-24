@@ -14,13 +14,14 @@ supply stay ``None``, and the raw line is always retained as evidence.
 from __future__ import annotations
 
 import json
+import ipaddress
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from aethra_sec.utils.logging import get_logger
-from aethra_sec.utils.timeutil import from_epoch, utcnow
+from aethra_sec.utils.timeutil import UTC, from_epoch, utcnow
 
 LOGGER = get_logger("integrations.snort.parser")
 
@@ -105,6 +106,37 @@ class ParsedAlert:
         return bool(self.message or self.signature_id is not None)
 
 
+def _to_port(value: Any) -> int | None:
+    """Parse a port, returning ``None`` unless it is one a packet can carry.
+
+    A port outside 0-65535 cannot have been observed, so storing it would put
+    an impossible value into the evidence an incident is later built from.
+    """
+    port = _to_int(value)
+    if port is None or not 0 <= port <= 65535:
+        return None
+    return port
+
+
+def _to_ip(value: Any) -> str:
+    """Return ``value`` when it is a real address, otherwise an empty string.
+
+    Snort's own output is well formed, but the alert file and the TCP listener
+    both accept lines from outside this application. Recording
+    ``999.999.999.999`` or ``a.b.c.d`` as a source would create an alert - and
+    then a host - for an address that cannot exist.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        ipaddress.ip_address(text)
+    except ValueError:
+        LOGGER.debug("Discarding an unparseable address from a Snort alert.")
+        return ""
+    return text
+
+
 def _to_int(value: Any) -> int | None:
     """Parse an integer field, returning ``None`` when absent or malformed."""
     if value is None:
@@ -118,14 +150,33 @@ def _to_int(value: Any) -> int | None:
         return None
 
 
+#: How far ahead of us a sensor's clock may sit before a year-less timestamp
+#: is treated as last year's. Generous enough to absorb ordinary clock skew,
+#: far short of the months that would make a genuine roll-back ambiguous.
+FUTURE_TOLERANCE = timedelta(hours=26)
+
+
 def _parse_fast_timestamp(text: str, reference: datetime | None = None) -> datetime | None:
     """Parse the ``MM/DD-HH:MM:SS.ffffff`` timestamp of the fast format.
 
-    The fast format omits the year, so the current year is used and a
-    date in the future is rolled back one year (which happens across a New
-    Year boundary). The parsed value is a real sensor timestamp; only the year
-    is inferred, and :class:`ParsedAlert` records the format so the source of
-    each field stays traceable.
+    The fast format omits the year, so it is inferred: the current year, rolled
+    back one only when that would place the alert genuinely in the future, as
+    happens across a New Year boundary.
+
+    Snort writes these in the sensor's **local** time, so the comparison is made
+    in local time. Comparing a local reading against a UTC clock made every
+    alert raised within the UTC offset look like it came from the future - on a
+    UTC+8 host that was the whole working day - and each one was dated a year
+    early. All 125 alerts on this machine were stamped 2025, which put the
+    dashboard's mean detection latency at 365 days and hid every alert from the
+    windowed queries that drive the counters.
+
+    A tolerance is allowed before rolling back, because a sensor's clock can sit
+    slightly ahead of ours without its alerts belonging to last year.
+
+    The parsed value is a real sensor timestamp; only the year is inferred, and
+    :class:`ParsedAlert` records the format so the source of each field stays
+    traceable.
     """
     if not text:
         return None
@@ -138,16 +189,20 @@ def _parse_fast_timestamp(text: str, reference: datetime | None = None) -> datet
         ("%m/%d-%H:%M:%S.%f", False),
         ("%m/%d-%H:%M:%S", False),
     )
+    # The sensor's own clock, in its own zone, is what a year-less stamp is
+    # relative to.
+    local_now = now.astimezone()
     for fmt, has_year in formats:
         try:
             parsed = datetime.strptime(candidate, fmt)
         except ValueError:
             continue
-        if not has_year:
-            parsed = parsed.replace(year=now.year)
-            if parsed.replace(tzinfo=now.tzinfo) > now:
-                parsed = parsed.replace(year=now.year - 1)
-        return parsed.replace(tzinfo=now.tzinfo)
+        if has_year:
+            return parsed.replace(tzinfo=local_now.tzinfo).astimezone(UTC)
+        parsed = parsed.replace(year=local_now.year, tzinfo=local_now.tzinfo)
+        if parsed - local_now > FUTURE_TOLERANCE:
+            parsed = parsed.replace(year=local_now.year - 1)
+        return parsed.astimezone(UTC)
     return None
 
 
@@ -166,10 +221,10 @@ def parse_fast(line: str) -> ParsedAlert | None:
         classification=(data.get("classification") or "").strip(),
         priority=_to_int(data.get("priority")),
         protocol=(data.get("protocol") or "").upper(),
-        src_ip=(data.get("src") or "").strip(),
-        src_port=_to_int(data.get("sport")),
-        dst_ip=(data.get("dst") or "").strip(),
-        dst_port=_to_int(data.get("dport")),
+        src_ip=_to_ip(data.get("src")),
+        src_port=_to_port(data.get("sport")),
+        dst_ip=_to_ip(data.get("dst")),
+        dst_port=_to_port(data.get("dport")),
         raw=line.strip(),
         format="alert_fast",
     )
@@ -203,10 +258,10 @@ def parse_syslog(line: str) -> ParsedAlert | None:
         classification=(data.get("classification") or "").strip(),
         priority=_to_int(data.get("priority")),
         protocol=(data.get("protocol") or "").upper(),
-        src_ip=(data.get("src") or "").strip(),
-        src_port=_to_int(data.get("sport")),
-        dst_ip=(data.get("dst") or "").strip(),
-        dst_port=_to_int(data.get("dport")),
+        src_ip=_to_ip(data.get("src")),
+        src_port=_to_port(data.get("sport")),
+        dst_ip=_to_ip(data.get("dst")),
+        dst_port=_to_port(data.get("dport")),
         raw=line.strip(),
         format="alert_syslog",
     )
@@ -259,10 +314,10 @@ def parse_json(line: str) -> ParsedAlert | None:
         classification=str(data.get("class") or "").strip(),
         priority=_to_int(data.get("priority")),
         protocol=str(data.get("proto") or "").upper(),
-        src_ip=str(data.get("src_addr") or "").strip(),
-        src_port=_to_int(data.get("src_port")),
-        dst_ip=str(data.get("dst_addr") or "").strip(),
-        dst_port=_to_int(data.get("dst_port")),
+        src_ip=_to_ip(data.get("src_addr")),
+        src_port=_to_port(data.get("src_port")),
+        dst_ip=_to_ip(data.get("dst_addr")),
+        dst_port=_to_port(data.get("dst_port")),
         interface=str(data.get("iface") or data.get("interface") or "").strip(),
         raw=text,
         format="alert_json",
@@ -295,10 +350,10 @@ def parse_csv(
         classification=values.get("class", "").strip('"'),
         priority=_to_int(values.get("priority")),
         protocol=values.get("proto", "").upper(),
-        src_ip=values.get("src", ""),
-        src_port=_to_int(values.get("srcport")),
-        dst_ip=values.get("dst", ""),
-        dst_port=_to_int(values.get("dstport")),
+        src_ip=_to_ip(values.get("src")),
+        src_port=_to_port(values.get("srcport")),
+        dst_ip=_to_ip(values.get("dst")),
+        dst_port=_to_port(values.get("dstport")),
         raw=text,
         format="alert_csv",
         extra={k: v for k, v in values.items() if k not in known and v},

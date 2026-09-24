@@ -202,7 +202,7 @@ class TestSeverityOfScoring:
     def test_same_evidence_scores_identically(self) -> None:
         """Two identical evidence sets produce the same factors."""
         evidence = ThreatEvidence(
-            category=ThreatCategory.BRUTE_FORCE,
+            category=ThreatCategory.TCP_SYN_FLOOD,
             distinct_sources=1,
             snort_alert_count=5,
             event_count=5,
@@ -290,10 +290,24 @@ class TestRecoveryInterfaceWiring:
         assert "EmptyState" in source
 
     def test_the_users_badge_only_asks_when_it_may(self) -> None:
-        """An unauthorised count per tick would be a flood of denial records."""
-        source = inspect.getsource(app_module.MainWindow._refresh_nav_badges)
-        assert "session.has(Permission.USER_RESET_APPROVE)" in source
+        """An unauthorised count would be a flood of denial records.
+
+        The read now runs on a worker (off the Tk thread) in
+        ``_maybe_refresh_badge_counts``; the permission guard moved there with
+        it, so that is where the check must be.
+        """
+        source = inspect.getsource(app_module.MainWindow._maybe_refresh_badge_counts)
+        assert "session.has(" in source
+        assert "Permission.USER_RESET_APPROVE" in source
         assert "users" in app_module.BADGE_SOURCES
+
+    def test_the_badge_paint_never_queries_on_the_tk_thread(self) -> None:
+        """§lag - a DB read on the tick is the stall an operator feels."""
+        paint = inspect.getsource(app_module.MainWindow._refresh_nav_badges)
+        for forbidden in (
+            "unresolved_alert_count", "open_incident_count", "pending_count",
+        ):
+            assert forbidden not in paint
 
     def test_every_request_state_has_a_colour(self) -> None:
         """The queue never shows a status in the default 'unknown' grey."""

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import socket
 from dataclasses import dataclass
+from typing import Any
 from datetime import timedelta
 
 from aethra_sec.core.errors import (
@@ -28,7 +29,14 @@ from aethra_sec.core.session import Session, SessionManager
 from aethra_sec.database.repositories.users import UserRepository
 from aethra_sec.models.user import User
 from aethra_sec.security.audit import AuditAction, AuditCategory, AuditService
-from aethra_sec.security.otp import OtpService
+from aethra_sec.security.lockout import (
+    ALERT_THRESHOLD,
+    ALERT_WINDOW_MINUTES,
+    FAILURES_BEFORE_LOCK,
+    LockoutState,
+    evaluate,
+    format_remaining,
+)
 from aethra_sec.security.password import PasswordHashService, token_fingerprint
 from aethra_sec.utils.logging import get_logger
 from aethra_sec.utils.timeutil import utcnow
@@ -54,14 +62,13 @@ class AuthenticationPolicy:
 class LoginResult:
     """Outcome of a sign-in attempt.
 
-    A result with ``session is None`` and ``otp_required`` true means the
-    password was correct and a second factor must now be supplied.
+    A sign-in has exactly two outcomes: a session, or an exception describing
+    why there is none. There is no intermediate state in which a password has
+    been accepted but the operator is not yet signed in - that state existed
+    when a second factor did, and it went with it.
     """
 
     session: Session | None = None
-    otp_required: bool = False
-    otp_user_id: int | None = None
-    otp_delivery_error: str = ""
     must_change_password: bool = False
 
     @property
@@ -79,15 +86,20 @@ class AuthenticationService:
         sessions: SessionManager,
         passwords: PasswordHashService,
         audit: AuditService,
-        otp: OtpService | None = None,
         policy: AuthenticationPolicy | None = None,
+        notifications: Any = None,
     ) -> None:
-        """Wire the service to its collaborators."""
+        """Wire the service to its collaborators.
+
+        ``notifications`` is optional so the service can be constructed in a
+        test or a setup script without one. When it is absent the lockout still
+        works in full; only the administrator's alert is skipped.
+        """
         self._users = users
         self._sessions = sessions
         self._passwords = passwords
         self._audit = audit
-        self._otp = otp
+        self._notifications = notifications
         self._policy = policy or AuthenticationPolicy()
         self._sessions.set_timeout(self._policy.session_timeout_minutes)
 
@@ -95,6 +107,17 @@ class AuthenticationService:
     def policy(self) -> AuthenticationPolicy:
         """The active authentication policy."""
         return self._policy
+
+    def attach_notifications(self, notifications: Any) -> None:
+        """Give the service somewhere to raise administrator alerts.
+
+        Set after construction because the notification service is built later
+        in the start-up order. Until it is attached the lockout works in full
+        and only the alert is skipped, which is the right way round: the
+        control that refuses sign-in must never depend on the one that reports
+        it.
+        """
+        self._notifications = notifications
 
     def apply_policy(self, policy: AuthenticationPolicy) -> None:
         """Replace the policy (called when an administrator edits settings)."""
@@ -119,10 +142,11 @@ class AuthenticationService:
             AuthenticationError: on any credential failure. The message is
                 deliberately identical for unknown users and wrong passwords.
             AccountLockedError / AccountInactiveError: when the account exists
-                but cannot be used; these are distinguishable because the
-                operator needs to know to contact an administrator, and they
-                are only reachable *after* the password verified or after the
-                lockout has already been triggered by this same account.
+                but cannot be used. These are distinguishable from a credential
+                failure because the operator needs to know to contact an
+                administrator - and they are reachable only *after* the
+                password has verified, so neither can be used to discover
+                whether an account exists.
         """
         host = self._host_context()
         candidate = (username or "").strip()
@@ -131,13 +155,77 @@ class AuthenticationService:
             self._record_failure(candidate, None, "empty_credentials", host)
             raise AuthenticationError(user_message=GENERIC_FAILURE_MESSAGE)
 
+        # The throttle is checked here, before the password is looked at, and
+        # it is the reason a correct password cannot get in during a lock.
+        #
+        # Checking it first is safe *because* it is keyed on the submitted name
+        # rather than on an account: an unknown username accumulates failures
+        # and locks in exactly the same way, so the refusal discloses nothing
+        # about whether the account exists. The per-account lock below is a
+        # different control and stays where it is, after verification.
+        lock = self._lockout_for(candidate)
+        if lock.locked:
+            self._record_failure(candidate, None, "throttled", host)
+            self._audit.record(
+                AuditAction.LOGIN_LOCKED,
+                username=candidate,
+                category=AuditCategory.AUTHENTICATION,
+                result="DENIED",
+                detail=(
+                    f"Sign-in refused: {lock.failures} consecutive failed "
+                    f"attempts; locked for {lock.seconds}s, "
+                    f"{lock.remaining(utcnow())}s remaining."
+                ),
+            )
+            raise AccountLockedError(user_message=self._lockout_message(lock))
+
         user = self._users.get_by_username(candidate)
         if user is None or user.id is None:
             # Unknown account: record the attempt, answer with the generic
             # message, and do not reveal that the username does not exist.
+            # It escalates and alerts exactly as a real name does - anything
+            # less would make the *absence* of a lock the tell.
             self._record_failure(candidate, None, "unknown_user", host)
+            unknown_lock = self._lockout_for(candidate)
+            self._raise_security_alert(candidate, None, unknown_lock, host)
+            if unknown_lock.locked:
+                raise AccountLockedError(
+                    user_message=self._lockout_message(unknown_lock)
+                )
             raise AuthenticationError(user_message=GENERIC_FAILURE_MESSAGE)
 
+        stored_hash, _algorithm = self._users.get_password_hash(user.id)
+        if not self._passwords.verify(password, stored_hash):
+            self._users.register_failed_login(user.id)
+            self._record_failure(candidate, user.id, "bad_password", host)
+            # Re-read after recording, so the decision is made from the row
+            # this attempt just wrote rather than from a stale count.
+            lock = self._lockout_for(candidate)
+            if lock.locked:
+                self._users.set_locked(user.id, True, lock.locked_until)
+                self._audit.record(
+                    AuditAction.LOGIN_LOCKED,
+                    user_id=user.id,
+                    username=user.username,
+                    category=AuditCategory.AUTHENTICATION,
+                    result="DENIED",
+                    detail=(
+                        f"Sign-in locked after {lock.failures} consecutive "
+                        f"failed attempts; lock lasts {lock.seconds}s "
+                        f"(escalation level {lock.level})."
+                    ),
+                )
+            self._raise_security_alert(candidate, user.id, lock, host)
+            if lock.locked:
+                raise AccountLockedError(user_message=self._lockout_message(lock))
+            raise AuthenticationError(user_message=GENERIC_FAILURE_MESSAGE)
+
+        # The lockout is disclosed only to someone who has just proved they
+        # know the password. Checked before verification it was an enumeration
+        # oracle: six wrong guesses against any name, and the reply told the
+        # guesser whether that account existed. A wrong password now gets the
+        # same generic answer whatever the account's state, and the operator
+        # who does know their password still learns why they cannot get in.
         if self._is_locked(user):
             self._record_failure(candidate, user.id, "account_locked", host)
             self._audit.record(
@@ -146,35 +234,12 @@ class AuthenticationService:
                 username=user.username,
                 category=AuditCategory.AUTHENTICATION,
                 result="DENIED",
-                detail="Sign-in refused: the account is locked.",
+                detail=(
+                    "Sign-in refused: the account is locked. The password "
+                    "supplied was correct."
+                ),
             )
             raise AccountLockedError()
-
-        stored_hash, _algorithm = self._users.get_password_hash(user.id)
-        if not self._passwords.verify(password, stored_hash):
-            failures = self._users.register_failed_login(user.id)
-            reason = "bad_password"
-            if failures >= self._policy.max_failed_logins:
-                self._users.set_locked(
-                    user.id,
-                    True,
-                    utcnow() + timedelta(minutes=self._policy.lockout_minutes),
-                )
-                reason = "bad_password_locked"
-                self._audit.record(
-                    AuditAction.LOGIN_LOCKED,
-                    user_id=user.id,
-                    username=user.username,
-                    category=AuditCategory.AUTHENTICATION,
-                    result="DENIED",
-                    detail=(
-                        f"Account locked after {failures} consecutive failed "
-                        f"sign-in attempts; lockout lasts "
-                        f"{self._policy.lockout_minutes} minute(s)."
-                    ),
-                )
-            self._record_failure(candidate, user.id, reason, host)
-            raise AuthenticationError(user_message=GENERIC_FAILURE_MESSAGE)
 
         if not user.is_active:
             self._record_failure(candidate, user.id, "account_inactive", host)
@@ -192,46 +257,7 @@ class AuthenticationService:
             except Exception:  # noqa: BLE001 - never block a valid sign-in
                 LOGGER.exception("Credential upgrade failed; sign-in continues.")
 
-        if self._otp and self._otp.required_for(user.email):
-            challenge = self._otp.issue(user.id, user.email)
-            return LoginResult(
-                otp_required=True,
-                otp_user_id=user.id,
-                otp_delivery_error=challenge.delivery_error,
-                must_change_password=user.must_change_password,
-            )
-
         session = self._establish_session(user, host)
-        return LoginResult(
-            session=session, must_change_password=user.must_change_password
-        )
-
-    def complete_otp(self, user_id: int, code: str) -> LoginResult:
-        """Finish a sign-in that required a second factor.
-
-        Raises:
-            AuthenticationError: when the code is wrong or expired.
-        """
-        if not self._otp:
-            raise AuthenticationError(
-                user_message="Two-factor authentication is not configured."
-            )
-        ok, reason = self._otp.verify(user_id, code)
-        if not ok:
-            self._audit.record(
-                AuditAction.LOGIN_FAILED,
-                user_id=user_id,
-                category=AuditCategory.AUTHENTICATION,
-                result="FAILURE",
-                detail=f"Second factor rejected: {reason}",
-            )
-            raise AuthenticationError(user_message=reason)
-
-        user = self._users.get_by_id(user_id)
-        if user is None or user.id is None or not user.is_active:
-            raise AuthenticationError(user_message=GENERIC_FAILURE_MESSAGE)
-
-        session = self._establish_session(user, self._host_context())
         return LoginResult(
             session=session, must_change_password=user.must_change_password
         )
@@ -270,6 +296,127 @@ class AuthenticationService:
         )
         LOGGER.info("User '%s' signed in (role=%s).", user.username, user.role_name)
         return session
+
+    # ------------------------------------------------------------------
+    # Lockout
+    # ------------------------------------------------------------------
+    def _lockout_for(self, username: str) -> LockoutState:
+        """The lock state for a submitted username, from recorded attempts.
+
+        A database failure here must not hand out a free pass, but neither
+        should it lock everyone out of the console. It resolves to "not
+        locked" and is logged: the password check still has to pass, and the
+        per-account lock below is a second line.
+        """
+        try:
+            failures, last_at = self._users.consecutive_failures(username)
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("Could not read the sign-in attempt history.")
+            return LockoutState()
+        return evaluate(failures, last_at, utcnow())
+
+    @staticmethod
+    def _lockout_message(lock: LockoutState) -> str:
+        """What the operator is told while a lock is in force.
+
+        Names the wait and nothing else - not the threshold, not the schedule,
+        not whether the account exists.
+        """
+        remaining = lock.remaining(utcnow())
+        return (
+            "Too many unsuccessful login attempts. "
+            f"Try again in {format_remaining(remaining)}."
+        )
+
+    def lockout_status(self, username: str) -> tuple[bool, int]:
+        """Whether sign-in is currently locked, and for how many seconds.
+
+        Read by the sign-in screen to drive its countdown. The screen only
+        *displays* this; every decision is made in :meth:`login`, so a tampered
+        or stopped client clock changes nothing about what the server accepts.
+        """
+        lock = self._lockout_for((username or "").strip())
+        return lock.locked, lock.remaining(utcnow())
+
+    # ------------------------------------------------------------------
+    # Administrator alerting
+    # ------------------------------------------------------------------
+    def _raise_security_alert(
+        self,
+        username: str,
+        user_id: int | None,
+        lock: LockoutState,
+        host: str,
+    ) -> None:
+        """Tell an administrator about a real run of failed sign-ins.
+
+        Raised only from attempts this service actually recorded, and only once
+        the run reaches :data:`ALERT_THRESHOLD` inside the window. Every figure
+        in the notification is counted from ``login_attempts``; none of it is
+        composed.
+
+        Deduplicated rather than repeated: eight failures produce one alert,
+        not eight. A further alert is raised only when the lock escalates,
+        which is the point at which the situation has genuinely changed.
+        """
+        if self._notifications is None:
+            return
+        window_start = utcnow() - timedelta(minutes=ALERT_WINDOW_MINUTES)
+        try:
+            recent = self._users.failed_attempts_since(username, window_start)
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("Could not count recent failures.", exc_info=True)
+            return
+        if recent < ALERT_THRESHOLD:
+            return
+
+        reference = f"login-failures:{username[:48]}"
+        try:
+            if self._notifications.security_alert_exists(reference, window_start):
+                # One already stands for this window. It is replaced only when
+                # the lock escalates, so a sustained attack updates the
+                # administrator instead of burying them.
+                if not (lock.locked and lock.failures % FAILURES_BEFORE_LOCK == 0):
+                    return
+                if self._notifications.security_alert_exists(
+                    f"{reference}:L{lock.level}", window_start
+                ):
+                    return
+                reference = f"{reference}:L{lock.level}"
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("Could not check for an existing alert.", exc_info=True)
+            return
+
+        detail = (
+            f"{recent} failed sign-in attempt(s) for '{username[:64]}' in the "
+            f"last {ALERT_WINDOW_MINUTES} minutes"
+            + (f" from {host}" if host else "")
+            + (
+                f". Sign-in is locked for {lock.seconds}s."
+                if lock.locked
+                else "."
+            )
+        )
+        try:
+            self._notifications.raise_security_alert(
+                title="Multiple failed login attempts",
+                message=detail,
+                reference=reference,
+                user_id=user_id,
+            )
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("Could not raise the sign-in alert.", exc_info=True)
+            return
+
+        self._audit.record(
+            AuditAction.MULTIPLE_LOGIN_FAILURES,
+            user_id=user_id,
+            username=username,
+            category=AuditCategory.AUTHENTICATION,
+            result="DENIED",
+            detail=detail,
+        )
+        LOGGER.warning("Sign-in security alert raised: %s", detail)
 
     def _record_failure(
         self, username: str, user_id: int | None, reason: str, host: str

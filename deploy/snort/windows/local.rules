@@ -1,0 +1,23 @@
+# Starter rules for proving the AETHRA-SEC alert pipeline works.
+#
+# Each fires on a property of a real packet. Nothing here fabricates an alert:
+# if none of these ever match, nothing is stored, and that is the correct
+# outcome rather than a fault.
+#
+# These three are DELIBERATELY BROAD. They match ordinary traffic, which is
+# what lets you confirm the plumbing in about a minute - run "ping 127.0.0.1"
+# and the first rule fires - instead of waiting for a real attack to arrive.
+#
+# REPLACE THEM BEFORE YOU RELY ON THIS FOR MONITORING. Broad rules on a live
+# network produce a constant stream of alerts, and a screen that always has
+# alerts on it is a screen nobody reads. Snort's registered and community rule
+# sets are at snort.org/downloads (a free account is needed for those, though
+# not for Snort itself); unpack one into C:\Snort\rules and add an include line
+# for it in aethra.conf.
+#
+# Local rule sids start at 1000000 by convention - that range is reserved for
+# rules you write, so it cannot collide with a downloaded rule set.
+
+alert icmp any any -> any any (msg:"ICMP echo request"; itype:8; sid:1000001; rev:1; classtype:misc-activity;)
+alert tcp any any -> any any (msg:"TCP SYN to HTTP port"; flags:S; dsize:0; sid:1000002; rev:1; classtype:attempted-recon;)
+alert udp any any -> any 53 (msg:"UDP traffic to DNS port"; sid:1000003; rev:1; classtype:misc-activity;)

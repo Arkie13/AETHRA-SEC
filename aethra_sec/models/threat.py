@@ -50,6 +50,16 @@ class TrafficAnomaly:
     threshold_value: float = 0.0
     window_seconds: int = 0
     event_count: int = 1
+    #: T2 - the instant the rule crossed its threshold, taken from the
+    #: clock at that moment. Distinct from ``created_at``, which is when
+    #: the row reached the database: without both, a slow detection and a
+    #: slow write are indistinguishable.
+    detected_at: datetime | None = None
+    #: When an analyst marked this reviewed. A read receipt, deliberately
+    #: separate from ``evaluation``: being looked at is not a verdict, and
+    #: the evaluation labels feed the detection-accuracy statistics.
+    reviewed_at: datetime | None = None
+    reviewed_by: int | None = None
     first_seen: datetime | None = None
     last_seen: datetime | None = None
     evidence: dict[str, object] = field(default_factory=dict)
@@ -103,7 +113,8 @@ class ThreatSummary:
     """Counts used by the dashboard security overview, all query-derived."""
 
     active_incidents: int = 0
-    critical_alerts: int = 0
+    #: No ``critical_alerts``: CRITICAL is outside the detection severity
+    #: model, so a field for it could only ever hold zero.
     high_alerts: int = 0
     medium_alerts: int = 0
     low_alerts: int = 0
@@ -116,8 +127,7 @@ class ThreatSummary:
     def total_alerts(self) -> int:
         """Total alerts across all severities in the queried window."""
         return (
-            self.critical_alerts
-            + self.high_alerts
+            self.high_alerts
             + self.medium_alerts
             + self.low_alerts
             + self.info_alerts

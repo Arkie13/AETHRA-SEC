@@ -19,7 +19,8 @@ What is pinned here:
 * live packets are coalesced onto a fixed cadence, so display cost is bounded
   by the clock rather than by the attacker;
 * the display buffer is bounded and says when it dropped something;
-* a protocol view filters on arrival rather than after rendering;
+* the display filter is applied before packets reach the screen, so traffic
+  nobody asked to see costs the interface nothing;
 * nothing above is allowed to hide traffic: what is not displayed is still
   analysed, counted and stored, and the screen says so.
 """
@@ -33,10 +34,10 @@ import pytest
 
 from aethra_sec.ui.screens import traffic as traffic_module
 from aethra_sec.ui.screens.traffic import (
+    DIRECTION_BUTTONS,
     FLUSH_INTERVAL_MS,
     MAX_BUFFERED_PACKETS,
-    PROTOCOL_ANY,
-    PROTOCOL_CHOICES,
+    PROTOCOL_BUTTONS,
     TrafficScreen,
 )
 from aethra_sec.ui.widgets.tables import Column, DataTable
@@ -106,6 +107,7 @@ class _Table(DataTable):
         self._actions = []
         self._empty_text = ""
         self._hovered = ""
+        self._marked = set()
         self._counter = None
         self._hint = None
         self._footer = None
@@ -228,33 +230,32 @@ class TestBoundedTable:
 # Coalescing and filtering on the live screen
 # ---------------------------------------------------------------------------
 class _Packet:
-    """A captured packet, as the screen reads one."""
+    """A captured packet, as the screen and the packet view read one."""
 
-    def __init__(self, protocol: str = "ICMP", app_protocol: str = "") -> None:
-        self.protocol = protocol
-        self.app_protocol = app_protocol
+    def __init__(self, layers: tuple[str, ...] = ("ETH", "IP", "ICMP")) -> None:
+        self.layers = layers
+        self.protocol = layers[-1]
+        self.direction = ""
+        self.src_ip = ""
+        self.dst_ip = ""
+        self.src_mac = ""
+        self.dst_mac = ""
 
 
 class _Screen:
     """TrafficScreen's buffering logic, without a display."""
 
-    def __init__(self, choice: str = PROTOCOL_ANY) -> None:
+    def __init__(self) -> None:
         self._buffer: list[Any] = []
         self._flush_job: str | None = None
         self._seen_since_flush = 0
         self._buffer_dropped = 0
-        self._choice = choice
         self.scheduled = 0
 
-    _matches_protocol = TrafficScreen._matches_protocol
     _buffer_packets = TrafficScreen._buffer_packets
 
     def _flush_buffer(self) -> None:
         """The real flush needs a table; scheduling it is what is under test."""
-
-    @property
-    def _protocol_var(self) -> Any:
-        return type("Var", (), {"get": lambda _s, c=self._choice: c})()
 
     @property
     def is_alive(self) -> bool:
@@ -298,58 +299,100 @@ class TestCoalescing:
         screen._buffer_packets([_Packet() for _ in range(MAX_BUFFERED_PACKETS + 500)])
         assert screen._buffer_dropped == 500
 
-    def test_everything_arriving_is_counted_even_when_not_displayed(self) -> None:
-        """The rate shown to the operator is what arrived, not what was drawn."""
-        screen = _Screen(choice="TCP")
-        screen._buffer_packets([_Packet("ICMP") for _ in range(100)])
+    def test_everything_arriving_is_counted(self) -> None:
+        """What reached the screen is counted whether or not it was drawn."""
+        screen = _Screen()
+        screen._buffer_packets([_Packet() for _ in range(100)])
         assert screen._seen_since_flush == 100
-        assert screen._buffer == []
 
 
-class TestProtocolView:
-    """Item 9: choose what to monitor, and do not pay for the rest."""
+def _view(expression: str) -> tuple[Any, list[Any]]:
+    """A packet view with ``expression`` applied, driven by hand."""
+    from aethra_sec.analytics.display_filter import compile_filter
+    from aethra_sec.analytics.traffic_direction import LocalAddresses
+    from aethra_sec.services.packet_view import PacketView
 
-    def test_the_required_protocols_are_offered(self) -> None:
-        """All, ICMP, TCP, UDP, ARP, DNS, HTTP, HTTPS."""
-        for protocol in ("All", "ICMP", "TCP", "UDP", "ARP", "DNS", "HTTP", "HTTPS"):
-            assert protocol in PROTOCOL_CHOICES
+    published: list[Any] = []
+    ticks = [0.0]
 
-    def test_all_admits_everything(self) -> None:
+    def clock() -> float:
+        ticks[0] += 1.0
+        return ticks[0]
+
+    view = PacketView(
+        lambda _kind, payload: published.append(payload),
+        resolver=lambda _interface: LocalAddresses(),
+        clock=clock,
+    )
+    view.begin_session("test0")
+    view.apply_filter(compile_filter(expression))
+    return view, published
+
+
+def _listed(published: list[Any]) -> list[Any]:
+    return [packet for payload in published for packet in payload.packets]
+
+
+class TestDisplayViews:
+    """Choose what to watch, and do not pay for the rest."""
+
+    def test_the_required_views_are_offered(self) -> None:
+        """All, Incoming, Outgoing, Transit; HTTP, HTTPS, Web, TCP, UDP, ICMP, DNS, ARP."""
+        assert {key for key, _label in DIRECTION_BUTTONS} == {"", "INCOMING", "OUTGOING", "TRANSIT"}
+        assert {key for key, _label in PROTOCOL_BUTTONS} == {
+            "HTTP", "HTTPS", "WEB", "SITES", "TCP", "UDP", "ICMP", "DNS", "ARP",
+        }
+
+    def test_all_traffic_admits_everything(self) -> None:
         """The default view hides nothing."""
-        screen = _Screen(PROTOCOL_ANY)
-        assert screen._matches_protocol(_Packet("ICMP"))
-        assert screen._matches_protocol(_Packet("TCP"))
+        view, published = _view("")
+        view.ingest([_Packet(("ETH", "IP", "ICMP")), _Packet(("ETH", "IP", "TCP"))])
+        view.step()
+        view.step()
+        assert len(_listed(published)) == 2
 
-    @pytest.mark.parametrize("protocol", ["ICMP", "TCP", "UDP", "ARP"])
-    def test_a_transport_view_admits_only_that_transport(self, protocol: str) -> None:
+    @pytest.mark.parametrize("protocol", ["icmp", "tcp", "udp", "arp"])
+    def test_a_protocol_view_admits_only_that_protocol(self, protocol: str) -> None:
         """Watching ICMP means a TCP flood costs the view nothing."""
-        screen = _Screen(protocol)
-        assert screen._matches_protocol(_Packet(protocol))
-        assert not screen._matches_protocol(_Packet("OTHER"))
+        view, published = _view(protocol)
+        view.ingest([_Packet(("ETH", "IP", protocol.upper())), _Packet(("ETH", "IP", "OTHER"))])
+        view.step()
+        view.step()
+        listed = _listed(published)
+        assert len(listed) == 1 and listed[0].layers[-1] == protocol.upper()
 
-    @pytest.mark.parametrize("application", ["DNS", "HTTP", "HTTPS"])
-    def test_an_application_view_matches_the_decoded_protocol(
-        self, application: str
-    ) -> None:
-        """These ride on a transport, so the transport is not what identifies them."""
-        screen = _Screen(application)
-        assert screen._matches_protocol(_Packet("UDP", application))
-        assert not screen._matches_protocol(_Packet("UDP", "OTHER"))
+    def test_an_application_view_matches_the_decoded_layer_not_the_port(self) -> None:
+        """HTTP is what TShark decoded, not where the packet was going."""
+        view, published = _view("http")
+        decoded = _Packet(("ETH", "IP", "TCP", "HTTP"))
+        port_only = _Packet(("ETH", "IP", "TCP"))
+        port_only.dst_port = 80
+        view.ingest([decoded, port_only])
+        view.step()
+        view.step()
+        assert _listed(published) == [decoded]
 
-    def test_filtering_happens_before_the_buffer(self) -> None:
-        """Traffic nobody asked for must not reach the table at all."""
-        screen = _Screen("ICMP")
-        screen._buffer_packets([_Packet("TCP") for _ in range(500)])
-        assert screen._buffer == []
+    def test_filtering_happens_before_the_screen(self) -> None:
+        """Traffic nobody asked for never reaches the table at all."""
+        view, published = _view("icmp")
+        view.ingest([_Packet(("ETH", "IP", "TCP")) for _ in range(500)])
+        view.step()
+        view.step()
+        assert _listed(published) == []
+        assert view.statistics().evaluated == 500
+        assert view.statistics().matched == 0
 
 
 class TestHonesty:
     """None of the above is allowed to quietly reduce what is monitored."""
 
-    def test_filtering_is_a_display_choice_not_a_capture_change(self) -> None:
-        """The protocol view must never touch the capture or its rules."""
-        source = inspect.getsource(TrafficScreen._matches_protocol)
-        for forbidden in ("capture.stop", "set_bpf", "rules", "start("):
+    def test_changing_the_display_filter_is_not_a_capture_change(self) -> None:
+        """A display filter must never stop, start or re-filter the capture."""
+        source = inspect.getsource(TrafficScreen._apply_display_filter)
+        for forbidden in (
+            "capture.stop", "capture.start", "_bpf_var", "_perform_stop",
+            "_begin_capture", "rules",
+        ):
             assert forbidden not in source
 
     def test_the_screen_states_what_it_is_not_showing(self) -> None:
@@ -362,6 +405,14 @@ class TestHonesty:
         """If the display buffer overflows, the operator is told."""
         source = inspect.getsource(TrafficScreen._update_surge_note)
         assert "_buffer_dropped" in source
+
+    def test_the_https_limitation_is_stated_for_encrypted_views(self) -> None:
+        source = inspect.getsource(TrafficScreen._update_surge_note)
+        assert "HTTPS_NOTICE" in source
+
+    def test_the_table_is_not_narrowed_by_matching_rendered_text(self) -> None:
+        source = inspect.getsource(TrafficScreen._build_packet_table)
+        assert "show_toolbar=False" in source
 
     def test_hiding_the_screen_stops_drawing_not_capturing(self) -> None:
         """Leaving the page must not reduce detection."""

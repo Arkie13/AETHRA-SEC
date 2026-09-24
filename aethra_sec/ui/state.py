@@ -28,6 +28,12 @@ KEY_GEOMETRY = "window.geometry"
 KEY_SIDEBAR_COLLAPSED = "sidebar.collapsed"
 KEY_LAST_SCREEN = "navigation.last_screen"
 KEY_TABLE_SORT = "tables.sort"
+#: "dark" or "light". Read before the main window is built, so the
+#: chosen theme is the first thing painted and no flash is visible.
+KEY_THEME = "appearance.theme"
+#: When true, subtle animations (status pulse, tile flash, drawer slide) are
+#: skipped - transitions jump to their end state, nothing is hidden.
+KEY_REDUCED_MOTION = "appearance.reduced_motion"
 
 
 class UiState:

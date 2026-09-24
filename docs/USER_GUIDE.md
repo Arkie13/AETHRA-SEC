@@ -88,6 +88,59 @@ rule working correctly, and the resulting anomaly names the source address.
 * The privileged profiles are hidden when the process cannot open raw sockets.
 * The exact argument list and Nmap version used are stored with the scan.
 
+### Hostname and operating system
+
+A port scan answers *what is listening*, not *what is this machine*. After the
+port scan finishes, every host that is up and still missing a name or an OS
+gets one short follow-up probe — ports 135/139/445 with Nmap's `nbstat` and
+`smb-os-discovery` scripts, plus `-O` fingerprinting where the process has
+raw-socket privileges. Both scripts only read what a service volunteers;
+neither authenticates and neither guesses a credential.
+
+Answers are preferred in this order, and the source is shown next to the value
+in the host's detail drawer:
+
+| Field | Order of preference |
+| --- | --- |
+| Hostname | PTR record → SMB computer name → NetBIOS name → local resolver → mDNS |
+| Operating system | what SMB reported → Nmap's `-O` fingerprint → scan evidence (below) |
+
+**Scan evidence.** `-O` needs raw sockets and `smb-os-discovery` needs a host
+willing to hold an anonymous SMB session, so on an ordinary unprivileged run
+neither produces an answer. The scan has usually already collected one anyway,
+and these sources are read directly out of Nmap's XML:
+
+| Evidence | Confidence | Example |
+| --- | --- | --- |
+| An operating-system CPE reported by a service | 95% | `cpe:/o:microsoft:windows_10` |
+| Nmap's service database naming the platform | 85% | `ostype="Windows"` on port 135 |
+| A version banner naming the distribution | 80% | `MariaDB-0ubuntu0.24.04.1` → Ubuntu 24.04 |
+| The reply TTL | 45% | 128 → Windows, 64 → Linux/Unix, 255 → network device |
+
+The percentage shown beside the OS is that confidence, and the host's detail
+drawer states the exact evidence behind it. A reply TTL narrows the *family*
+only — it is never turned into a version. Software that runs everywhere
+(`nginx`, a bare `MySQL` version) is not treated as evidence of anything.
+
+The inventory keeps the **best** answer anyone has obtained rather than the
+most recent one, so re-running a scan without Administrator rights will not
+replace a measured fingerprint with a weaker inference.
+
+Where nothing answers, the cell reads **Unknown** and the drawer's *Why
+identity is incomplete* section says which methods were tried and what stopped
+them. Two things commonly do:
+
+* **No PTR record.** Normal on a LAN where the router hands out addresses and
+  registers no names. NetBIOS, SMB and mDNS cover most such devices; a Linux
+  box with none of those services running genuinely has no name to give.
+* **Nothing listening.** A host with no open port offers no banner and no
+  service CPE, so only the reply TTL is available — and a firewalled host that
+  answers nothing at all leaves even that empty.
+
+Running as Administrator (Windows) or root (Linux) additionally enables `-O`,
+which is the only source that identifies an OS from the network stack itself
+rather than from something a service said.
+
 **Reading findings.** A finding states what Nmap observed (the port, service
 and version), why it is a concern, and its risk level with the reasoning. Where
 no configured knowledge source matched the service, the finding says *further

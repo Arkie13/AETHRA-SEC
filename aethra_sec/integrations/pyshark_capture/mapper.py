@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from aethra_sec.models.traffic import CapturedPacket
+from aethra_sec.models.traffic import CapturedPacket, without_parsed_tls
 from aethra_sec.utils.logging import get_logger
 from aethra_sec.utils.timeutil import from_epoch, utcnow
 
@@ -28,20 +28,15 @@ APPLICATION_LAYERS: tuple[str, ...] = (
 #: Transport/network layers that are never treated as the application protocol.
 _NON_APPLICATION_LAYERS: frozenset[str] = frozenset(
     {"ETH", "IP", "IPV6", "TCP", "UDP", "ICMP", "ICMPV6", "ARP", "SLL",
-     "LOOP", "NULL", "DATA", "FRAME", "VLAN", "LLC", "RAW", "SLL2"}
+     "LOOP", "NULL", "DATA", "FRAME", "VLAN", "LLC", "RAW", "SLL2",
+     "ETHERTYPE", "TCP.SEGMENTS", "DATA-TEXT-LINES", "MEDIA", "IGMP"}
 )
 
-#: Ports used to name the application protocol when TShark did not decode one.
-#: This is a static lookup over the port number the packet really carried - it
-#: labels an observation, it does not assert what the traffic contained.
-_PORT_HINTS: dict[int, str] = {
-    20: "FTP-DATA", 21: "FTP", 22: "SSH", 23: "TELNET", 25: "SMTP", 53: "DNS",
-    67: "DHCP", 68: "DHCP", 69: "TFTP", 80: "HTTP", 110: "POP3", 123: "NTP",
-    135: "MSRPC", 137: "NBNS", 139: "NETBIOS", 143: "IMAP", 161: "SNMP",
-    389: "LDAP", 443: "HTTPS", 445: "SMB", 514: "SYSLOG", 587: "SMTP",
-    993: "IMAPS", 995: "POP3S", 1433: "MSSQL", 3306: "MYSQL", 3389: "RDP",
-    5432: "POSTGRESQL", 5900: "VNC", 8080: "HTTP", 8443: "HTTPS",
-}
+# There is deliberately no port-to-protocol table here any more. One used to
+# name a packet "HTTPS" because it went to port 443 and "HTTP" because it went
+# to port 80, whether or not either protocol was present. The label then reached
+# the packet table, the stored records and the detection rules as though TShark
+# had decoded it. A port is where traffic went, not what it contained.
 
 
 def _field(layer: Any, *names: str) -> str:
@@ -122,21 +117,33 @@ def _sniff_time(packet: Any) -> datetime:
     return utcnow()
 
 
-def _application_protocol(
-    layers: tuple[str, ...], highest_layer: str, src_port: int | None, dst_port: int | None
-) -> str:
-    """Determine the application protocol from decoded layers, then ports."""
-    for name in reversed(layers):
-        if name in _NON_APPLICATION_LAYERS:
+def application_protocol(layers: tuple[str, ...], highest_layer: str = "") -> str:
+    """The application protocol TShark decoded for a frame, or ``""``.
+
+    Read from the decoded protocol chain and nothing else. Layers after an ICMP
+    header are the quoted packet an ICMP error carries, not this frame's own
+    application, so the chain is cut there.
+    """
+    chain = tuple(layers)
+    for marker in ("ICMP", "ICMPV6"):
+        if marker in chain:
+            chain = chain[: chain.index(marker) + 1]
+            break
+    # A DNS answer whose HTTPS record TShark parsed with its TLS code is DNS.
+    chain = without_parsed_tls(chain)
+    for name in reversed(chain):
+        if name in _NON_APPLICATION_LAYERS or name.startswith("_WS."):
             continue
         if name in APPLICATION_LAYERS:
             return name
     upper = (highest_layer or "").upper()
-    if upper and upper not in _NON_APPLICATION_LAYERS:
+    if (
+        upper
+        and upper in chain
+        and upper not in _NON_APPLICATION_LAYERS
+        and not upper.startswith("_WS.")
+    ):
         return upper
-    for port in (dst_port, src_port):
-        if port is not None and port in _PORT_HINTS:
-            return _PORT_HINTS[port]
     return ""
 
 
@@ -221,7 +228,21 @@ def map_packet(packet: Any, interface: str = "") -> CapturedPacket | None:
             src_mac = _field(arp_layer, "src_hw_mac").lower()
             dst_mac = _field(arp_layer, "dst_hw_mac").lower()
 
-        app_protocol = _application_protocol(layers, highest, src_port, dst_port)
+        app_protocol = application_protocol(layers, highest)
+
+        http_layer = _layer(packet, "HTTP")
+        tls_layer = _layer(packet, "TLS")
+        if tls_layer is None:
+            tls_layer = _layer(packet, "SSL")
+        dns_layer = None
+        for dns_name in ("DNS", "MDNS", "LLMNR"):
+            dns_layer = _layer(packet, dns_name)
+            if dns_layer is not None:
+                break
+        icmp_layer = _layer(packet, "ICMP")
+        if icmp_layer is None:
+            icmp_layer = _layer(packet, "ICMPV6")
+        dns_flag = _field(dns_layer, "flags_response").lower()
 
         if not layers and not length and not (src_ip or dst_ip or src_mac or dst_mac):
             # Nothing identifiable was read: no layers, no length, no endpoints.
@@ -248,6 +269,31 @@ def map_packet(packet: Any, interface: str = "") -> CapturedPacket | None:
             dst_mac=dst_mac,
             ip_version=ip_version,
             layers=layers,
+            http_method=_field(http_layer, "request_method"),
+            http_uri=_field(http_layer, "request_uri"),
+            http_host=_field(http_layer, "host"),
+            http_version=_field(http_layer, "request_version", "response_version"),
+            http_status=_int_field(http_layer, "response_code"),
+            http_phrase=_field(http_layer, "response_phrase"),
+            tls_handshake_type=_int_field(tls_layer, "handshake_type"),
+            tls_sni=_field(tls_layer, "handshake_extensions_server_name"),
+            tls_record_version=_int_field(tls_layer, "record_version"),
+            tls_handshake_version=_int_field(tls_layer, "handshake_version"),
+            tls_supported_version=_int_field(
+                tls_layer, "handshake_extensions_supported_version"
+            ),
+            dns_query=_field(dns_layer, "qry_name"),
+            dns_response=(
+                True if dns_flag in ("1", "true")
+                else False if dns_flag in ("0", "false") else None
+            ),
+            icmp_type=_int_field(icmp_layer, "type"),
+            icmp_code=_int_field(icmp_layer, "code"),
+            arp_opcode=_int_field(arp_layer, "opcode"),
+            arp_sender_mac=_field(arp_layer, "src_hw_mac").lower(),
+            arp_target_mac=_field(arp_layer, "dst_hw_mac").lower(),
+            tcp_seq=_int_field(transport_layer_obj, "seq") if transport == "TCP" else None,
+            tcp_ack=_int_field(transport_layer_obj, "ack") if transport == "TCP" else None,
         )
     except Exception:  # noqa: BLE001 - one odd packet must not stop the capture
         LOGGER.debug("Could not map a captured packet.", exc_info=True)

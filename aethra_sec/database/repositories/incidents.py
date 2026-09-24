@@ -14,6 +14,7 @@ from aethra_sec.database.repositories.base import (
     as_text,
     limit_clause,
     order_clause,
+    period_bounds,
 )
 from aethra_sec.models.enums import (
     EvaluationLabel,
@@ -355,7 +356,10 @@ class IncidentRepository(Repository):
         query.equals("src_ip", src_ip)
         query.equals("assigned_user_id", assigned_user_id)
         query.gte("created_at", to_db(start))
-        query.lte("created_at", to_db(end))
+        # Exclusive upper bound. An inclusive one, or a 23:59:59 cut, counts a
+        # record stamped at exactly midnight into both days and loses anything
+        # in the final second.
+        query.lt("created_at", to_db(end))
         if open_only:
             query.raw("i.status IN ('NEW','INVESTIGATING','ACKNOWLEDGED')")
         query.any_of(("title", "src_ip", "dst_ip", "reference"), text)
@@ -375,6 +379,26 @@ class IncidentRepository(Repository):
         )
         return self._map_all(rows, self._map)
 
+    def for_mitigation(
+        self, recommendation_id: int, limit: int = 50
+    ) -> list[Incident]:
+        """Incidents this recommendation was actually bound to.
+
+        The mitigation knowledge base is generic by design - an entry
+        describes a class of threat, not one event. What makes a
+        recommendation *actionable* is the real evidence it was attached to,
+        and that link already exists as ``incidents.mitigation_id``. Reading
+        it back is what lets the screen show genuine addresses, ports and
+        counts instead of the placeholder values a generic entry would
+        otherwise have to invent.
+        """
+        rows = self.db.query(
+            f"{_SELECT} WHERE i.mitigation_id = %s "
+            "ORDER BY i.last_seen DESC LIMIT %s",
+            (int(recommendation_id), max(1, min(int(limit), 200))),
+        )
+        return self._map_all(rows, self._map)
+
     def for_host(self, host_id: int, limit: int = 100) -> list[Incident]:
         """Incidents affecting a host."""
         rows = self.db.query(
@@ -385,10 +409,65 @@ class IncidentRepository(Repository):
         return self._map_all(rows, self._map)
 
     def count_open(self) -> int:
-        """Incidents still requiring attention."""
+        """Incidents still requiring attention.
+
+        Deliberately unbounded in time. This is *current state* - a backlog
+        does not become smaller because a new day started - so it is the one
+        incident figure the Dashboard's daily rollover must not touch.
+        """
         return self.count(
             f"SELECT COUNT(*) FROM incidents WHERE status IN {_OPEN_STATUSES}"
         )
+
+    def close_stale(self, cutoff: datetime, limit: int = 5000) -> list[int]:
+        """Close untouched incidents whose evidence stopped before ``cutoff``.
+
+        An incident is a claim that something needs attention *now*. Correlation
+        refreshes ``last_seen`` every time new evidence arrives, so anything
+        still happening keeps its incident open on its own; what this closes is
+        the long tail that stopped days ago and that nobody will ever action.
+
+        Only ``NEW`` incidents are touched. ``INVESTIGATING`` and
+        ``ACKNOWLEDGED`` mean a person has picked the incident up, and closing
+        one out from under them would be worse than leaving the count high.
+
+        Nothing is deleted. The row keeps its evidence, its timeline and its
+        notes, moves to ``CLOSED``, and stays searchable under any historical
+        period - so the record of what was detected is unchanged and only the
+        claim that it is *outstanding* is retracted.
+
+        Returns:
+            The ids closed, so the caller can audit them individually.
+        """
+        rows = self.db.query(
+            "SELECT id FROM incidents WHERE status = %s AND last_seen < %s "
+            "ORDER BY last_seen ASC LIMIT %s",
+            (str(IncidentStatus.NEW), to_db(cutoff), max(1, min(int(limit), 20_000))),
+        )
+        ids = [int(row["id"]) for row in rows if row.get("id") is not None]
+        if not ids:
+            return []
+        placeholders = ", ".join(["%s"] * len(ids))
+        self.db.execute(
+            f"UPDATE incidents SET status = %s, resolved_at = %s, updated_at = %s "
+            f"WHERE id IN ({placeholders}) AND status = %s",
+            (
+                str(IncidentStatus.CLOSED), to_db(utcnow()), to_db(utcnow()),
+                *ids, str(IncidentStatus.NEW),
+            ),
+        )
+        return ids
+
+    def count_created_in_period(
+        self, start: datetime | None, end: datetime | None = None
+    ) -> int:
+        """Incidents *opened* inside ``[start, end)``.
+
+        The daily counterpart to :meth:`count_open`: how much new work the
+        period produced, which does start again at zero each day.
+        """
+        clauses, params = period_bounds("created_at", start, end)
+        return self.count(f"SELECT COUNT(*) FROM incidents {clauses}", params)
 
     def count_unread(self) -> int:
         """Open incidents nobody has opened in the investigation view yet.
@@ -417,20 +496,34 @@ class IncidentRepository(Repository):
         return bool(changed)
 
     def mark_all_viewed(self, user_id: int | None) -> int:
-        """Stamp every unread incident as read in one go.
+        """Stamp every unread open incident as read by ``user_id``.
 
-        Used by the sidebar's "mark all read" - it clears the whole backlog
-        at once rather than requiring each incident to be opened individually.
+        Mirrors :meth:`mark_viewed` for one incident, and counts the same rows
+        the sidebar badge counts, so clearing the badge and reading the badge
+        can never disagree. Incidents already read keep the reader and the time
+        they were first opened - being marked again does not rewrite who saw an
+        incident first.
+
+        Returns:
+            How many incidents this call marked.
         """
         return self.db.execute(
             "UPDATE incidents SET viewed_at = %s, viewed_by = %s "
-            "WHERE viewed_at IS NULL",
+            f"WHERE viewed_at IS NULL AND status IN {_OPEN_STATUSES}",
             (to_db(utcnow()), user_id),
         )
 
     def count_all(self) -> int:
         """Total incidents recorded."""
         return self.count("SELECT COUNT(*) FROM incidents")
+
+    def count_resolved(self) -> int:
+        """Incidents no longer requiring attention (resolved, closed or false
+        positive) - the counterpart to :meth:`count_open`, so the two sum to
+        :meth:`count_all`."""
+        return self.count(
+            f"SELECT COUNT(*) FROM incidents WHERE status NOT IN {_OPEN_STATUSES}"
+        )
 
     def count_by_severity(self, open_only: bool = True) -> dict[str, int]:
         """Incident counts grouped by severity."""
@@ -458,13 +551,20 @@ class IncidentRepository(Repository):
             )
         return {as_text(r["category"]): as_int(r["c"]) or 0 for r in rows}
 
-    def timeline(self, since: datetime, limit: int = 100) -> list[dict[str, Any]]:
-        """Incident events ordered for the dashboard threat timeline."""
+    def timeline(
+        self, since: datetime | None, limit: int = 100, end: datetime | None = None
+    ) -> list[dict[str, Any]]:
+        """Incident events ordered for the dashboard threat timeline.
+
+        Bounded on ``last_seen``: the timeline shows incidents that were still
+        active inside the reporting period, not every incident ever opened.
+        """
+        clauses, params = period_bounds("i.last_seen", since, end)
         rows = self.db.query(
             "SELECT i.reference, i.title, i.severity, i.category, i.src_ip, "
             "i.dst_ip, i.first_seen, i.last_seen, i.status FROM incidents i "
-            "WHERE i.last_seen >= %s ORDER BY i.last_seen DESC LIMIT %s",
-            (to_db(since), max(1, min(int(limit), 500))),
+            f"{clauses} ORDER BY i.last_seen DESC LIMIT %s",
+            [*params, max(1, min(int(limit), 500))],
         )
         return [
             {

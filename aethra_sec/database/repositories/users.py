@@ -301,6 +301,69 @@ class UserRepository(Repository):
     # ------------------------------------------------------------------
     # Login attempts
     # ------------------------------------------------------------------
+    def consecutive_failures(self, username: str) -> tuple[int, datetime | None]:
+        """Failed attempts for ``username`` since it last succeeded.
+
+        Keyed on the *submitted username string*, not on an account row, so an
+        unknown name accumulates exactly as a real one does. That is what keeps
+        the lock from becoming an enumeration oracle: three attempts against a
+        name that does not exist behave identically to three against one that
+        does.
+
+        Returns:
+            ``(count, most_recent_failure_at)``. The timestamp is the recorded
+            attempt time, so a lock is measured from a real event.
+        """
+        name = (username or "").strip()
+        if not name:
+            return 0, None
+        last_success = self.db.query_value(
+            "SELECT MAX(attempted_at) FROM login_attempts "
+            "WHERE username = %s AND successful = 1",
+            (name[:64],),
+        )
+        clauses = ["username = %s", "successful = 0"]
+        params: list[Any] = [name[:64]]
+        if last_success is not None:
+            clauses.append("attempted_at > %s")
+            params.append(last_success)
+        row = self.db.query_one(
+            "SELECT COUNT(*) AS c, MAX(attempted_at) AS last_at "
+            f"FROM login_attempts WHERE {' AND '.join(clauses)}",
+            params,
+        )
+        if not row:
+            return 0, None
+        return int(row["c"] or 0), as_dt(row["last_at"])
+
+    def failed_attempts_since(self, username: str, since: datetime) -> int:
+        """Failed attempts for ``username`` inside the alert window."""
+        name = (username or "").strip()
+        if not name:
+            return 0
+        return self.count(
+            "SELECT COUNT(*) FROM login_attempts WHERE username = %s "
+            "AND successful = 0 AND attempted_at >= %s",
+            (name[:64], to_db(since)),
+        )
+
+    def distinct_failed_usernames_since(self, since: datetime) -> int:
+        """How many different names have been tried and failed recently.
+
+        A spread across many usernames is what account lockout alone does not
+        catch: an attacker who tries one password against a thousand names
+        never trips any single account's counter.
+        """
+        return int(
+            self.db.query_value(
+                "SELECT COUNT(DISTINCT username) FROM login_attempts "
+                "WHERE successful = 0 AND attempted_at >= %s",
+                (to_db(since),),
+                default=0,
+            )
+            or 0
+        )
+
     def record_login_attempt(
         self,
         *,

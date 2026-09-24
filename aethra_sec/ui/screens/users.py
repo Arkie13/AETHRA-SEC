@@ -29,7 +29,6 @@ from aethra_sec.ui.widgets import (
     EmptyState,
     FormDialog,
     FormField,
-    ScrollableFrame,
     Toolbar,
     confirm,
     show_message,
@@ -113,17 +112,8 @@ class UsersScreen(Screen):
     # Layout
     # ------------------------------------------------------------------
     def build(self) -> None:
-        """Construct the user management screen.
-
-        Wrapped in a :class:`ScrollableFrame`, matching the Alerts screen: a
-        fixed-height page must never leave content unreachable whenever it is
-        taller than the window (§ layout).
-        """
-        scroller = ScrollableFrame(self)
-        scroller.pack(fill="both", expand=True)
-        root = scroller.interior
-
-        summary = Card(root, "Accounts", fonts=self.fonts, padding=18)
+        """Construct the user management screen."""
+        summary = Card(self, "Accounts", fonts=self.fonts, padding=12)
         summary.pack(fill="x")
         self._summary_label = ttk.Label(summary, text="", style="CardMuted.TLabel")
         self._summary_label.pack(anchor="w")
@@ -132,8 +122,8 @@ class UsersScreen(Screen):
         )
         self._reset_summary_label.pack(anchor="w", pady=(4, 0))
 
-        notebook = ttk.Notebook(root)
-        notebook.pack(fill="both", expand=True, pady=(16, 0))
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill="both", expand=True, pady=(10, 0))
         self._notebook = notebook
 
         accounts = ttk.Frame(notebook, style="TFrame", padding=10)
@@ -158,7 +148,7 @@ class UsersScreen(Screen):
 
     def _build_accounts(self, parent: tk.Misc) -> None:
         """Account table and its controls."""
-        card = Card(parent, "User accounts", fonts=self.fonts, padding=18)
+        card = Card(parent, "User accounts", fonts=self.fonts, padding=12)
         card.pack(fill="both", expand=True)
 
         toolbar = Toolbar(card)
@@ -180,7 +170,7 @@ class UsersScreen(Screen):
         card = Card(
             parent, "Password recovery requests",
             subtitle="raised at the sign-in screen; nothing changes until you decide",
-            fonts=self.fonts, padding=18,
+            fonts=self.fonts, padding=12,
         )
         card.pack(fill="both", expand=True)
 
@@ -235,7 +225,7 @@ class UsersScreen(Screen):
         """Sign-in attempt history."""
         card = Card(
             parent, "Sign-in attempts", subtitle="successful and failed",
-            fonts=self.fonts, padding=18,
+            fonts=self.fonts, padding=12,
         )
         card.pack(fill="both", expand=True)
         toolbar = Toolbar(card)
@@ -246,7 +236,7 @@ class UsersScreen(Screen):
 
     def _build_sessions(self, parent: tk.Misc) -> None:
         """Currently signed-in sessions."""
-        card = Card(parent, "Active sessions", fonts=self.fonts, padding=18)
+        card = Card(parent, "Active sessions", fonts=self.fonts, padding=12)
         card.pack(fill="both", expand=True)
         toolbar = Toolbar(card)
         toolbar.pack(fill="x", pady=(0, 6))
@@ -256,7 +246,7 @@ class UsersScreen(Screen):
 
     def _build_roles(self, parent: tk.Misc) -> None:
         """Role and permission reference."""
-        card = Card(parent, "Roles and permissions", fonts=self.fonts, padding=18)
+        card = Card(parent, "Roles and permissions", fonts=self.fonts, padding=12)
         card.pack(fill="both", expand=True)
         self._roles_text = tk.Text(card, wrap="word")
         configure_text_widget(self._roles_text, self.fonts)
@@ -617,8 +607,8 @@ class UsersScreen(Screen):
                           options=self._roles, required=True,
                           help_text=(
                               "ADMIN can manage accounts, settings, the audit trail "
-                              "and password recovery. USER monitors, assesses, reads "
-                              "incidents and reports."
+                              "and password recovery. USER monitors, assesses, "
+                              "reviews alerts and reads reports."
                           )),
                 FormField("password", "Initial password", kind="password",
                           help_text=(

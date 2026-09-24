@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from aethra_sec.core.errors import IntegrityError
 from aethra_sec.core.permissions import Permission
 from aethra_sec.core.session import Session
 from aethra_sec.database.repositories.audit import AuditRepository
@@ -134,6 +135,94 @@ class LogService:
                 "LOG INTEGRITY WARNING: %d issue(s) detected.", len(report.issues)
             )
         return report
+
+
+    def rehash_chain(self, session: Session) -> tuple[int, int]:
+        """Re-hash records written under the earlier canonical format.
+
+        This is the only operation in AETHRA-SEC that rewrites an integrity
+        hash, so it is deliberately narrow:
+
+        * it requires ``data.maintain``, not the ``log.verify`` an operator
+          uses to read the report, so a normal user cannot touch historical
+          records;
+        * it refuses if verification finds a CONTENT problem, so a real
+          modification cannot be laundered into a fresh, valid-looking chain;
+        * it writes an audit record before and after. The maintenance is itself
+          part of the log it maintains, including when it refuses.
+
+        Returns:
+            ``(examined, rehashed)``.
+
+        Raises:
+            PermissionDeniedError: without ``data.maintain``.
+            IntegrityError: when the log shows a content modification.
+        """
+        live = self._access.require(
+            session, Permission.DATA_MAINTAIN, target="audit_logs"
+        )
+
+        before = self._audit.verify()
+        tampered = [issue for issue in before.issues if issue.kind == "CONTENT"]
+        if tampered:
+            first = tampered[0].record_id
+            self._audit.record(
+                AuditAction.LOG_CHAIN_REHASHED,
+                session=live,
+                category=AuditCategory.ADMINISTRATION,
+                target_type="audit_logs",
+                result="DENIED",
+                detail=(
+                    f"Refused: {len(tampered)} record(s) do not match their "
+                    f"stored hash, the first at id {first}. A modified log is "
+                    "investigated, not re-hashed."
+                ),
+            )
+            LOGGER.error(
+                "Audit re-hash refused: %d modified record(s), first at id %s.",
+                len(tampered),
+                first,
+            )
+            raise IntegrityError(
+                f"{len(tampered)} audit record(s) fail their content hash.",
+                user_message=(
+                    f"The audit log cannot be re-hashed: {len(tampered)} "
+                    f"record(s) have been modified since they were written, the "
+                    f"first at id {first}. Investigate before running "
+                    "maintenance."
+                ),
+            )
+
+        self._audit.record(
+            AuditAction.LOG_CHAIN_REHASHED,
+            session=live,
+            category=AuditCategory.ADMINISTRATION,
+            target_type="audit_logs",
+            target_id=str(before.checked),
+            result="WARNING",
+            detail=(
+                f"Starting re-hash: {before.legacy} record(s) of "
+                f"{before.checked} verified are on the earlier hash format. "
+                "Record contents are not modified."
+            ),
+        )
+
+        examined, rehashed = self._audit.rehash_chain()
+
+        after = self._audit.verify()
+        self._audit.record(
+            AuditAction.LOG_CHAIN_REHASHED,
+            session=live,
+            category=AuditCategory.ADMINISTRATION,
+            target_type="audit_logs",
+            target_id=str(rehashed),
+            result="SUCCESS" if after.is_valid else "WARNING",
+            detail=(
+                f"Re-hashed {rehashed} of {examined} record(s). "
+                f"{after.summary}"
+            ),
+        )
+        return examined, rehashed
 
     # ------------------------------------------------------------------
     # Export

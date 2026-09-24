@@ -8,11 +8,6 @@
 *.env
 !.env.example
 
-# Registration API's own SQLite database and its WAL/SHM sidecar files
-web/registration_api/*.db
-web/registration_api/*.db-wal
-web/registration_api/*.db-shm
-
 # Python
 __pycache__/
 *.py[cod]
@@ -57,3 +52,6 @@ Desktop.ini
 .idea/
 .vscode/
 *.swp
+
+# Claude Code local machine config
+.claude/

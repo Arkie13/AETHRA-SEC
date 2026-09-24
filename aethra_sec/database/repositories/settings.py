@@ -138,6 +138,12 @@ class IntegrationStatusRepository(Repository):
         }
 
 
+#: Separates the operator-facing text of a notification from the correlation
+#: key that deduplicates it. Everything after it is hidden by the interface,
+#: which is why a key can live here without a schema change.
+_REFERENCE_MARKER = "⁣ref:"
+
+
 class NotificationRepository(Repository):
     """In-application notifications for genuine events (§52)."""
 
@@ -172,45 +178,107 @@ class NotificationRepository(Repository):
             ),
         )
 
+    def exists_since(
+        self, reference_type: str, reference_key: str, since: datetime
+    ) -> bool:
+        """True when a notification with this reference already stands.
+
+        Used to keep a repeated condition to one notification rather than one
+        per occurrence. The key is carried in ``message`` behind a marker so
+        no schema change was needed for it.
+        """
+        return bool(
+            self.count(
+                "SELECT COUNT(*) FROM notifications WHERE reference_type = %s "
+                "AND message LIKE %s AND created_at >= %s",
+                (
+                    reference_type[:48],
+                    f"%{_REFERENCE_MARKER}{reference_key}%",
+                    to_db(since),
+                ),
+            )
+        )
+
     def list_recent(
         self, user_id: int | None = None, *, unread_only: bool = False, limit: int = 50
     ) -> list[Notification]:
-        """Notifications visible to a user (broadcast rows have no user id)."""
-        clauses = ["(user_id IS NULL OR user_id = %s)"]
-        params: list[Any] = [user_id]
-        if unread_only:
-            clauses.append("is_read = 0")
+        """Notifications visible to a user, with *that user's* read state.
+
+        A row with no ``user_id`` is a broadcast everyone can see. Whether it
+        has been read is answered per reader from ``notification_reads``, so
+        one analyst opening the panel no longer marks the queue read for the
+        rest of the team.
+
+        ``is_read`` on the notification itself is the grandfathered answer for
+        anything dismissed before per-user tracking existed; it still counts as
+        read, because it was.
+        """
         limit_sql, limit_params = limit_clause(limit)
+        read_expr = "(n.is_read = 1 OR r.notification_id IS NOT NULL)"
+        clauses = ["(n.user_id IS NULL OR n.user_id = %s)"]
+        params: list[Any] = [user_id, user_id]
+        if unread_only:
+            clauses.append(f"NOT {read_expr}")
         rows = self.db.query(
-            "SELECT id, user_id, level, title, message, category, "
-            "reference_type, reference_id, is_read, created_at, read_at "
-            f"FROM notifications WHERE {' AND '.join(clauses)} "
-            f"ORDER BY created_at DESC {limit_sql}",
-            (*params, *limit_params),
+            "SELECT n.id, n.user_id, n.level, n.title, n.message, n.category, "
+            "n.reference_type, n.reference_id, n.created_at, "
+            f"{read_expr} AS is_read, "
+            "COALESCE(r.read_at, n.read_at) AS read_at "
+            "FROM notifications n "
+            "LEFT JOIN notification_reads r "
+            "ON r.notification_id = n.id AND r.user_id = %s "
+            f"WHERE {' AND '.join(clauses)} "
+            f"ORDER BY n.created_at DESC {limit_sql}",
+            (params[0], params[1], *limit_params),
         )
         return self._map_all(rows, self._map)
 
-    def mark_read(self, notification_id: int) -> None:
-        """Mark one notification as read."""
+    def mark_read(self, notification_id: int, user_id: int | None) -> None:
+        """Record that *this* reader has read one notification.
+
+        Without a user - a system context with no session - there is nobody to
+        attribute the read to, and inventing one would be worse than doing
+        nothing, so nothing is written.
+        """
+        if user_id is None:
+            return
         self.db.execute(
-            "UPDATE notifications SET is_read = 1, read_at = %s WHERE id = %s",
-            (to_db(utcnow()), notification_id),
+            "INSERT INTO notification_reads (notification_id, user_id, read_at) "
+            "VALUES (%s, %s, %s) "
+            "ON DUPLICATE KEY UPDATE read_at = read_at",
+            (notification_id, user_id, to_db(utcnow())),
         )
 
     def mark_all_read(self, user_id: int | None) -> int:
-        """Mark every notification visible to a user as read."""
+        """Mark everything this reader can currently see as read by them.
+
+        Returns:
+            How many notifications this reader had not already read. Rows
+            another analyst has read are counted here too, because they were
+            unread *for this reader*, which is the number the screen reports.
+        """
+        if user_id is None:
+            return 0
         return self.db.execute(
-            "UPDATE notifications SET is_read = 1, read_at = %s "
-            "WHERE is_read = 0 AND (user_id IS NULL OR user_id = %s)",
-            (to_db(utcnow()), user_id),
+            "INSERT INTO notification_reads (notification_id, user_id, read_at) "
+            "SELECT n.id, %s, %s FROM notifications n "
+            "LEFT JOIN notification_reads r "
+            "ON r.notification_id = n.id AND r.user_id = %s "
+            "WHERE (n.user_id IS NULL OR n.user_id = %s) "
+            "AND n.is_read = 0 AND r.notification_id IS NULL "
+            "ON DUPLICATE KEY UPDATE read_at = notification_reads.read_at",
+            (user_id, to_db(utcnow()), user_id, user_id),
         )
 
     def unread_count(self, user_id: int | None) -> int:
-        """Number of unread notifications for a user."""
+        """Number of notifications this reader has not read."""
         return self.count(
-            "SELECT COUNT(*) FROM notifications WHERE is_read = 0 "
-            "AND (user_id IS NULL OR user_id = %s)",
-            (user_id,),
+            "SELECT COUNT(*) FROM notifications n "
+            "LEFT JOIN notification_reads r "
+            "ON r.notification_id = n.id AND r.user_id = %s "
+            "WHERE (n.user_id IS NULL OR n.user_id = %s) "
+            "AND n.is_read = 0 AND r.notification_id IS NULL",
+            (user_id, user_id),
         )
 
     def prune_excess(self, keep: int = 500) -> int:

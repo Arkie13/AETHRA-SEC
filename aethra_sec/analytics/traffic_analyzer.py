@@ -102,6 +102,12 @@ class TrafficAnalyzer:
         self._buckets: dict[int, SecondBucket] = {}
         self._bucket_order: Deque[int] = deque()
         self._newest_second: int | None = None
+        #: Newest second already written into a persisted aggregate. Buckets at
+        #: or below this are done; everything above is still owed to a future
+        #: interval. Without it, a packet handled after an interval's end was
+        #: stamped had its second skipped by that interval and excluded by the
+        #: next one, which is how a burst came to be under-reported.
+        self._aggregated_through: int = -1
         #: Hard ceiling on retained buckets. One bucket per second inside the
         #: window is the normal case; the margin absorbs out-of-order arrivals.
         self._max_buckets = self._window + 2
@@ -221,6 +227,7 @@ class TrafficAnalyzer:
             self.last_packet_at = None
             self._all_protocols.clear()
             self._interfaces.clear()
+            self._aggregated_through = -1
 
     # ------------------------------------------------------------------
     # Queries
@@ -421,18 +428,45 @@ class TrafficAnalyzer:
                 conversations=tuple(self.top_conversations(top_n)),
             )
 
+    #: Seconds left unclaimed at the end of an interval so packets still being
+    #: processed can land in them. A packet handled this late is counted by the
+    #: next interval instead of being lost.
+    AGGREGATE_GRACE_SECONDS = 3
+
     def interval_totals(
-        self, start: datetime, end: datetime
+        self, start: datetime, end: datetime, *, final: bool = False
     ) -> dict[str, int | float]:
-        """Aggregate one interval for persistence into ``traffic_aggregates``."""
+        """Aggregate one interval for persistence into ``traffic_aggregates``.
+
+        Buckets are keyed by the packet's own timestamp, but ``start`` and
+        ``end`` are wall-clock readings taken by the caller. Those two clocks
+        drift apart under load: a packet whose second falls inside the interval
+        can be handled after ``end`` was stamped, and it was then too late for
+        this interval and too old for the next, so it was counted by neither.
+        Measured on a burst, an interval holding 4,746 stored packets reported
+        1,649.
+
+        So the window is not used to select buckets. Every bucket newer than
+        the last one aggregated is claimed, up to a short grace period behind
+        ``end`` that leaves room for packets still in flight. Each bucket is
+        therefore counted exactly once, and none is dropped.
+        """
         with self._lock:
-            start_second = int(start.timestamp())
             end_second = int(end.timestamp())
-            buckets = [
-                self._buckets[s]
+            # Leave the newest seconds unclaimed; they may still be filling.
+            # On the last flush of a capture nothing more is coming, so the
+            # grace period is dropped and every remaining bucket is claimed.
+            cutoff = end_second if final else (
+                end_second - self.AGGREGATE_GRACE_SECONDS
+            )
+            claimed = [
+                s
                 for s in sorted(self._bucket_order)
-                if start_second <= s < end_second and s in self._buckets
+                if self._aggregated_through < s <= cutoff and s in self._buckets
             ]
+            buckets = [self._buckets[s] for s in claimed]
+            if claimed:
+                self._aggregated_through = claimed[-1]
             sources: set[str] = set()
             destinations: set[str] = set()
             for bucket in buckets:

@@ -1,0 +1,101 @@
+AETHRA-SEC — TERMS OF USE AND THIRD-PARTY NOTICES
+=================================================
+
+1. AUTHORISED USE ONLY
+----------------------
+
+AETHRA-SEC must only be operated against networks, hosts and interfaces that
+you are explicitly authorised to monitor or assess.
+
+It performs no exploitation, no credential attacks and no automated mitigation.
+Every mitigation output is advisory and requires a human decision.
+
+Running port scans or packet capture against networks you do not administer, or
+do not have written permission to test, is unlawful in most jurisdictions.
+Installing this software does not grant you that permission, and by continuing
+you accept responsibility for obtaining it.
+
+AETHRA-SEC is intended for academic Network Security laboratories and
+authorised internal LAN environments.
+
+
+2. WHAT THIS INSTALLER CONTAINS
+-------------------------------
+
+This installer contains the AETHRA-SEC application, the Python runtime it was
+built against, and the open-source Python libraries it depends on, all compiled
+into a single application directory by PyInstaller.
+
+Bundled Python libraries and their licences:
+
+    mysql-connector-python    GPL-2.0 with FOSS License Exception (Oracle)
+    argon2-cffi               MIT
+    argon2-cffi-bindings      MIT
+    python-nmap               GPL-3.0-or-later
+    pyshark                   MIT
+    psutil                    BSD-3-Clause
+    python-dotenv             BSD-3-Clause
+    reportlab                 BSD-3-Clause
+    openpyxl                  MIT
+    lxml                      BSD-3-Clause
+    Python (CPython)          Python Software Foundation License 2.0
+    Tcl/Tk                    Tcl/Tk BSD-style licence
+
+Each of these permits redistribution in this form. python-nmap is GPL-3.0, and
+its source is available from its published repository; it is used as an
+unmodified library.
+
+
+3. WHAT THIS INSTALLER DOES NOT CONTAIN
+---------------------------------------
+
+The following are NOT included, NOT redistributed and NOT modified by this
+installer. AETHRA-SEC detects them at run time and reports each one as
+available or unavailable according to what it actually finds:
+
+    Nmap                Nmap Public Source License (NPSL). Not redistributable
+                        under these terms without a separate licence, so it is
+                        detected rather than bundled.
+                        Official source: https://nmap.org/download.html
+
+    Wireshark / TShark  GPL-2.0-or-later. Install from the official build to
+                        get a supported binary and the matching Npcap driver.
+                        Official source: https://www.wireshark.org/download.html
+
+    Npcap               Npcap License. Free for personal and limited use;
+                        redistribution inside another installer requires a
+                        commercial OEM licence from the vendor. Not bundled.
+                        Official source: https://npcap.com/#download
+
+    Snort               GPL-2.0. Optional. AETHRA-SEC only reads alerts a Snort
+                        sensor has already produced; it never starts Snort.
+                        Official source: https://www.snort.org/downloads
+
+    MySQL / MariaDB     GPL-2.0 / GPL-2.0. Required. Install the server itself,
+                        or XAMPP, separately.
+                        Official sources: https://dev.mysql.com/downloads/
+                                          https://mariadb.org/download/
+
+No pirated, patched or repackaged copy of any third-party component is included
+in this installer.
+
+
+4. NO WARRANTY
+--------------
+
+This software is provided "as is", without warranty of any kind, express or
+implied, including but not limited to the warranties of merchantability,
+fitness for a particular purpose and non-infringement.
+
+
+5. DATA HANDLING
+----------------
+
+AETHRA-SEC records what it actually observes on the network you point it at.
+Captured traffic metadata, discovered hosts, alerts and incidents are stored in
+your own MySQL database on your own machine. Nothing is transmitted to the
+authors or to any third party.
+
+Passwords are stored only as Argon2id hashes. Database and SMTP credentials are
+held in a configuration file whose permissions are restricted to Administrators
+and SYSTEM.

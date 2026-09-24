@@ -7,6 +7,7 @@ import os
 import shutil
 import socket
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -200,6 +201,115 @@ def resolve_hostname(address: str, *, timeout: float = 1.0) -> str:
         socket.setdefaulttimeout(previous)
 
 
+def local_ipv4_networks() -> tuple[ipaddress.IPv4Network, ...]:
+    """Subnets this machine is directly attached to, right now.
+
+    An address inside one of these is *on-link*: it shares a broadcast domain
+    with the sensor, so a frame from it carries that host's own MAC. An address
+    outside them was reached through a router, and the source MAC on its frames
+    is the router's - attaching it to the remote address would invent a
+    hardware identity for a machine the sensor has never touched.
+
+    Read from the live interfaces rather than configured once, so it is still
+    correct after the machine moves to a different network.
+    """
+    networks: list[ipaddress.IPv4Network] = []
+    try:
+        import psutil
+    except ImportError:  # pragma: no cover - psutil is a declared dependency
+        return ()
+    try:
+        for entries in psutil.net_if_addrs().values():
+            for entry in entries:
+                if entry.family != socket.AF_INET or not entry.netmask:
+                    continue
+                try:
+                    network = ipaddress.ip_network(
+                        f"{entry.address}/{entry.netmask}", strict=False
+                    )
+                except ValueError:
+                    continue
+                if isinstance(network, ipaddress.IPv4Network) and not (
+                    network.is_loopback
+                ):
+                    networks.append(network)
+    except Exception:  # noqa: BLE001 - never break capture over this
+        return ()
+    return tuple(dict.fromkeys(networks))
+
+
+def is_on_link(address: str, networks: Sequence[ipaddress.IPv4Network]) -> bool:
+    """True when ``address`` sits in one of the sensor's own subnets."""
+    if not address or not networks:
+        return False
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return any(parsed in network for network in networks)
+
+
+def host_address_rejection(
+    address: str, networks: Sequence[ipaddress.IPv4Network] = ()
+) -> str:
+    """Why ``address`` cannot be a discovered host, or ``""`` if it can.
+
+    An inventory row asserts that a device exists at an address. Several kinds
+    of address can never satisfy that, however genuinely they appear on the
+    wire, because no single device owns them:
+
+    * the unspecified address, which a DHCP client uses before it has one;
+    * multicast and broadcast, which name a *group*, not a machine - this
+      installation accumulated 45 IPv6 multicast groups and 12 IPv4
+      broadcast/multicast addresses as "hosts";
+    * loopback, which is the sensor talking to itself;
+    * link-local, which is unroutable autoconfiguration - 117 ``fe80::``
+      addresses were stored as separate hosts here;
+    * a subnet's own network or broadcast address.
+
+    A valid private address is never rejected for lacking a hostname: a real
+    device with no DNS record is still a real device.
+
+    Args:
+        networks: the sensor's subnets, used to recognise a network or
+            broadcast address. Omitted, only the address-intrinsic rules apply.
+
+    Returns:
+        A short reason suitable for an audit note, or ``""`` when the address
+        is acceptable.
+    """
+    text = (address or "").strip()
+    if not text:
+        return "empty address"
+    try:
+        parsed = ipaddress.ip_address(text)
+    except ValueError:
+        return "not a valid IP address"
+    if parsed.is_unspecified:
+        return "the unspecified address"
+    if parsed.is_loopback:
+        return "a loopback address"
+    if parsed.is_multicast:
+        return "a multicast group, not a host"
+    if parsed.is_link_local:
+        return "a link-local address"
+    # Before is_reserved, which also covers it but says less: these reasons
+    # are written into the audit trail, so the specific one is worth keeping.
+    if str(parsed) == "255.255.255.255":
+        return "the broadcast address"
+    if parsed.is_reserved:
+        return "a reserved address"
+    if isinstance(parsed, ipaddress.IPv4Address):
+        for network in networks:
+            if parsed not in network or network.prefixlen >= 31:
+                continue
+            if parsed == network.broadcast_address:
+                return "the subnet broadcast address"
+            if parsed == network.network_address:
+                return "the subnet network address"
+    return ""
+
+
 def local_addresses() -> set[str]:
     """IP addresses belonging to this machine (used to label local traffic)."""
     addresses: set[str] = set()
@@ -253,3 +363,132 @@ def service_name_for_port(port: int, protocol: str = "tcp") -> str:
         return socket.getservbyport(port, protocol.lower())
     except (OSError, TypeError, ValueError):
         return ""
+
+
+@dataclass(frozen=True)
+class AdapterDetail:
+    """Physical characteristics of one adapter, as the OS reports them.
+
+    Windows exposes the media type an adapter actually uses, which is the only
+    trustworthy way to tell Wi-Fi from Ethernet - adapter names like "Ethernet
+    3" are user-editable labels and are routinely wrong (that one is a
+    VirtualBox host-only adapter on this machine). Nothing here is guessed from
+    a name.
+    """
+
+    guid: str
+    friendly_name: str = ""
+    description: str = ""
+    media_type: str = ""
+    physical_media: str = ""
+    status: str = ""
+    link_speed: str = ""
+
+    @property
+    def kind(self) -> str:
+        """Wi-Fi / Ethernet / Bluetooth / Other, from the reported media type.
+
+        ``MediaType`` is the OS's own classification: "Native 802.11" is
+        wireless and "802.3" is wired. ``PhysicalMediaType`` refines it, since
+        a Bluetooth PAN also presents itself as 802.3.
+        """
+        physical = self.physical_media.strip().lower()
+        media = self.media_type.strip().lower()
+        if "802.11" in media or "802.11" in physical:
+            return "Wi-Fi"
+        if "bluetooth" in physical:
+            return "Bluetooth"
+        if "802.3" in media:
+            return "Ethernet"
+        return "Other"
+
+
+#: PowerShell projection used to read adapter details. CIM, so no elevation.
+_ADAPTER_QUERY = (
+    "Get-NetAdapter | Select-Object "
+    "InterfaceGuid,Name,InterfaceDescription,MediaType,PhysicalMediaType,"
+    "Status,LinkSpeed | ConvertTo-Json -Compress"
+)
+
+
+def windows_adapter_details() -> dict[str, AdapterDetail]:
+    r"""Adapter details keyed by upper-case interface GUID (Windows only).
+
+    The GUID is what makes this reliable: TShark names a Windows capture device
+    ``\Device\NPF_{GUID}``, and ``Get-NetAdapter`` reports the same GUID, so
+    the two lists join exactly rather than by matching display names.
+
+    Returns:
+        GUID -> detail. Empty on non-Windows, or when the query fails for any
+        reason - callers then simply show what TShark gave them.
+    """
+    if os.name != "nt":
+        return {}
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if not powershell:
+        return {}
+    try:
+        completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            [powershell, "-NoProfile", "-NonInteractive", "-Command", _ADAPTER_QUERY],
+            capture_output=True,
+            text=True,
+            timeout=25,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if completed.returncode != 0 or not completed.stdout.strip():
+        return {}
+
+    import json
+
+    try:
+        payload = json.loads(completed.stdout)
+    except (ValueError, TypeError):
+        return {}
+    if isinstance(payload, dict):  # a single adapter is not wrapped in a list
+        payload = [payload]
+
+    details: dict[str, AdapterDetail] = {}
+    for entry in payload:
+        if not isinstance(entry, dict):
+            continue
+        guid = str(entry.get("InterfaceGuid") or "").strip().upper()
+        if not guid:
+            continue
+        details[guid] = AdapterDetail(
+            guid=guid,
+            friendly_name=str(entry.get("Name") or "").strip(),
+            description=str(entry.get("InterfaceDescription") or "").strip(),
+            media_type=str(entry.get("MediaType") or "").strip(),
+            physical_media=str(entry.get("PhysicalMediaType") or "").strip(),
+            status=str(entry.get("Status") or "").strip(),
+            link_speed=str(entry.get("LinkSpeed") or "").strip(),
+        )
+    return details
+
+
+def primary_outbound_address() -> str:
+    """The local IPv4 address this machine would use to reach the internet.
+
+    Asking the routing table which source address it would choose is the only
+    reliable way to tell which of several "up" adapters actually carries
+    traffic - on a machine with VirtualBox, VMware and ZeroTier installed, most
+    of them look equally plausible from their addresses alone.
+
+    The socket is never connected and nothing is transmitted: a UDP socket has
+    no handshake, so this only asks the OS to resolve a route.
+
+    Returns:
+        The chosen source address, or an empty string when there is no route.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.settimeout(0.5)
+        # A routable address that is never contacted; it only selects a route.
+        probe.connect(("192.0.2.1", 9))
+        return str(probe.getsockname()[0])
+    except OSError:
+        return ""
+    finally:
+        probe.close()

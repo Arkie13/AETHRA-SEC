@@ -22,6 +22,7 @@ by the tests themselves, and nothing here is importable by the application.
 from __future__ import annotations
 
 from datetime import timedelta
+import re
 from pathlib import Path
 from typing import Any
 
@@ -328,7 +329,11 @@ class TestGeneratedNames:
         name = service._generated_name("db").name  # noqa: SLF001
         assert name.startswith(f"{BACKUP_PREFIX}db_")
         assert name.endswith(BACKUP_SUFFIX)
-        assert "_2" not in name.removeprefix(f"{BACKUP_PREFIX}db_")
+        # No collision counter: the stem is exactly date_time. Substring checks
+        # cannot express this - a 20:04:45 backup is stamped 20260901_200445,
+        # whose time half legitimately contains "_2".
+        stem = name.removeprefix(f"{BACKUP_PREFIX}db_").removesuffix(BACKUP_SUFFIX)
+        assert re.fullmatch(r"\d{8}_\d{6}", stem), stem
 
     def test_a_taken_name_takes_a_counter_rather_than_failing(
         self, tmp_path: Path

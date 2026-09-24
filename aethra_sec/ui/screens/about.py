@@ -15,7 +15,6 @@ from typing import Any
 
 from aethra_sec.analytics.anomaly_rules import RULE_DEFINITIONS
 from aethra_sec.analytics.risk_engine import (
-    SCORE_CRITICAL,
     SCORE_HIGH,
     SCORE_LOW,
     SCORE_MEDIUM,
@@ -69,14 +68,14 @@ class AboutScreen(Screen):
             ttk.Label(row, text=value, style="Card.TLabel").pack(side="left")
 
         purpose = Card(root, "Purpose", fonts=self.fonts, padding=16)
-        purpose.pack(fill="x", pady=(16, 0))
+        purpose.pack(fill="x", pady=(10, 0))
         ttk.Label(
             purpose, text=APP_PURPOSE, style="Card.TLabel", wraplength=980,
             justify="left",
         ).pack(anchor="w")
 
         stack = Card(root, "Technology stack", fonts=self.fonts, padding=16)
-        stack.pack(fill="x", pady=(16, 0))
+        stack.pack(fill="x", pady=(10, 0))
         for item in TECHNOLOGY_STACK:
             row = ttk.Frame(stack, style="Card.TFrame")
             row.pack(anchor="w", fill="x", pady=1)
@@ -86,7 +85,7 @@ class AboutScreen(Screen):
             ttk.Label(row, text=item, style="Card.TLabel").pack(side="left")
 
         notices = Card(root, "Conditions of use", fonts=self.fonts, padding=16)
-        notices.pack(fill="x", pady=(16, 0))
+        notices.pack(fill="x", pady=(10, 0))
         for text, style in (
             (AUTHORIZED_USE_NOTICE, "Critical.TLabel"),
             (EDUCATIONAL_USE_NOTICE, "CardMuted.TLabel"),
@@ -96,7 +95,7 @@ class AboutScreen(Screen):
             ).pack(anchor="w", pady=(0, 8))
 
         boundaries = Card(root, "What AETHRA-SEC does not do", fonts=self.fonts, padding=16)
-        boundaries.pack(fill="x", pady=(16, 0))
+        boundaries.pack(fill="x", pady=(10, 0))
         for line in (
             "It does not exploit discovered vulnerabilities - Nmap is used for "
             "discovery, port state, service/version and OS detection only.",
@@ -106,8 +105,8 @@ class AboutScreen(Screen):
             "Mitigation output is advisory.",
             "It does not scan targets outside the configured authorised "
             "networks; such requests are refused and audited.",
-            "It does not fabricate data. Every packet, alert, finding, incident "
-            "and metric originates from Nmap, PyShark/TShark, Snort, or a "
+            "It does not fabricate data. Every packet, alert, finding and "
+            "metric originates from Nmap, PyShark/TShark, Snort, or a "
             "deterministic rule applied to those records. Where there is no "
             "data, the interface says so.",
         ):
@@ -184,10 +183,11 @@ not observed anything yet. Populate it in this order.
    AETHRA_SNORT_TRANSPORT at its alert output - see docs/SNORT_INTEGRATION.md.
    Until then the interface reports "Snort unavailable", which is the truth.
 
-5. WATCH CORRELATION
-   As evidence accumulates, the correlation engine groups related records into
-   incidents and attaches mitigation guidance. Incidents state exactly which
-   subsystems contributed.
+5. REVIEW ALERTS
+   Detected threats appear on IDS Alerts, from Snort and from AETHRA-SEC's own
+   traffic rules. Open an alert to read its full evidence and the mitigation
+   guidance mapped to it, then mark it reviewed, acknowledge or escalate it,
+   and record whether it was a true or false positive.
 """
 
     @staticmethod
@@ -197,7 +197,7 @@ not observed anything yet. Populate it in this order.
 
 TWO ROLES
   USER (analyst)  Dashboard, live monitoring, authorised assessments, hosts,
-                  alerts, incidents, mitigation guidance, reports and system
+                  alerts, mitigation guidance, reports and system
                   health. Enough to run a shift.
   ADMIN           Everything a USER can do, plus accounts, password recovery,
                   settings, the audit trail, detection classification and
@@ -270,9 +270,40 @@ PAUSE DISPLAY vs STOP CAPTURE
   Pause display freezes the table; capture, analysis and detection continue.
   Stop capture stops everything.
 
-FILTERS
-  The filter box filters what is displayed. The BPF capture filter is applied
-  by TShark itself and therefore changes what is captured at all.
+FILTERS - TWO KINDS, NEVER CONFUSED
+  CAPTURE FILTER (BPF), in the capture strip: applied by dumpcap before a
+  packet is captured, so excluded traffic is never recorded, analysed or
+  stored. Changing it restarts capture. Example: tcp port 80
+  DISPLAY FILTER, above the packet table: applied to packets already
+  captured. It never restarts capture and never changes what is analysed or
+  stored. CAPTURED keeps counting; DISPLAYED says how many packets match.
+    Presets     All Traffic, Incoming, Outgoing, Transit; HTTP, HTTPS/TLS,
+                Web, Sites, TCP, UDP, ICMP, DNS, ARP. A direction and a
+                protocol combine. Pressing the active protocol again clears it.
+    IP, Port    searched against captured packets as source, destination or
+                either. Searching for an address never creates a host.
+    Expression  Wireshark-style: http, tls, dns || icmp, !arp,
+                ip.addr == <address>, tcp.port == 443,
+                http.host contains "name", direction == incoming.
+                An invalid expression is refused with the reason, and the
+                previous filter stays active.
+
+DIRECTION
+  Decided from the capture interface's own addresses, never from ports.
+  Incoming  - to an address of this interface.
+  Outgoing  - from an address of this interface.
+  Transit   - between two other devices. A switched or wireless network only
+              delivers that here through a mirror (SPAN) port, a network TAP,
+              or with AETHRA-SEC in the traffic path.
+  Broadcast - broadcast or multicast from other devices, which every station
+              on the segment receives.
+  Unknown   - the interface's addresses could not be read.
+
+HTTP AND HTTPS
+  HTTP is identified by TShark's HTTP decode, not by port 80. HTTPS/TLS is
+  identified by TShark's TLS decode, not by port 443. HTTPS is encrypted:
+  AETHRA-SEC shows the TLS and network metadata it can see - server name,
+  handshake, versions - and never claims to see the HTTP inside it.
 
 STORAGE
   Per-packet metadata is kept for a short, configurable window; interval
@@ -368,12 +399,17 @@ first, so the decision is made on the address that would actually be contacted.
         return f"""RISK SCORING AND CORRELATION
 
 SEVERITY IS CALCULATED, NOT GUESSED
-Every incident severity is the sum of named factors, and the factors are stored
-with the incident. Open any incident and read "How the severity was calculated"
-to see exactly which points were awarded and why.
+Alert severity comes from the sensor: a Snort alert's own priority, mapped
+onto HIGH / MEDIUM / LOW, and for AETHRA-SEC's flood rules the manuscript's
+packet-rate bands. Open an alert on IDS Alerts to see the priority it arrived
+with and the raw alert text it was mapped from.
+
+Behind the scenes a correlation engine still groups related detections, scores
+each group from named factors, and binds it to mitigation guidance. That is
+what supplies the evidence and the firewall parameters on the Mitigation
+screen.
 
 Score bands:
-  {SCORE_CRITICAL:>3}+  CRITICAL
   {SCORE_HIGH:>3}+  HIGH
   {SCORE_MEDIUM:>3}+  MEDIUM
   {SCORE_LOW:>3}+  LOW
@@ -391,16 +427,16 @@ signal; the same pattern plus a Snort alert plus a confirmed exposure is a
 strong one.
 
 CORRELATION
-Related evidence is grouped into one incident using a category-aware key. Rate
+Related evidence is grouped using a category-aware key. Rate
 based categories group by source and destination; scan and sweep categories
 group by source and destination host, because the varying ports are the
-pattern. New evidence inside the correlation window joins the existing incident
-rather than creating a new one.
+pattern. New evidence inside the correlation window joins the existing group
+rather than starting a new one.
 
 EVIDENCE PROVENANCE
-An incident lists exactly which subsystems contributed. If only Snort saw it,
-the incident says "Snort only". AETHRA-SEC never implies that Nmap confirmed
-something Nmap did not observe.
+Every alert records which engine raised it - Snort, or AETHRA-SEC's own
+traffic rules - in its "Detected by" column. AETHRA-SEC never implies that one
+subsystem confirmed something only another observed.
 
 TRUSTED ASSETS
 Marking a host as trusted does not suppress detection. It lowers the score
@@ -422,7 +458,7 @@ Each recommendation carries: what was observed, why it matters, the evidence,
 an immediate action, a long-term action, and verification steps.
 
 Administrators maintain the knowledge base on the Mitigation screen. Entries
-are deactivated rather than deleted, so incidents that already cite an entry
+are deactivated rather than deleted, so detections that already cite an entry
 keep their guidance.
 
 REPORTS

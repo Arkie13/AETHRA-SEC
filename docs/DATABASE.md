@@ -162,12 +162,16 @@ it without re-applying anything.
 | 1 | `initial_schema` | Every table in `CREATE_TABLE_STATEMENTS` |
 | 2 | `password_recovery_requests` | `password_reset_requests`, the administrator-reviewed recovery queue |
 | 3 | `incident_read_state` | `incidents.viewed_at` / `viewed_by`, so the sidebar counter can report unread incidents |
+| 4 | `hostname_lookup_state` | `hosts.hostname_checked_at`, which separates "no DNS record" from "nobody has looked yet" |
+| 5 | `os_detail_columns` | `os_version` and `os_cpe` on `hosts` and `scan_hosts`, so a fingerprint's build and its CPE are kept rather than discarded |
 
 Migration 2 is a plain `CREATE TABLE IF NOT EXISTS`, so it is a no-op on a
 database created after it was written and adds only the one table to an
-installation created before it. Migration 3 adds two nullable columns and
-checks `information_schema` first, so it is equally safe to re-run. No account
-or evidence data is touched by either.
+installation created before it. Migrations 3, 4 and 5 add columns and check
+`information_schema` first, so they are equally safe to re-run. No account or
+evidence data is touched by any of them: migrations 4 and 5 leave existing
+rows at `NULL` and `''` respectively, which is the truthful starting state —
+nothing was ever recorded in those columns for those hosts.
 
 The account needs `CREATE`, `ALTER`, `INDEX` and `REFERENCES` while migrations
 run. In steady state `SELECT, INSERT, UPDATE, DELETE` is enough — see

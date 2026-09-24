@@ -32,10 +32,9 @@ from aethra_sec.database.repositories.scans import ScanRepository
 from aethra_sec.models.enums import HostStatus, RiskLevel
 from aethra_sec.models.host import Host
 from aethra_sec.models.incident import Incident
-from aethra_sec.models.scan import ScanHostResult
+from aethra_sec.models.scan import NOT_DETECTED, ScanHostResult
 from aethra_sec.services.correlation_service import CorrelationService
 from aethra_sec.ui.screens import hosts as hosts_screen
-from aethra_sec.ui.screens import incidents as incidents_screen
 from aethra_sec.ui.screens.vulnerabilities import VulnerabilitiesScreen
 from aethra_sec.ui.widgets import cards as cards_module
 from aethra_sec.ui.widgets import tables as tables_module
@@ -177,18 +176,6 @@ class TestIncidentDevices:
         source = inspect.getsource(CorrelationService.evidence_bundle)
         assert '"devices": self._devices(' in source
 
-    def test_the_screen_renders_them_and_names_the_attacker(self) -> None:
-        """The summary tab gained a device table and an explicit source label."""
-        build = inspect.getsource(incidents_screen.IncidentsScreen._build_summary_tab)
-        assert "Devices involved" in build
-        assert "DEVICE_COLUMNS" in build
-        render = inspect.getsource(incidents_screen.IncidentsScreen._render_summary)
-        assert "Source (attacker)" in render
-        assert "self._render_devices(" in render
-        assert [c.key for c in incidents_screen.DEVICE_COLUMNS][:5] == [
-            "role", "ip", "hostname", "mac", "os",
-        ]
-
 
 # ---------------------------------------------------------------------------
 # 2. The sidebar counter tracks unread incidents
@@ -251,24 +238,35 @@ class TestAssessmentHostFields:
     """The screen shows what the backend holds, and only what it holds."""
 
     def test_os_shows_the_name_with_its_accuracy(self) -> None:
-        """The accuracy used to be lost whenever the name was present."""
+        """The accuracy used to be lost whenever the name was present.
+
+        The formatting moved from the screen onto the model, so the drawer,
+        the table and the report all read the same text from one place.
+        """
         host = ScanHostResult(ip_address="10.0.0.1", os_name="Ubuntu", os_accuracy=94)
-        assert VulnerabilitiesScreen._os_text(host) == "Ubuntu (94%)"
+        assert host.os_text == "Ubuntu (94%)"
 
     def test_os_without_an_accuracy_is_shown_plainly(self) -> None:
         """Nmap does not always report a confidence."""
         host = ScanHostResult(ip_address="10.0.0.1", os_name="Ubuntu")
-        assert VulnerabilitiesScreen._os_text(host) == "Ubuntu"
+        assert host.os_text == "Ubuntu"
 
-    def test_an_unknown_os_never_renders_an_accuracy_onto_a_dash(self) -> None:
+    def test_an_unknown_os_never_renders_an_accuracy_onto_a_placeholder(self) -> None:
         """The old expression produced '- (94%)', which claimed nothing twice."""
         host = ScanHostResult(ip_address="10.0.0.1", os_accuracy=94)
-        assert VulnerabilitiesScreen._os_text(host) == "-"
+        assert host.os_text == NOT_DETECTED
 
     def test_a_family_is_used_when_that_is_all_nmap_gave(self) -> None:
         """Real data, clearly labelled as the coarser answer it is."""
         host = ScanHostResult(ip_address="10.0.0.1", os_family="Linux")
-        assert VulnerabilitiesScreen._os_text(host) == "Linux (family)"
+        assert host.os_text == "Linux (family only)"
+
+    def test_the_screen_reads_the_model_rather_than_reformatting_it(self) -> None:
+        """One definition of the text, so the table and drawer cannot diverge."""
+        source = inspect.getsource(VulnerabilitiesScreen)
+        assert "host.os_text" in source
+        assert "host.hostname_text" in source
+        assert "_os_text" not in source
 
     def test_empty_scan_fields_fall_back_to_the_inventory(self) -> None:
         """A discovery sweep records no name; the inventory already has one."""
@@ -418,27 +416,6 @@ class TestRowContextMenu:
         """The row travels with the command rather than being looked up later."""
         source = inspect.getsource(tables_module.DataTable._handle_context_menu)
         assert "data=row: run(data)" in source
-
-    def test_the_incident_menu_offers_the_expected_actions(self) -> None:
-        """The full set, wired to the methods the toolbar already uses."""
-        source = inspect.getsource(incidents_screen.IncidentsScreen._build_table)
-        for label in (
-            "Mark investigating", "Acknowledge", "Resolve", "Mark false positive",
-            "Assign to me", "Add note", "Open affected host", "Copy ID",
-        ):
-            assert f'"{label}"' in source
-
-    def test_the_incident_actions_use_the_clicked_row(self) -> None:
-        """Every entry resolves its incident from the row it was given."""
-        source = inspect.getsource(incidents_screen.IncidentsScreen._build_table)
-        assert source.count("self._incident_from_row(row)") >= 8
-        assert "lambda _row:" not in source
-
-    def test_the_action_methods_accept_an_incident(self) -> None:
-        """They still default to the selection, so the toolbar is unchanged."""
-        for name in ("_set_status", "_assign_self", "_add_note", "_open_host"):
-            method = getattr(incidents_screen.IncidentsScreen, name)
-            assert "incident" in inspect.signature(method).parameters
 
 
 # ---------------------------------------------------------------------------

@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from aethra_sec.core.errors import ReportError
+from aethra_sec.core.errors import ReportError, ValidationFailedError
 from aethra_sec.core.event_bus import EventBus
 from aethra_sec.core.events import EventType, NotificationPayload
 from aethra_sec.core.permissions import Permission
@@ -50,6 +50,9 @@ class ReportService:
         self._audit = audit
         self._access = access
         self._output_dir = Path(output_dir)
+        #: The boundary report output may never leave. Fixed at
+        #: construction so a later call cannot widen it.
+        self._reports_root = Path(output_dir).resolve()
         self._lock = threading.Lock()
         try:
             self._output_dir.mkdir(parents=True, exist_ok=True)
@@ -61,9 +64,45 @@ class ReportService:
         """Directory reports are written to."""
         return self._output_dir
 
-    def set_output_dir(self, path: Path) -> None:
-        """Change the report output directory."""
-        self._output_dir = Path(path)
+    def set_output_dir(self, session: Session, path: Path) -> None:
+        """Change the report output directory.
+
+        Two controls, because this both writes to the filesystem and creates
+        the directories on the way. It took neither before: any caller could
+        point report output at ``C:\\Windows\\System32`` or walk out of the
+        configured tree with ``..``, and ``mkdir(parents=True)`` would create
+        whatever it named - a pentest call created ``C:\\tmp\\evil``.
+
+        Args:
+            session: must hold ``settings.manage``.
+            path: must resolve inside the configured reports root.
+
+        Raises:
+            PermissionDeniedError: without the permission.
+            ValidationFailedError: when the path escapes the reports root.
+        """
+        # settings.manage, not report.generate: choosing where files are
+        # written is configuration, and report.generate is held by ordinary
+        # analyst accounts who should not be able to redirect output.
+        self._access.require(session, Permission.SETTINGS_MANAGE, target="reports")
+
+        root = Path(self._reports_root).resolve()
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        resolved = candidate.resolve()
+
+        # A containment check on the resolved paths, so "..", a symlink or an
+        # absolute path all fail the same way.
+        if resolved != root and root not in resolved.parents:
+            raise ValidationFailedError(
+                f"Report output must stay inside {root}.",
+                user_message=(
+                    "Reports can only be written inside the configured reports "
+                    f"folder ({root}). The location requested was outside it."
+                ),
+            )
+        self._output_dir = resolved
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------

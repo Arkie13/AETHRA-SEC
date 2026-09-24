@@ -33,6 +33,10 @@ class EventType:
     CAPTURE_STOPPED = "capture.stopped"
     CAPTURE_ERROR = "capture.error"
     PACKET_BATCH_PROCESSED = "capture.packet_batch"
+    #: The display filter's matches were re-evaluated; replace the table.
+    DISPLAY_VIEW_RESET = "capture.display_view_reset"
+    #: New packets matched the active display filter; append them.
+    DISPLAY_VIEW_BATCH = "capture.display_view_batch"
     TRAFFIC_STATS_UPDATED = "traffic.stats_updated"
     TRAFFIC_ANOMALY_DETECTED = "traffic.anomaly_detected"
 
@@ -61,7 +65,8 @@ class EventType:
 
     ALL: tuple[str, ...] = (
         CAPTURE_STARTED, CAPTURE_STOPPED, CAPTURE_ERROR,
-        PACKET_BATCH_PROCESSED, TRAFFIC_STATS_UPDATED, TRAFFIC_ANOMALY_DETECTED,
+        PACKET_BATCH_PROCESSED, DISPLAY_VIEW_RESET, DISPLAY_VIEW_BATCH,
+        TRAFFIC_STATS_UPDATED, TRAFFIC_ANOMALY_DETECTED,
         SNORT_ALERT_RECEIVED, SNORT_STATUS_CHANGED,
         NMAP_SCAN_STARTED, NMAP_SCAN_PROGRESS, NMAP_SCAN_COMPLETED,
         NMAP_SCAN_FAILED,
@@ -111,6 +116,24 @@ class PacketBatchPayload:
     packets: tuple[Any, ...]
     total_captured: int
     dropped: int
+
+
+@dataclass(frozen=True)
+class DisplayViewPayload:
+    """Captured packets that match the active display filter.
+
+    ``generation`` identifies the filter the packets were judged against. A
+    screen applies a batch only when it belongs to the generation it is
+    showing, so packets filtered under a previous filter can never be appended
+    under the new one. ``reset`` marks the full re-evaluation that follows a
+    filter change: the table is replaced rather than appended to.
+    ``statistics`` is a :class:`aethra_sec.services.packet_view.ViewStatistics`.
+    """
+
+    generation: int
+    packets: tuple[Any, ...]
+    statistics: Any
+    reset: bool = False
 
 
 @dataclass(frozen=True)

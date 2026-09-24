@@ -16,12 +16,30 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Callable
 
+from aethra_sec import runtime
 from aethra_sec.core.application import ApplicationContext, StartupReport
-from aethra_sec.core.errors import AethraError
+from aethra_sec.core.errors import AethraError, user_facing
 from aethra_sec.core.session import Session
 from aethra_sec.ui import dispatch
-from aethra_sec.ui.state import UiState
-from aethra_sec.ui.theme import PALETTE, Fonts, apply_theme
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from aethra_sec.ui.brand import (
+    LOGO_CANVAS,
+    LOGO_LETTER,
+    LOGO_OUTLINE_WIDTH,
+    flat_logo_points,
+)
+from aethra_sec.ui.state import KEY_THEME, UiState
+from aethra_sec.security.lockout import format_remaining
+from aethra_sec.utils.timeutil import utcnow
+from aethra_sec.ui.theme import (
+    DEFAULT_THEME,
+    PALETTE,
+    Fonts,
+    apply_theme,
+    set_theme,
+)
 from aethra_sec.utils.logging import get_logger
 from aethra_sec.version import (
     APP_FULL_NAME,
@@ -55,7 +73,11 @@ class LoginWindow(tk.Toplevel):
         self.fonts = fonts
         self._on_success = on_success
         self._busy = False
-        self._otp_user_id: int | None = None
+        #: Local mirror of the server's lock, for the countdown only. The
+        #: server is asked again before every attempt, so stopping this clock
+        #: buys nothing.
+        self._lock_deadline: datetime | None = None
+        self._lock_job: str | None = None
         self._state = UiState(context.settings.log_dir)
 
         # Sign-in runs on a worker thread, so the bridge that carries its
@@ -70,6 +92,11 @@ class LoginWindow(tk.Toplevel):
         self._build()
         self._centre()
         self.after(50, self._show_startup_state)
+        # A lock outlives this window. Re-opening the application, or simply
+        # typing the name again, shows the remaining time rather than a fresh
+        # form that would accept an attempt the server is going to refuse.
+        self.after(120, self._refresh_lock_state)
+        self._username.trace_add("write", lambda *_a: self._refresh_lock_state())
 
     # ------------------------------------------------------------------
     # Layout
@@ -82,7 +109,7 @@ class LoginWindow(tk.Toplevel):
         self._build_form_panel(container)
 
         self._username_entry.focus_set()
-        for widget in (self._username_entry, self._password_entry, self._otp_entry):
+        for widget in (self._username_entry, self._password_entry):
             widget.bind("<Return>", lambda _event: self._submit_login())
             widget.bind("<KeyRelease>", self._on_key)
 
@@ -106,13 +133,16 @@ class LoginWindow(tk.Toplevel):
             highlightthickness=0, borderwidth=0,
         )
         mark.place(x=44, y=56)
+        # The same numbers the Windows icon is rendered from, so the shortcut
+        # on the desktop cannot drift away from what the screen shows.
         mark.create_polygon(
-            32, 4, 60, 16, 60, 36, 32, 60, 4, 36, 4, 16,
-            fill=PALETTE.accent_soft, outline=PALETTE.accent, width=2,
+            *flat_logo_points(LOGO_CANVAS),
+            fill=PALETTE.accent_soft, outline=PALETTE.accent,
+            width=LOGO_OUTLINE_WIDTH,
         )
         mark.create_text(
-            32, 32, text="A", fill=PALETTE.accent,
-            font=(self.fonts.family, 24, "bold"),
+            LOGO_CANVAS / 2, LOGO_CANVAS / 2, text=LOGO_LETTER,
+            fill=PALETTE.accent, font=(self.fonts.family, 24, "bold"),
         )
 
         body = ttk.Frame(brand, style="AuthBrand.TFrame", padding=(44, 0))
@@ -128,8 +158,7 @@ class LoginWindow(tk.Toplevel):
             body,
             text=(
                 "Continuous traffic analysis, intrusion detection and "
-                "vulnerability assessment, correlated into incidents you can "
-                "act on."
+                "vulnerability assessment, in one place you can act from."
             ),
             style="AuthBrandBody.TLabel", wraplength=292, justify="left",
         ).pack(anchor="w")
@@ -142,7 +171,7 @@ class LoginWindow(tk.Toplevel):
         for key, label in (
             ("database", "Database"),
             ("schema", "Schema"),
-            ("otp", "Two-factor"),
+            ("smtp", "Email alerts"),
         ):
             row = ttk.Frame(self._subsystem_frame, style="AuthBrand.TFrame")
             row.pack(anchor="w", fill="x", pady=3)
@@ -177,6 +206,9 @@ class LoginWindow(tk.Toplevel):
 
         form = ttk.Frame(panel, style="AuthPanel.TFrame", padding=(52, 0))
         form.pack(side="top", fill="both", expand=True, pady=(40, 0))
+        # Kept so the verification step can hide the credential fields and
+        # present one question at a time.
+        self._form = form
 
         ttk.Label(form, text="Sign in", style="AuthTitle.TLabel").pack(anchor="w")
         ttk.Label(
@@ -184,6 +216,23 @@ class LoginWindow(tk.Toplevel):
             text="Authorised operators only. Every sign-in is recorded.",
             style="AuthSubtitle.TLabel",
         ).pack(anchor="w", pady=(6, 0))
+
+        # --- lockout banner, shown only while sign-in is actually refused --
+        self._lock_frame = ttk.Frame(form, style="AuthError.TFrame", padding=(12, 10))
+        self._lock_title = ttk.Label(
+            self._lock_frame, text="ACCOUNT TEMPORARILY LOCKED",
+            style="AuthErrorText.TLabel",
+        )
+        self._lock_title.pack(anchor="w")
+        ttk.Label(
+            self._lock_frame,
+            text="Too many unsuccessful login attempts.",
+            style="AuthNote.TLabel", wraplength=380, justify="left",
+        ).pack(anchor="w", pady=(4, 0))
+        self._lock_countdown = ttk.Label(
+            self._lock_frame, text="", style="AuthErrorText.TLabel",
+        )
+        self._lock_countdown.pack(anchor="w", pady=(6, 0))
 
         # --- error / message band, hidden until it has something to say ---
         self._message_frame = ttk.Frame(form, style="AuthError.TFrame", padding=(12, 9))
@@ -219,7 +268,7 @@ class LoginWindow(tk.Toplevel):
         self._caps_label.pack(anchor="w", pady=(6, 0))
 
         options = ttk.Frame(form, style="AuthPanel.TFrame")
-        options.pack(fill="x", pady=(16, 0))
+        options.pack(fill="x", pady=(10, 0))
         self._remember = tk.BooleanVar(value=bool(self._state.get_bool(KEY_REMEMBER)))
         ttk.Checkbutton(
             options, text="Remember my username", variable=self._remember,
@@ -229,14 +278,6 @@ class LoginWindow(tk.Toplevel):
         forgot.pack(side="right")
         forgot.bind("<Button-1>", lambda _e: self._open_recovery())
         forgot.configure(cursor="hand2")
-
-        # --- second factor, revealed only when the server asks for one ----
-        self._otp_frame = ttk.Frame(form, style="AuthPanel.TFrame")
-        ttk.Label(
-            self._otp_frame, text="VERIFICATION CODE", style="AuthLabel.TLabel"
-        ).pack(anchor="w", pady=(16, 6))
-        self._otp = tk.StringVar()
-        self._otp_entry, _ = self._field(self._otp_frame, self._otp)
 
         # --- submit -------------------------------------------------------
         self._submit = ttk.Button(
@@ -363,10 +404,13 @@ class LoginWindow(tk.Toplevel):
                 "schema", report.schema_detail or "not verified", PALETTE.critical
             )
 
-        otp = self.context.otp.status()
+        # Email is a notification channel, never a sign-in step. Saying so
+        # here keeps an operator from reading "not configured" as a reason
+        # they cannot get in: they can, with a username and a password.
+        smtp = self.context.settings.smtp
         self._set_subsystem(
-            "otp", otp.display,
-            PALETTE.ok if getattr(otp, "enabled", False) else PALETTE.text_dim,
+            "smtp", smtp.status_text(),
+            PALETTE.ok if smtp.is_configured else PALETTE.text_dim,
         )
 
         blockers: list[str] = []
@@ -410,13 +454,8 @@ class LoginWindow(tk.Toplevel):
 
         username = self._username.get().strip()
         password = self._password.get()
-        code = self._otp.get().strip()
 
-        if self._otp_user_id is not None:
-            if not code:
-                self._fail("Enter the verification code sent to your email.")
-                return
-        elif not username or not password:
+        if not username or not password:
             self._fail("Enter your username and password.")
             return
 
@@ -425,11 +464,7 @@ class LoginWindow(tk.Toplevel):
         self._submit.configure(text="Signing in…")
         self._show_message("")
 
-        pending_otp_user = self._otp_user_id
-
         def work() -> object:
-            if pending_otp_user is not None:
-                return authentication.complete_otp(pending_otp_user, code)
             return authentication.login(username, password)
 
         def done(result: object) -> None:
@@ -437,15 +472,11 @@ class LoginWindow(tk.Toplevel):
             self._submit.state(["!disabled"])
             self._submit.configure(text="Sign in")
             login_result = result  # type: ignore[assignment]
-            if getattr(login_result, "otp_required", False):
-                self._enter_otp_mode(login_result)
-                return
             session = getattr(login_result, "session", None)
             if session is None:
                 self._fail("Invalid username or password.")
                 return
             self._password.set("")
-            self._otp.set("")
             self._remember_username(username)
             self._on_success(session)
 
@@ -455,6 +486,10 @@ class LoginWindow(tk.Toplevel):
             self._submit.configure(text="Sign in")
             self._password.set("")
             self._fail(message)
+            # A refusal may have been the one that triggered a lock, so the
+            # banner is re-derived from the server rather than inferred from
+            # the message text.
+            self._refresh_lock_state()
 
         self._run_async(work, done, failed)
 
@@ -480,29 +515,12 @@ class LoginWindow(tk.Toplevel):
                 dispatch.post(lambda: on_error(message))
             except Exception as exc:  # noqa: BLE001
                 LOGGER.exception("Sign-in failed unexpectedly.")
-                message = f"Sign-in failed: {exc}"
+                message = user_facing(exc)
                 dispatch.post(lambda: on_error(message))
             else:
                 dispatch.post(lambda: on_success(result))
 
         threading.Thread(target=runner, name="login-worker", daemon=True).start()
-
-    def _enter_otp_mode(self, result: object) -> None:
-        """Switch the form to second-factor entry."""
-        self._otp_user_id = getattr(result, "otp_user_id", None)
-        self._otp_frame.pack(fill="x", before=self._submit)
-        self._otp_entry.focus_set()
-        delivery_error = getattr(result, "otp_delivery_error", "")
-        if delivery_error:
-            self._show_message(
-                "A verification code was requested but could not be "
-                f"delivered: {delivery_error}",
-                PALETTE.critical,
-            )
-        else:
-            self._show_message(
-                "A verification code has been emailed to you.", PALETTE.info
-            )
 
     def _open_recovery(self, start_tab: int = 0) -> None:
         """Open the password recovery dialog over the sign-in form.
@@ -538,6 +556,75 @@ class LoginWindow(tk.Toplevel):
         self._show_message(message, PALETTE.critical)
         self._password_entry.focus_set()
 
+    # ------------------------------------------------------------------
+    # Lockout
+    # ------------------------------------------------------------------
+    def _refresh_lock_state(self) -> None:
+        """Ask the server whether this username is locked, and show it.
+
+        The countdown below is drawn from the remaining seconds the *server*
+        reports. It is a courtesy, not the control: :meth:`_submit_login`
+        always calls the authentication service, which re-derives the lock
+        from recorded attempts and refuses on its own account. Editing this
+        clock, closing the window or restarting the application changes
+        nothing about what is accepted.
+        """
+        authentication = getattr(self.context, "authentication", None)
+        username = self._username.get().strip()
+        if authentication is None or not username:
+            self._hide_lock()
+            return
+        try:
+            locked, remaining = authentication.lockout_status(username)
+        except Exception:  # noqa: BLE001 - never block the form
+            LOGGER.debug("Could not read the lock state.", exc_info=True)
+            self._hide_lock()
+            return
+        if not locked:
+            self._hide_lock()
+            return
+        self._lock_deadline = utcnow() + timedelta(seconds=remaining)
+        if not self._lock_frame.winfo_ismapped():
+            self._lock_frame.pack(fill="x", pady=(18, 0), before=self._message_frame)
+        self._tick_lock_countdown()
+
+    def _tick_lock_countdown(self) -> None:
+        """Redraw the countdown once a second while the lock stands."""
+        if self._lock_job is not None:
+            try:
+                self.after_cancel(self._lock_job)
+            except tk.TclError:
+                pass
+            self._lock_job = None
+        if self._lock_deadline is None:
+            return
+        remaining = max(0, int((self._lock_deadline - utcnow()).total_seconds() + 0.999))
+        self._lock_countdown.configure(
+            text=f"Try again in  {format_remaining(remaining)}"
+        )
+        self._submit.state(["disabled"] if remaining else ["!disabled"])
+        if remaining <= 0:
+            # Re-ask the server rather than assuming the lock has gone: it is
+            # the only thing that decides.
+            self._lock_deadline = None
+            self.after(200, self._refresh_lock_state)
+            return
+        self._lock_job = self.after(1000, self._tick_lock_countdown)
+
+    def _hide_lock(self) -> None:
+        """Take the banner down and release the button."""
+        self._lock_deadline = None
+        if self._lock_job is not None:
+            try:
+                self.after_cancel(self._lock_job)
+            except tk.TclError:
+                pass
+            self._lock_job = None
+        if self._lock_frame.winfo_ismapped():
+            self._lock_frame.pack_forget()
+        if not self._busy:
+            self._submit.state(["!disabled"])
+
     def _remember_username(self, username: str) -> None:
         """Persist the username when asked, and forget it when not.
 
@@ -570,6 +657,19 @@ def prepare_root(context: ApplicationContext) -> tuple[tk.Tk, Fonts]:
     root = tk.Tk()
     root.withdraw()
     root.title(APP_FULL_NAME)
+
+    # A callback error must never be able to close the console. Installed on
+    # the root before any window is shown, because in a packaged build the
+    # default handler writes to a stderr that does not exist and takes the
+    # process with it. See aethra_sec.runtime.
+    runtime.install(root)
+    runtime.apply_window_icon(root)
+
+    # Adopt the stored theme *before* the first paint. Applying it afterwards
+    # would show the default for a frame and then swap, which is the flash the
+    # login window would make most visible.
+    stored = UiState(Path(context.settings.log_dir)).get_str(KEY_THEME)
+    set_theme(stored or DEFAULT_THEME)
     fonts = apply_theme(root)
 
     # Start the worker-to-Tk bridge before any window that runs background work.

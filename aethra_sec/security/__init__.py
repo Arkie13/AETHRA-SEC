@@ -9,7 +9,6 @@ from aethra_sec.security.authentication import (
     LoginResult,
 )
 from aethra_sec.security.integrity import IntegrityReport, verify_chain
-from aethra_sec.security.otp import OtpService
 from aethra_sec.security.password import PasswordHashService, token_fingerprint
 from aethra_sec.security.rbac import AccessControl
 
@@ -22,7 +21,6 @@ __all__ = [
     "AuthenticationService",
     "IntegrityReport",
     "LoginResult",
-    "OtpService",
     "PasswordHashService",
     "token_fingerprint",
     "verify_chain",

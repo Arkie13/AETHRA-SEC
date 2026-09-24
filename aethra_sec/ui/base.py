@@ -18,7 +18,7 @@ from tkinter import ttk
 from typing import Any, Callable
 
 from aethra_sec.core.application import ApplicationContext
-from aethra_sec.core.errors import AethraError
+from aethra_sec.core.errors import AethraError, user_facing
 from aethra_sec.core.session import Session
 from aethra_sec.ui import dispatch
 from aethra_sec.ui.theme import Fonts
@@ -108,11 +108,14 @@ class Screen(ttk.Frame):
         def deliver(callback: Callable[[Any], None], payload: Any) -> None:
             """Hand a worker's result back to the Tk thread.
 
-            Never ``after()`` from here: this runs on the worker thread, and
-            Tkinter forbids that - on Python 3.14 it raises "main thread is not
-            in main loop". The dispatcher owns the hand-off.
+            Touch no Tk call from here: this runs on the worker thread, and
+            Tkinter forbids that - it raises "main thread is not in main loop".
+            That bars ``after()`` and equally ``winfo_exists()``, so the cheap
+            destroyed flag is all this side may read. The real liveness check
+            runs inside the posted callable, on the Tk thread, where asking
+            the widget is both safe and accurate.
             """
-            if not self.is_alive:
+            if self._destroyed:
                 return
             dispatch.post(lambda: callback(payload) if self.is_alive else None)
 
@@ -128,7 +131,7 @@ class Screen(ttk.Frame):
                 deliver(on_error or self.show_error_message, exc.user_message)
             except Exception as exc:  # noqa: BLE001
                 LOGGER.exception("Async work failed unexpectedly.")
-                deliver(on_error or self.show_error_message, str(exc))
+                deliver(on_error or self.show_error_message, user_facing(exc))
             else:
                 if on_success is not None:
                     deliver(on_success, result)

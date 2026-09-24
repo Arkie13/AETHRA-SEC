@@ -6,6 +6,8 @@ any I/O. Synthetic packets are used here and only here (§99).
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 
 from aethra_sec.analytics.anomaly_rules import (
@@ -85,8 +87,16 @@ class TestTrafficAnalyzer:
         assert ports[0].port == 443
         assert ports[0].packets == 7
 
-    def test_interval_totals_for_persistence(self) -> None:
-        """Interval rollups aggregate the packets inside the window."""
+    def test_interval_totals_counts_every_packet_exactly_once(self) -> None:
+        """Successive rollups must lose nothing and double-count nothing.
+
+        The window used to select the buckets, which quietly dropped packets:
+        a packet handled after the interval's end was stamped fell in a second
+        that interval had passed and the next one considered too old. On a
+        burst, an interval holding 4,746 stored packets reported 1,649. Rollups
+        now claim every unclaimed bucket, so the guarantee is per-packet
+        exactness across calls rather than per-call completeness.
+        """
         from datetime import timedelta
 
         from aethra_sec.utils.timeutil import utcnow
@@ -95,10 +105,39 @@ class TestTrafficAnalyzer:
         for index in range(10):
             analyzer.observe(make_packet(length=200, offset_seconds=-index * 0.2))
         start = utcnow() - timedelta(seconds=10)
-        end = utcnow() + timedelta(seconds=1)
-        totals = analyzer.interval_totals(start, end)
-        assert totals["packet_count"] == 10
-        assert totals["byte_count"] == 2000
+
+        # The recent seconds are held back so packets still arriving for them
+        # are not stranded; a final flush claims whatever is left.
+        first = analyzer.interval_totals(start, utcnow() + timedelta(seconds=1))
+        second = analyzer.interval_totals(
+            start, utcnow() + timedelta(seconds=1), final=True
+        )
+        assert first["packet_count"] + second["packet_count"] == 10
+
+        # Nothing is served twice: a further rollup has nothing left to claim.
+        third = analyzer.interval_totals(
+            start, utcnow() + timedelta(seconds=1), final=True
+        )
+        assert third["packet_count"] == 0
+
+    def test_a_final_rollup_leaves_no_packet_behind(self) -> None:
+        """Stopping a capture must flush the seconds still inside the grace."""
+        from datetime import timedelta
+
+        from aethra_sec.utils.timeutil import utcnow
+
+        analyzer = TrafficAnalyzer()
+        for index in range(6):
+            analyzer.observe(make_packet(length=120, offset_seconds=-index * 0.1))
+        totals = analyzer.interval_totals(
+            utcnow() - timedelta(seconds=10),
+            utcnow() + timedelta(seconds=1),
+            final=True,
+        )
+        assert totals["packet_count"] == 6
+        # 6 packets of 120 bytes: the byte total must follow the packets it
+        # was rolled up from, not drift from them.
+        assert totals["byte_count"] == 720
         assert totals["unique_sources"] == 1
 
     def test_reset_clears_everything(self) -> None:
@@ -209,7 +248,12 @@ class TestAnomalyRules:
             )
         icmp = [a for a in raised if a.rule_id == RULE_ICMP_FLOOD]
         assert icmp
-        assert icmp[0].severity in (Severity.MEDIUM, Severity.HIGH)
+        # §3.9.8: severity follows the measured rate, not a fixed baseline.
+        from aethra_sec.analytics.anomaly_rules import flood_severity
+
+        expected, band = flood_severity(icmp[0].observed_value)
+        assert icmp[0].severity is expected
+        assert icmp[0].evidence["severity_band"] == band
         assert icmp[0].observed_value >= 10
 
     def test_udp_rate_rule(self) -> None:
@@ -259,10 +303,75 @@ class TestAnomalyRules:
         syn = [a for a in raised if a.rule_id == RULE_SYN_FLOOD]
         assert syn
         anomaly = syn[0]
-        assert anomaly.severity is Severity.HIGH
+        from aethra_sec.analytics.anomaly_rules import flood_severity
+
+        # §3.9.8: rated by the band of the rate it measured. A test-sized flood
+        # is far below 1,000 pps, so it is not HIGH merely for being a SYN flood.
+        assert anomaly.severity is flood_severity(anomaly.observed_value)[0]
+        assert "severity_band" in anomaly.evidence
         assert anomaly.evidence["syn_ack_replies_observed"] == 0
         assert anomaly.evidence["unanswered_ratio"] == 1.0
         assert "Potential" in anomaly.title
+
+    def test_a_high_rate_flood_is_rated_high(self) -> None:
+        """Above 1,000 pps is High (§3.9.8), measured from real packet times."""
+        from aethra_sec.analytics.anomaly_rules import DetectionThresholds
+
+        from dataclasses import replace
+
+        engine = AnomalyRuleEngine(DetectionThresholds(syn_per_second=200))
+        raised = []
+        # 7,000 SYNs spread over 5 seconds: 1,400 per second. Timestamps are
+        # fixed from one base, so the loop's own run time cannot stretch them.
+        base = make_packet(tcp_flags=0x02)
+        for index in range(7000):
+            packet = replace(
+                base,
+                captured_at=base.captured_at + timedelta(seconds=index * (5 / 7000)),
+            )
+            raised.extend(engine.evaluate(packet))
+        syn = [a for a in raised if a.rule_id == RULE_SYN_FLOOD]
+        assert syn, "the flood was not detected"
+        # Detected early, at the band measured when the threshold was crossed...
+        assert syn[0].severity is Severity.LOW
+        # ...and reported again as the sustained rate entered each higher band,
+        # so the stored severity reflects the rate the flood actually reached.
+        assert [a.severity for a in syn] == [Severity.LOW, Severity.MEDIUM, Severity.HIGH]
+        assert syn[-1].observed_value > 1000
+        assert "higher severity band" in syn[-1].evidence["severity_band"]
+
+    def test_a_steady_flood_is_not_re_reported_without_escalation(self) -> None:
+        from aethra_sec.analytics.anomaly_rules import DetectionThresholds
+
+        from dataclasses import replace
+
+        engine = AnomalyRuleEngine(DetectionThresholds(syn_per_second=200))
+        raised = []
+        # 250 per second for 20 seconds: stays in the Low band throughout.
+        base = make_packet(tcp_flags=0x02)
+        for index in range(5000):
+            packet = replace(
+                base, captured_at=base.captured_at + timedelta(seconds=index * 0.004)
+            )
+            raised.extend(engine.evaluate(packet))
+        assert len([a for a in raised if a.rule_id == RULE_SYN_FLOOD]) == 1
+
+    def test_http_responses_are_not_counted_as_requests(self) -> None:
+        """§3.9.8 is 600 requests per minute; responses are not requests."""
+        from aethra_sec.analytics.anomaly_rules import (
+            RULE_HTTP_FLOOD,
+            DetectionThresholds,
+        )
+
+        engine = AnomalyRuleEngine(DetectionThresholds(http_per_second=10))
+        raised = []
+        for index in range(200):
+            packet = make_packet(offset_seconds=index * 0.01)
+            packet.app_protocol = "HTTP"
+            packet.http_status = 200
+            packet.http_method = ""
+            raised.extend(engine.evaluate(packet))
+        assert not [a for a in raised if a.rule_id == RULE_HTTP_FLOOD]
 
     def test_suppression_window_prevents_flooding(self) -> None:
         """A repeat detection inside the suppression window does not re-fire."""
@@ -333,7 +442,7 @@ class TestRiskEngine:
         """The same evidence always produces the same score."""
         engine = RiskEngine()
         evidence = ThreatEvidence(
-            category=ThreatCategory.BRUTE_FORCE, snort_priority=2,
+            category=ThreatCategory.TCP_SYN_FLOOD, snort_priority=2,
             snort_alert_count=3, distinct_sources=2, event_count=6,
             affected_service="ssh",
         )
@@ -347,7 +456,7 @@ class TestRiskEngine:
         engine = RiskEngine()
         assessment = engine.score_threat(
             ThreatEvidence(
-                category=ThreatCategory.BRUTE_FORCE, snort_priority=1,
+                category=ThreatCategory.TCP_SYN_FLOOD, snort_priority=1,
                 snort_alert_count=2, distinct_sources=3, event_count=25,
                 affected_service="ssh", exposure_confirmed=True,
             )
@@ -389,13 +498,41 @@ class TestRiskEngine:
         assert trusted.score >= 0
 
     def test_severity_bands(self) -> None:
-        """Scores map to the documented bands."""
+        """Scores map to the documented bands. HIGH is the top."""
         engine = RiskEngine()
-        assert engine.severity_for_score(100) is Severity.CRITICAL
+        assert engine.severity_for_score(100) is Severity.HIGH
         assert engine.severity_for_score(60) is Severity.HIGH
         assert engine.severity_for_score(35) is Severity.MEDIUM
         assert engine.severity_for_score(15) is Severity.LOW
         assert engine.severity_for_score(2) is Severity.INFO
+
+    def test_no_score_reaches_critical(self) -> None:
+        """CRITICAL is outside the incident severity model."""
+        engine = RiskEngine()
+        assert all(
+            engine.severity_for_score(score) is not Severity.CRITICAL
+            for score in range(0, 201)
+        )
+
+    def test_the_remaining_cut_points_did_not_move(self) -> None:
+        """Removing the top band must not rescale the others.
+
+        A score that was MEDIUM before is still MEDIUM; only scores at or
+        above the old CRITICAL cut changed, and they changed because HIGH is
+        now the highest band there is.
+        """
+        from aethra_sec.analytics.risk_engine import (
+            SCORE_HIGH,
+            SCORE_LOW,
+            SCORE_MEDIUM,
+        )
+
+        assert (SCORE_HIGH, SCORE_MEDIUM, SCORE_LOW) == (55, 30, 12)
+        engine = RiskEngine()
+        assert engine.severity_for_score(SCORE_MEDIUM) is Severity.MEDIUM
+        assert engine.severity_for_score(SCORE_MEDIUM - 1) is Severity.LOW
+        assert engine.severity_for_score(SCORE_LOW) is Severity.LOW
+        assert engine.severity_for_score(SCORE_LOW - 1) is Severity.INFO
 
     def test_exposure_scoring_states_its_reasoning(self) -> None:
         """An exposure finding always explains its level (§19, §20)."""
@@ -423,13 +560,25 @@ class TestRiskEngine:
         assert "configured vulnerability source" in rationale
 
     def test_snort_priority_mapping(self) -> None:
-        """Snort priorities map to severities, with a stated default."""
+        """Snort priorities map onto the model, with a stated default.
+
+        Priority 1 lands on HIGH because HIGH is the top of the severity model
+        this application presents. The sensor's own priority is stored
+        unchanged on the alert, so nothing Snort said is lost.
+        """
         engine = RiskEngine()
-        assert engine.severity_for_snort_priority(1) is Severity.CRITICAL
+        assert engine.severity_for_snort_priority(1) is Severity.HIGH
         assert engine.severity_for_snort_priority(2) is Severity.HIGH
         assert engine.severity_for_snort_priority(3) is Severity.MEDIUM
         assert engine.severity_for_snort_priority(4) is Severity.LOW
         assert engine.severity_for_snort_priority(None) is Severity.MEDIUM
+
+    def test_no_snort_priority_produces_critical(self) -> None:
+        engine = RiskEngine()
+        assert all(
+            engine.severity_for_snort_priority(priority) is not Severity.CRITICAL
+            for priority in [None, *range(0, 11)]
+        )
 
     def test_host_risk_is_the_worst_finding(self) -> None:
         """A host's risk equals its most serious finding."""

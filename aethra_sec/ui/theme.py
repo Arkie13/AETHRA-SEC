@@ -14,7 +14,7 @@ yellow for medium, green for healthy, blue for informational.
 from __future__ import annotations
 
 import tkinter as tk
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from tkinter import font as tkfont
 from tkinter import ttk
 
@@ -31,70 +31,302 @@ from aethra_sec.models.enums import (
 class Palette:
     """The application colour palette.
 
-    The surfaces form a deliberate ladder - page, panel, panel header, raised -
-    and every panel is separated from the page by a **drawn border** rather
-    than by a barely-different fill. On a console that is read for hours in a
-    dim room, an edge you can see is what makes a layout scannable; a two-shade
-    difference between a card and its background is not.
+    Surfaces are separated by **fill and whitespace**, not by a drawn box. The
+    previous ladder relied on a visible border around every section, which is
+    what made the console read as a grid of rectangles rather than as a
+    workspace. Here the steps between page, surface and raised are wide enough
+    to be read on their own, so a border is reserved for the few places an
+    actual edge carries meaning - an input, a menu, a table's header rule.
     """
 
-    # Surfaces, in ascending elevation.
-    #
-    # A neutral graphite-slate base rather than a saturated navy: the old
-    # #0A0F1E ladder pushed blue into every surface, which is what made the
-    # console read as a themed hobby build rather than an enterprise tool.
-    # Desaturating the base and leaning on it more subtly - separating panels
-    # by a soft, low-contrast edge instead of a bright bordercolor - is what a
-    # professional SOC console (Datadog, Grafana, CrowdStrike) actually does;
-    # the accent and severity colours carry all the remaining saturation.
-    background: str = "#0C0F14"
-    surface: str = "#141821"
-    surface_alt: str = "#181D27"
-    surface_raised: str = "#1E2430"
-    surface_hover: str = "#252C3A"
-    surface_sunken: str = "#080A0E"
-    overlay: str = "#181D27"
-    border: str = "#232A36"
-    border_strong: str = "#2E3644"
+    # Surfaces, in ascending elevation. Charcoal-navy rather than blue-navy:
+    # a near-neutral ground lets the severity colours be the only saturated
+    # thing on screen, which is what an operator should be drawn to.
+    background: str = "#0B0E14"
+    surface: str = "#11151E"
+    surface_alt: str = "#161B26"
+    surface_raised: str = "#1B2130"
+    surface_hover: str = "#1F2634"
+    surface_sunken: str = "#080A0F"
+    overlay: str = "#1B2130"
+    #: Hairline. Deliberately close to the surfaces it divides - a separator
+    #: should be found when looked for, not seen when not.
+    border: str = "#1C2230"
+    border_strong: str = "#2A3242"
 
     # Text
-    text: str = "#EDF0F5"
-    text_muted: str = "#98A2B3"
-    text_dim: str = "#636D7E"
-    text_inverse: str = "#0C0F14"
+    text: str = "#E8ECF4"
+    text_muted: str = "#8C97AC"
+    text_dim: str = "#5C6678"
+    text_inverse: str = "#0B0E14"
+    #: Text drawn on a saturated severity or accent fill. White in both themes:
+    #: those fills stay dark enough in the light theme to carry it, so this is
+    #: a token for the intent, not a value that flips.
+    text_on_accent: str = "#FFFFFF"
+    #: What a raised surface's shadow is blended toward. Black under a dark
+    #: page; a cool grey under a light one, where a black shadow reads as dirt.
+    shadow: str = "#000000"
 
     # Accents
-    accent: str = "#3B82F6"
-    accent_hover: str = "#60A5FA"
-    accent_dim: str = "#1B2E4E"
-    accent_soft: str = "#141F35"
+    accent: str = "#5B8DEF"
+    accent_hover: str = "#7FA6F3"
+    accent_dim: str = "#1A2942"
+    accent_soft: str = "#131D30"
     #: Second accent, for the far end of a gradient and for chart variety.
-    accent_alt: str = "#2DD4BF"
+    accent_alt: str = "#8B7CF0"
 
     # Severity
-    critical: str = "#F0475F"
-    high: str = "#F2924B"
-    medium: str = "#F0C24B"
-    low: str = "#34D399"
-    info: str = "#3B82F6"
-    ok: str = "#34D399"
-    offline: str = "#636D7E"
+    critical: str = "#F2555A"
+    high: str = "#F58A3C"
+    medium: str = "#E8B93B"
+    low: str = "#35C88A"
+    info: str = "#5B8DEF"
+    ok: str = "#35C88A"
+    offline: str = "#5C6678"
 
     # Severity fills: the tint a banded row takes, dark enough to sit under
     # body text without competing with it. Only the two severities worth
     # navigating a queue by are banded, so only those two have a fill.
-    critical_soft: str = "#2A1720"
-    high_soft: str = "#2A2018"
+    critical_soft: str = "#2A161C"
+    high_soft: str = "#2A1E14"
 
     # Chart series
     series: tuple[str, ...] = (
-        "#3B82F6", "#34D399", "#F0C24B", "#F2924B", "#F0475F",
-        "#2DD4BF", "#818CF8", "#F472B6", "#A3E635", "#E0B341",
+        "#5B8DEF", "#35C88A", "#E8B93B", "#F58A3C", "#F2555A",
+        "#8B7CF0", "#37C2C2", "#E86FA8", "#8FC44E", "#C9A227",
     )
-    grid: str = "#1B212C"
+    grid: str = "#171D28"
 
 
-PALETTE = Palette()
+#: The dark theme. This is the default: a security console is watched for
+#: hours in a dim room, and a bright page in that setting is fatiguing.
+DARK_PALETTE = Palette()
+
+#: The light theme. Designed, not inverted - inverting a dark palette gives
+#: muddy mid-greys and severity colours that vibrate against white. The
+#: surfaces here are a cool near-white ladder, and every severity colour is
+#: re-picked at a darker value so it carries the same weight on white that the
+#: dark theme's brighter version carries on near-black.
+LIGHT_PALETTE = Palette(
+    # Surfaces, ascending elevation. The page is faintly cool so that white
+    # panels sitting on it read as raised without needing a border.
+    background="#EEF1F6",
+    surface="#FFFFFF",
+    surface_alt="#F5F7FA",
+    surface_raised="#FFFFFF",
+    surface_hover="#E9EEF6",
+    surface_sunken="#E4E9F1",
+    overlay="#FFFFFF",
+    # A hairline that is found when looked for, not seen when not - the same
+    # rule as the dark theme, at light-theme contrast.
+    border="#DCE2EC",
+    border_strong="#B9C2D2",
+
+    # Text. Charcoal rather than black: pure black on white is harsher than it
+    # needs to be over a long shift.
+    text="#151A23",
+    text_muted="#4E5769",
+    text_dim="#7A8496",
+    text_inverse="#FFFFFF",
+    text_on_accent="#FFFFFF",
+    shadow="#98A5BA",
+
+    # Accents. The same AETHRA blue, darkened so it passes contrast on white.
+    accent="#2C5FD0",
+    accent_hover="#1E48A8",
+    accent_dim="#C9D8F7",
+    accent_soft="#E8EFFC",
+    accent_alt="#6B4FD8",
+
+    # Severity, re-picked for white. Each is dark enough for body text to sit
+    # on the page beside it without the colour glowing.
+    critical="#C42230",
+    high="#B85C10",
+    medium="#966A05",
+    low="#0F7A46",
+    info="#2C5FD0",
+    ok="#0F7A46",
+    offline="#7A8496",
+
+    # Severity fills: the tint a banded row takes. Pale enough that dark body
+    # text keeps its contrast on top.
+    critical_soft="#FBE8EA",
+    high_soft="#FDF0E3",
+
+    # Chart series, darkened to sit on a light plot surface.
+    series=(
+        "#2C5FD0", "#0F7A46", "#966A05", "#B85C10", "#C42230",
+        "#6B4FD8", "#0E7C7C", "#B33B7E", "#5A8A1E", "#8A6D12",
+    ),
+    grid="#E2E7EF",
+)
+
+
+class ActivePalette:
+    """The palette the interface is currently drawn from.
+
+    Every module does ``from aethra_sec.ui.theme import PALETTE`` and reads
+    ``PALETTE.background`` and friends. That binds the *object*, so switching
+    themes by rebinding the module attribute would leave thirty-odd modules
+    still pointing at the old one. Instead this holder keeps the same identity
+    for the life of the process and has its fields replaced in place, which
+    every existing reference picks up with no call site changing.
+
+    It carries exactly the fields of :class:`Palette`; there is one set of
+    tokens and one interface, and only the values behind them change.
+    """
+
+    def __init__(self, palette: "Palette") -> None:
+        """Adopt the starting theme."""
+        self.adopt(palette)
+
+    def adopt(self, palette: "Palette") -> None:
+        """Replace every token with the ones from ``palette``."""
+        for field_ in fields(Palette):
+            setattr(self, field_.name, getattr(palette, field_.name))
+
+
+#: Named themes, so a preference can be stored as a string.
+THEMES: dict[str, Palette] = {"dark": DARK_PALETTE, "light": LIGHT_PALETTE}
+
+#: The theme used when nothing has been chosen or a stored name is unknown.
+DEFAULT_THEME = "dark"
+
+_active_theme = DEFAULT_THEME
+
+#: The live palette. Import this; never copy its values into a module global,
+#: or that copy will not follow a theme change.
+PALETTE = ActivePalette(THEMES[DEFAULT_THEME])
+
+
+def current_theme() -> str:
+    """Name of the theme in force."""
+    return _active_theme
+
+
+def set_theme(name: str) -> str:
+    """Switch the active palette.
+
+    Only the token values change - there is no second set of widgets and no
+    second layout. Callers must still restyle ttk (:func:`apply_theme`) and
+    rebuild anything that painted itself on a canvas, because those captured
+    their colours when they were drawn.
+
+    Args:
+        name: ``dark`` or ``light``. An unknown name falls back to the default
+            rather than leaving the interface half-themed.
+
+    Returns:
+        The name actually applied.
+    """
+    global _active_theme
+
+    chosen = (name or "").strip().lower()
+    if chosen not in THEMES:
+        chosen = DEFAULT_THEME
+    _active_theme = chosen
+    PALETTE.adopt(THEMES[chosen])
+    _refresh_colour_maps()
+    return chosen
+
+
+def _refresh_colour_maps() -> None:
+    """Rebuild the derived colour lookups from the active palette.
+
+    These are module-level dicts built from the palette, so they hold values
+    from whichever theme was active when they were first built. They are
+    updated in place for the same reason the palette is: other modules hold
+    references to them.
+    """
+    SEVERITY_COLOURS.update({
+        "CRITICAL": PALETTE.critical,
+        "HIGH": PALETTE.high,
+        "MEDIUM": PALETTE.medium,
+        "LOW": PALETTE.low,
+        "INFO": PALETTE.info,
+        "INFORMATIONAL": PALETTE.info,
+    })
+    STATE_COLOURS.update({
+        "RUNNING": PALETTE.ok,
+        "CONNECTED": PALETTE.ok,
+        "AVAILABLE": PALETTE.ok,
+        "CAPTURING": PALETTE.ok,
+        "READY": PALETTE.info,
+        "PAUSED": PALETTE.medium,
+        "STOPPING": PALETTE.medium,
+        "STOPPED": PALETTE.medium,
+        "UNKNOWN": PALETTE.offline,
+        "DISABLED": PALETTE.offline,
+        "OFFLINE": PALETTE.critical,
+        "UNAVAILABLE": PALETTE.critical,
+        "ERROR": PALETTE.critical,
+        "PASS": PALETTE.ok,
+        "WARNING": PALETTE.medium,
+        "FAIL": PALETTE.critical,
+        "SKIPPED": PALETTE.offline,
+    })
+    STATUS_COLOURS.update({
+        "NEW": PALETTE.info,
+        "INVESTIGATING": PALETTE.medium,
+        "ACKNOWLEDGED": PALETTE.accent,
+        "RESOLVED": PALETTE.ok,
+        "FALSE_POSITIVE": PALETTE.offline,
+        "CLOSED": PALETTE.offline,
+        "REVIEWED": PALETTE.ok,
+        "ESCALATED": PALETTE.high,
+        "SUPPRESSED": PALETTE.offline,
+        "OPEN": PALETTE.medium,
+        "ACTIVE": PALETTE.ok,
+        "INACTIVE": PALETTE.offline,
+        "LOCKED": PALETTE.critical,
+        "PENDING": PALETTE.medium,
+        "APPROVED": PALETTE.accent,
+        "REJECTED": PALETTE.critical,
+        "COMPLETED": PALETTE.ok,
+        "EXPIRED": PALETTE.offline,
+    })
+
+
+@dataclass(frozen=True)
+class Metrics:
+    """Spacing, radius and control sizing - the layout half of the tokens.
+
+    Before this existed every screen chose its own padding, which is why the
+    console had no consistent rhythm: a card padded 12 sat beside one padded
+    18, and neither related to the gap between them. These are the only values
+    a screen should use, so spacing is a decision made once here rather than
+    re-made on every page.
+    """
+
+    #: A 4px base step. Everything on screen is a multiple of it.
+    space_xs: int = 4
+    space_sm: int = 8
+    space_md: int = 12
+    space_lg: int = 16
+    space_xl: int = 24
+    space_2xl: int = 32
+
+    #: Gutter between top-level regions of a page.
+    gutter: int = 16
+    #: Padding inside a section's body.
+    section_pad: int = 14
+
+    radius_sm: int = 4
+    radius_md: int = 6
+    radius_lg: int = 10
+
+    #: Table row height. Compact enough for density, tall enough to click.
+    row_height: int = 26
+    #: Height of a single-line control (entry, button, select).
+    control_height: int = 28
+    #: Sidebar widths, expanded and collapsed.
+    sidebar_width: int = 216
+    sidebar_collapsed: int = 56
+    #: Top bar height. One line of chrome, not two.
+    topbar_height: int = 48
+
+
+METRICS = Metrics()
 
 #: Font families tried in order; the first available one is used.
 _FONT_CANDIDATES = ("Segoe UI", "Inter", "Helvetica Neue", "DejaVu Sans", "Arial")
@@ -147,18 +379,18 @@ def build_fonts(root: tk.Misc) -> Fonts:
     family = _first_available(root, _FONT_CANDIDATES, "TkDefaultFont")
     mono = _first_available(root, _MONO_CANDIDATES, "TkFixedFont")
     return Fonts(
-        body=(family, 11),
-        body_bold=(family, 11, "bold"),
-        small=(family, 10),
-        small_bold=(family, 10, "bold"),
-        label=(family, 9, "bold"),
-        heading=(family, 13, "bold"),
-        subheading=(family, 12, "bold"),
-        title=(family, 18, "bold"),
-        metric=(family, 27, "bold"),
-        metric_small=(family, 18, "bold"),
-        mono=(mono, 10),
-        mono_small=(mono, 9),
+        body=(family, 10),
+        body_bold=(family, 10, "bold"),
+        small=(family, 9),
+        small_bold=(family, 9, "bold"),
+        label=(family, 8, "bold"),
+        heading=(family, 11, "bold"),
+        subheading=(family, 10, "bold"),
+        title=(family, 14, "bold"),
+        metric=(family, 22, "bold"),
+        metric_small=(family, 15, "bold"),
+        mono=(mono, 9),
+        mono_small=(mono, 8),
     )
 
 
@@ -176,6 +408,17 @@ STATE_COLOURS: dict[str, str] = {
     "CONNECTED": PALETTE.ok,
     "AVAILABLE": PALETTE.ok,
     "CAPTURING": PALETTE.ok,
+    # Live-capture states, as the capture service names them. IDLE means armed
+    # but not started; STARTING is the window before the capture process has
+    # been seen running; PAUSED means the display is held while capture
+    # continues underneath; STOPPING is the shutdown window; FAILED means the
+    # capture is not running and the reason is on screen.
+    "IDLE": PALETTE.info,
+    "STARTING": PALETTE.medium,
+    "FAILED": PALETTE.critical,
+    "READY": PALETTE.info,
+    "PAUSED": PALETTE.medium,
+    "STOPPING": PALETTE.medium,
     "STOPPED": PALETTE.medium,
     "UNKNOWN": PALETTE.offline,
     "DISABLED": PALETTE.offline,
@@ -186,6 +429,18 @@ STATE_COLOURS: dict[str, str] = {
     "WARNING": PALETTE.medium,
     "FAIL": PALETTE.critical,
     "SKIPPED": PALETTE.offline,
+    # Host reachability and automatic-assessment vocabulary (Vulnerability
+    # Assessment automation). A missing or failed result is never coloured as
+    # safe: only "NO FINDINGS" is green.
+    "UP": PALETTE.ok,
+    "QUEUED": PALETTE.info,
+    "SCANNING": PALETTE.info,
+    "NOT ASSESSED": PALETTE.offline,
+    "NO FINDINGS": PALETTE.ok,
+    "VULNERABLE": PALETTE.critical,
+    "NO RESPONSE TO SCAN": PALETTE.medium,
+    "SCAN FAILED": PALETTE.critical,
+    "NOT AUTHORISED": PALETTE.offline,
 }
 
 STATUS_COLOURS: dict[str, str] = {
@@ -230,9 +485,9 @@ ICONS: dict[str, str] = {
     "vulnerabilities": "⚑",  # flag
     "hosts": "▣",          # square with fill
     "alerts": "⚠",         # warning sign
-    "incidents": "✦",      # four-pointed star
     "mitigation": "⚕",     # staff of Aesculapius - remedy
     "reports": "☰",        # trigram - stacked lines
+    "evaluation": "⏱",     # stopwatch - measured detection time
     "logs": "≡",           # identical to - log lines
     "users": "☺",          # person
     "health": "♥",         # heart - health
@@ -286,6 +541,46 @@ def chip_colours(colour: str, *, surface: str = "") -> tuple[str, str]:
     return colour, _blend(colour, base, 0.18)
 
 
+def _relative_luminance(colour: str) -> float:
+    """WCAG relative luminance of a ``#rrggbb`` colour."""
+    raw = colour.lstrip("#")
+    if len(raw) != 6:
+        return 0.0
+
+    def channel(value: int) -> float:
+        v = value / 255.0
+        return v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
+
+    r, g, b = (int(raw[i:i + 2], 16) for i in (0, 2, 4))
+    return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+
+
+def _contrast(one: str, two: str) -> float:
+    """WCAG contrast ratio between two colours, 1.0 to 21.0."""
+    a, b = sorted(
+        (_relative_luminance(one), _relative_luminance(two)), reverse=True
+    )
+    return (a + 0.05) / (b + 0.05)
+
+
+def text_on(fill: str) -> str:
+    """The legible text colour to draw on ``fill``.
+
+    Severity fills span a wide luminance range - a red is dark, an amber is
+    bright - so no single fixed colour is legible on all of them. White on the
+    dark theme's HIGH amber measures 2.4:1, well under the 3:1 a badge needs.
+
+    Measured rather than guessed from a luminance threshold: a mid-orange sits
+    close enough to any such cut-off that the answer would depend on where the
+    line was drawn, so this simply takes whichever ink contrasts better.
+    """
+    dark_ink = "#101418"
+    light_ink = PALETTE.text_on_accent
+    if _contrast(dark_ink, fill) >= _contrast(light_ink, fill):
+        return dark_ink
+    return light_ink
+
+
 def severity_colour(value: object) -> str:
     """Colour for a severity or risk level."""
     if isinstance(value, (Severity, RiskLevel)):
@@ -304,6 +599,22 @@ def state_colour(value: object) -> str:
     return STATE_COLOURS.get(key, PALETTE.text_muted)
 
 
+def security_colour(value: object) -> str:
+    """Colour for a host's security conclusion. Only "Safe" is coloured.
+
+    Colour here is a claim, and only one of the three answers is a conclusion
+    worth making at a glance: the assessment completed and found nothing it
+    could confirm. "Vulnerable" is deliberately *not* coloured - the operator
+    must open the row and read the evidence rather than triage on a red cell,
+    and a red cell next to an unconfirmed finding is exactly the overstatement
+    this column exists to avoid. "-" is not a state at all.
+
+    Nothing here relies on colour alone: the cell always carries the word.
+    """
+    text = str(value or "").strip().upper()
+    return PALETTE.ok if text == "SAFE" else PALETTE.text
+
+
 def status_colour(value: object) -> str:
     """Colour for a workflow status."""
     if isinstance(value, IncidentStatus):
@@ -311,6 +622,51 @@ def status_colour(value: object) -> str:
     else:
         key = str(value or "").upper()
     return STATUS_COLOURS.get(key, PALETTE.text_muted)
+
+
+# ----------------------------------------------------------------------
+# Motion (§ reduced-motion)
+# ----------------------------------------------------------------------
+#: Whether the interface may animate. A single switch every animated widget
+#: consults, so "reduce motion" is one setting rather than a flag threaded
+#: through thirty call sites. When off, animations jump straight to their end
+#: state - nothing is hidden, only the transition is skipped.
+_motion_enabled = True
+
+
+def motion_enabled() -> bool:
+    """True when subtle animations are allowed."""
+    return _motion_enabled
+
+
+def set_motion(enabled: bool) -> None:
+    """Enable or disable animation across the whole interface."""
+    global _motion_enabled
+    _motion_enabled = bool(enabled)
+
+
+#: Subsystem states that represent live, healthy activity. A status dot pulses
+#: only for these, so motion on a dot means "this is working right now" rather
+#: than decoration; every other state (STOPPED, OFFLINE, ERROR, UNKNOWN) is
+#: drawn static.
+ACTIVE_STATES: frozenset[str] = frozenset(
+    {"RUNNING", "CAPTURING", "CONNECTED", "AVAILABLE", "SCANNING"}
+)
+
+
+def is_active_state(value: object) -> bool:
+    """True when a subsystem state represents live activity worth a pulse."""
+    return str(value or "").upper() in ACTIVE_STATES
+
+
+def pulse_colour(colour: str, phase: float) -> str:
+    """A dimmed shade of ``colour`` for a breathing pulse.
+
+    ``phase`` runs 0..1; 1 is the full colour and 0 is dimmed most of the way
+    toward the surface, so the dot never disappears - it only breathes.
+    """
+    ratio = 0.55 + 0.45 * max(0.0, min(1.0, phase))
+    return _blend(colour, PALETTE.surface, ratio)
 
 
 def apply_theme(root: tk.Misc) -> Fonts:
@@ -352,7 +708,11 @@ def apply_theme(root: tk.Misc) -> Fonts:
     style.configure("Surface.TFrame", background=p.surface)
     # Interiors stay flat: a panel draws one edge, and the rows and strips
     # inside it must not draw a second one within the first.
-    style.configure("Card.TFrame", background=p.surface, relief="flat",
+    # A section is not a box. It sits on the page ground and is separated
+    # from its neighbours by whitespace and a header rule, so its frame takes
+    # the page colour rather than a surface fill. Anything that genuinely is
+    # an object - a metric tile, a menu - uses Tile/Panel/Raised instead.
+    style.configure("Card.TFrame", background=p.background, relief="flat",
                     borderwidth=0)
     style.configure("CardAlt.TFrame", background=p.surface_alt, relief="flat",
                     borderwidth=0)
@@ -389,35 +749,71 @@ def apply_theme(root: tk.Misc) -> Fonts:
                     foreground=p.text_dim, font=fonts.small)
     # The details drawer sits one level above the page, so its own chrome needs
     # labels on the raised surface rather than on the card or page surface.
-    style.configure("DrawerHeading.TLabel", background=p.surface_raised,
+    style.configure("DrawerHeading.TLabel", background=p.background,
                     foreground=p.text, font=fonts.heading)
-    style.configure("DrawerMuted.TLabel", background=p.surface_raised,
+    style.configure("DrawerMuted.TLabel", background=p.background,
                     foreground=p.text_muted, font=fonts.small)
-    style.configure("DrawerDim.TLabel", background=p.surface_raised,
+    style.configure("DrawerDim.TLabel", background=p.background,
                     foreground=p.text_dim, font=fonts.small)
     style.configure("Sidebar.TFrame", background=p.surface)
+    # The active entry's row carries the same ground as its button, so the
+    # indicator, glyph and label read as one selected band rather than as
+    # stripes of two different greys.
+    style.configure("SidebarActive.TFrame", background=p.surface_alt)
     style.configure("Header.TFrame", background=p.surface_alt)
     style.configure("HeaderBand.TFrame", background=p.surface_alt,
                     borderwidth=0, relief="flat")
     style.configure("Separator.TFrame", background=p.border)
 
+
+    # A tile is a real object - it holds one figure and is clickable - so it
+    # keeps a surface fill. This is the deliberate counterpart to a section,
+    # which does not. Everything inside a tile takes these styles so its
+    # interior never falls back to the page colour.
+    style.configure("Tile.TFrame", background=p.surface, relief="flat",
+                    borderwidth=0)
+    style.configure("TileHover.TFrame", background=p.surface_hover, relief="flat",
+                    borderwidth=0)
+    style.configure("Tile.TLabel", background=p.surface, foreground=p.text)
+    style.configure("TileMuted.TLabel", background=p.surface,
+                    foreground=p.text_muted, font=fonts.small)
+    style.configure("TileDim.TLabel", background=p.surface,
+                    foreground=p.text_dim, font=fonts.small)
+    style.configure("TileLabel.TLabel", background=p.surface,
+                    foreground=p.text_muted, font=fonts.label)
+    style.configure("TileValue.TLabel", background=p.surface, foreground=p.text,
+                    font=fonts.metric)
+    style.configure("TileValueSm.TLabel", background=p.surface, foreground=p.text,
+                    font=fonts.metric_small)
+
+
+    # KPI strip: a figure sized to be read at a glance without taking the
+    # vertical space a display-size number does.
+    style.configure("KpiValue.TLabel", background=p.background,
+                    foreground=p.text, font=fonts.metric_small)
+    style.configure("KpiTrend.TLabel", background=p.background,
+                    foreground=p.text_dim, font=fonts.small_bold)
+    # Hover surface for a clickable cell that is otherwise flat.
+    style.configure("CardHover.TFrame", background=p.surface_alt,
+                    relief="flat", borderwidth=0)
+
     # --- Labels -----------------------------------------------------------
     style.configure("TLabel", background=p.background, foreground=p.text)
-    style.configure("Card.TLabel", background=p.surface, foreground=p.text)
-    style.configure("CardMuted.TLabel", background=p.surface, foreground=p.text_muted,
+    style.configure("Card.TLabel", background=p.background, foreground=p.text)
+    style.configure("CardMuted.TLabel", background=p.background, foreground=p.text_muted,
                     font=fonts.small)
-    style.configure("CardDim.TLabel", background=p.surface, foreground=p.text_dim,
+    style.configure("CardDim.TLabel", background=p.background, foreground=p.text_dim,
                     font=fonts.small)
-    style.configure("Metric.TLabel", background=p.surface, foreground=p.text,
+    style.configure("Metric.TLabel", background=p.background, foreground=p.text,
                     font=fonts.metric)
     style.configure("Heading.TLabel", background=p.background, foreground=p.text,
                     font=fonts.heading)
-    style.configure("CardHeading.TLabel", background=p.surface, foreground=p.text,
+    style.configure("CardHeading.TLabel", background=p.background, foreground=p.text,
                     font=fonts.heading)
     # A panel's own name: small, bold and upper-case, so it reads as a label
     # rather than competing with the content underneath it.
-    style.configure("CardTitle.TLabel", background=p.surface, foreground=p.text,
-                    font=fonts.subheading)
+    style.configure("CardTitle.TLabel", background=p.background,
+                    foreground=p.text_muted, font=fonts.label)
     style.configure("Title.TLabel", background=p.background, foreground=p.text,
                     font=fonts.title)
 
@@ -477,7 +873,7 @@ def apply_theme(root: tk.Misc) -> Fonts:
                     background=p.surface, foreground=p.text,
                     bordercolor=p.surface, lightcolor=p.surface,
                     darkcolor=p.surface, insertcolor=p.accent,
-                    borderwidth=0, relief="flat", padding=(4, 11))
+                    borderwidth=0, relief="flat", padding=(2, 7))
     style.configure("AuthReveal.TButton", background=p.surface,
                     foreground=p.text_dim, borderwidth=0, relief="flat",
                     font=fonts.small, padding=(6, 2))
@@ -486,7 +882,7 @@ def apply_theme(root: tk.Misc) -> Fonts:
               foreground=[("active", p.accent)])
     style.configure("AuthPrimary.TButton", background=p.accent,
                     foreground="#FFFFFF", borderwidth=0, relief="flat",
-                    font=fonts.body_bold, padding=(18, 15))
+                    font=fonts.body_bold, padding=(14, 11))
     style.map("AuthPrimary.TButton",
               background=[("disabled", p.accent_dim), ("active", p.accent_hover)],
               foreground=[("disabled", p.text_dim)])
@@ -535,7 +931,7 @@ def apply_theme(root: tk.Misc) -> Fonts:
     # --- Buttons ----------------------------------------------------------
     style.configure("TButton", background=p.surface_raised, foreground=p.text,
                     bordercolor=p.border_strong, focuscolor=p.accent,
-                    padding=(18, 10), relief="flat", font=fonts.body)
+                    padding=(12, 6), relief="flat", font=fonts.body)
     style.map("TButton",
               background=[("active", p.border_strong), ("disabled", p.surface_alt)],
               foreground=[("disabled", p.text_dim)])
@@ -548,32 +944,48 @@ def apply_theme(root: tk.Misc) -> Fonts:
                     bordercolor=p.critical, font=fonts.body_bold)
     style.map("Danger.TButton", background=[("active", "#FF6E66")])
     style.configure("Ghost.TButton", background=p.surface, foreground=p.text_muted,
-                    bordercolor=p.border, padding=(16, 9))
+                    bordercolor=p.border, padding=(10, 5))
     style.map("Ghost.TButton", background=[("active", p.surface_alt)],
               foreground=[("active", p.text)])
     # Section headings above each group of navigation entries.
+    # A section label, not a heading: small and quiet, so the entries under it
+    # are what the eye lands on. It was previously letter-spaced by injecting
+    # spaces between characters, which made a four-letter word wider than the
+    # entries it introduced.
     style.configure("NavGroup.TLabel", background=p.surface,
-                    foreground=p.text_dim, font=fonts.small_bold)
+                    foreground=p.text_dim, font=fonts.label)
 
+    # Entries are ~26px rather than ~44px. The rail previously needed its own
+    # scrollbar at eleven entries purely because each row was tall enough for
+    # two; at this pitch the whole of it fits without one.
+    #
+    # ``focuscolor=""`` removes ttk's dotted focus ring, which drew a dashed
+    # rectangle around whichever entry was clicked last and read as a rendering
+    # fault rather than as focus.
     style.configure("Nav.TButton", background=p.surface, foreground=p.text_muted,
-                    bordercolor=p.surface, anchor="w", padding=(14, 13),
-                    relief="flat", font=fonts.body, borderwidth=0)
+                    bordercolor=p.surface, anchor="w", padding=(10, 5),
+                    relief="flat", font=fonts.body, borderwidth=0,
+                    focuscolor="")
     style.map("Nav.TButton",
               background=[("active", p.surface_hover)],
               foreground=[("active", p.text)])
-    style.configure("NavActive.TButton", background=p.accent_dim, foreground=p.text,
-                    bordercolor=p.accent, anchor="w", padding=(14, 13),
-                    relief="flat", font=fonts.body_bold, borderwidth=0)
+    # The current page is marked by its accent bar, its lit label and a barely
+    # raised ground - not by a saturated filled block, which at eleven entries
+    # made the sidebar the loudest thing on screen.
+    style.configure("NavActive.TButton", background=p.surface_alt,
+                    foreground=p.text, bordercolor=p.surface_alt, anchor="w",
+                    padding=(10, 5), relief="flat", font=fonts.body_bold,
+                    borderwidth=0, focuscolor="")
     style.map("NavActive.TButton",
-              background=[("active", p.accent_dim)],
+              background=[("active", p.surface_alt)],
               foreground=[("active", p.text)])
     # The icon cell beside each entry: a fixed-width square so the labels line
     # up down the rail whatever glyph each screen uses.
     style.configure("NavGlyph.TLabel", background=p.surface,
-                    foreground=p.text_dim, font=(fonts.body[0], 13),
+                    foreground=p.text_dim, font=(fonts.body[0], 11),
                     anchor="center", width=2)
-    style.configure("NavGlyphActive.TLabel", background=p.accent_dim,
-                    foreground=p.accent_hover, font=(fonts.body[0], 13),
+    style.configure("NavGlyphActive.TLabel", background=p.surface_alt,
+                    foreground=p.accent, font=(fonts.body[0], 11),
                     anchor="center", width=2)
 
     # Collapsed sidebar: the same entries as a centred icon rail.
@@ -590,30 +1002,30 @@ def apply_theme(root: tk.Misc) -> Fonts:
 
     # Toolbar buttons sit directly on a card and stay quiet until hovered.
     style.configure("Tool.TButton", background=p.surface, foreground=p.text_muted,
-                    bordercolor=p.surface, padding=(14, 8), relief="flat",
+                    bordercolor=p.surface, padding=(10, 5), relief="flat",
                     font=fonts.small)
     style.map("Tool.TButton",
               background=[("active", p.surface_hover), ("disabled", p.surface)],
               foreground=[("active", p.text), ("disabled", p.text_dim)])
     style.configure("ToolAccent.TButton", background=p.accent_soft,
                     foreground=p.accent_hover, bordercolor=p.accent_soft,
-                    padding=(14, 8), relief="flat", font=fonts.small_bold)
+                    padding=(10, 5), relief="flat", font=fonts.small_bold)
     style.map("ToolAccent.TButton",
               background=[("active", p.accent_dim)],
               foreground=[("active", "#FFFFFF"), ("disabled", p.text_dim)])
     style.configure("Icon.TButton", background=p.surface_alt, foreground=p.text_muted,
-                    bordercolor=p.surface_alt, padding=(10, 6), relief="flat")
+                    bordercolor=p.surface_alt, padding=(8, 4), relief="flat")
     style.map("Icon.TButton",
               background=[("active", p.surface_hover)],
               foreground=[("active", p.text)])
     style.configure("HeaderIcon.TButton", background=p.surface_alt,
                     foreground=p.text_muted, bordercolor=p.surface_alt,
-                    padding=(11, 7), relief="flat")
+                    padding=(9, 5), relief="flat")
     style.map("HeaderIcon.TButton",
               background=[("active", p.surface_hover)],
               foreground=[("active", p.text)])
     style.configure("Search.TButton", background=p.surface, foreground=p.text_dim,
-                    bordercolor=p.border, padding=(14, 8), relief="flat",
+                    bordercolor=p.border, padding=(12, 5), relief="flat",
                     anchor="w", font=fonts.small)
     style.map("Search.TButton",
               background=[("active", p.surface_hover)],
@@ -632,14 +1044,14 @@ def apply_theme(root: tk.Misc) -> Fonts:
             style.configure(
                 f"{name}{surface_name}Chip.TLabel",
                 background=chip_background, foreground=foreground,
-                padding=(10, 4), font=fonts.small_bold,
+                padding=(8, 2), font=fonts.small_bold,
             )
     style.configure("Badge.TLabel", background=p.accent, foreground="#FFFFFF",
-                    padding=(8, 2), font=fonts.small_bold)
+                    padding=(6, 0), font=fonts.small_bold)
     style.configure("BadgeMuted.TLabel", background=p.surface_raised,
-                    foreground=p.text_muted, padding=(8, 2), font=fonts.small_bold)
+                    foreground=p.text_muted, padding=(6, 0), font=fonts.small_bold)
     style.configure("Kbd.TLabel", background=p.surface_raised, foreground=p.text_dim,
-                    padding=(8, 3), font=fonts.mono_small)
+                    padding=(6, 2), font=fonts.mono_small)
 
     # --- Overlay surfaces (command palette, notification panel, toasts) ----
     style.configure("Overlay.TFrame", background=p.overlay)
@@ -662,11 +1074,11 @@ def apply_theme(root: tk.Misc) -> Fonts:
     # --- Inputs -----------------------------------------------------------
     style.configure("TEntry", fieldbackground=p.surface_alt, foreground=p.text,
                     bordercolor=p.border_strong, insertcolor=p.text,
-                    padding=9, relief="flat")
+                    padding=6, relief="flat")
     style.map("TEntry", bordercolor=[("focus", p.accent)])
     style.configure("TCombobox", fieldbackground=p.surface_alt, background=p.surface_alt,
                     foreground=p.text, arrowcolor=p.text_muted,
-                    bordercolor=p.border_strong, padding=8)
+                    bordercolor=p.border_strong, padding=5)
     style.map("TCombobox",
               fieldbackground=[("readonly", p.surface_alt)],
               foreground=[("readonly", p.text)],
@@ -681,30 +1093,52 @@ def apply_theme(root: tk.Misc) -> Fonts:
     style.map("TCheckbutton",
               background=[("active", p.surface)],
               indicatorcolor=[("selected", p.accent)])
+    # A toolbar sits on a card, which is a shade lighter than a plain surface;
+    # a checkbox using the default background reads as a patch stuck on top.
+    style.configure("Toolbar.TCheckbutton", background=p.surface_alt,
+                    foreground=p.text_muted, indicatorcolor=p.surface,
+                    focuscolor=p.accent, padding=(2, 2))
+    style.map("Toolbar.TCheckbutton",
+              background=[("active", p.surface_alt)],
+              foreground=[("selected", p.text), ("active", p.text)],
+              indicatorcolor=[("selected", p.accent)])
     style.configure("TRadiobutton", background=p.surface, foreground=p.text)
     style.configure("TSpinbox", fieldbackground=p.surface_alt, foreground=p.text,
-                    bordercolor=p.border_strong, arrowcolor=p.text_muted, padding=7)
+                    bordercolor=p.border_strong, arrowcolor=p.text_muted, padding=4)
 
     # --- Tables -----------------------------------------------------------
     # Rows are given real height: a security table is read row by row, and a
     # cramped grid is where an analyst loses their place.
     style.configure("Treeview", background=p.surface, fieldbackground=p.surface,
-                    foreground=p.text, bordercolor=p.border, rowheight=38,
+                    foreground=p.text, bordercolor=p.border,
+                    rowheight=METRICS.row_height,
                     font=fonts.body, relief="flat", borderwidth=0)
     style.map("Treeview",
               background=[("selected", p.accent_dim)],
               foreground=[("selected", "#FFFFFF")])
-    style.configure("Treeview.Heading", background=p.surface_sunken,
-                    foreground=p.text_dim, relief="flat", padding=(14, 13),
+    # The heading shares the table's own fill and is separated from the rows
+    # by a rule, so a table needs no outer border to be legible.
+    style.configure("Treeview.Heading", background=p.surface,
+                    foreground=p.text_muted, relief="flat", padding=(10, 7),
                     font=fonts.label, borderwidth=0)
+    style.layout("Treeview.Heading", [
+        ("Treeheading.cell", {"sticky": "nswe"}),
+        ("Treeheading.border", {"sticky": "nswe", "children": [
+            ("Treeheading.padding", {"sticky": "nswe", "children": [
+                ("Treeheading.image", {"side": "right", "sticky": ""}),
+                ("Treeheading.text", {"sticky": "we"}),
+            ]}),
+        ]}),
+    ])
     style.map("Treeview.Heading",
               background=[("active", p.surface_alt)],
               foreground=[("active", p.text)])
-    style.configure("Mono.Treeview", font=fonts.mono_small, rowheight=27,
+    style.configure("Mono.Treeview", font=fonts.mono_small,
+                    rowheight=METRICS.row_height - 2,
                     background=p.surface, fieldbackground=p.surface,
                     foreground=p.text, borderwidth=0)
     style.configure("Mono.Treeview.Heading", background=p.surface_sunken,
-                    foreground=p.text_dim, relief="flat", padding=(12, 9),
+                    foreground=p.text_dim, relief="flat", padding=(10, 7),
                     font=fonts.label, borderwidth=0)
     style.map("Mono.Treeview.Heading",
               background=[("active", p.surface_hover)],
@@ -730,12 +1164,18 @@ def apply_theme(root: tk.Misc) -> Fonts:
 
     style.configure("TNotebook", background=p.background, bordercolor=p.border,
                     tabmargins=(0, 4, 0, 0), borderwidth=0)
-    style.configure("TNotebook.Tab", background=p.surface_sunken,
-                    foreground=p.text_dim, padding=(20, 13), font=fonts.small_bold,
+    # Compact tabs. The selected one is carried by an accent underline rather
+    # than by a raised slab, so the active tab is obvious at a glance without
+    # each tab costing a row of height.
+    style.configure("TNotebook.Tab", background=p.background,
+                    foreground=p.text_dim, padding=(14, 6), font=fonts.small_bold,
                     borderwidth=0)
     style.map("TNotebook.Tab",
-              background=[("selected", p.surface_raised)],
-              foreground=[("selected", p.text)])
+              background=[("selected", p.background), ("active", p.surface_sunken)],
+              foreground=[("selected", p.accent), ("active", p.text)],
+              bordercolor=[("selected", p.accent)],
+              lightcolor=[("selected", p.accent)],
+              darkcolor=[("selected", p.accent)])
     style.configure("TPanedwindow", background=p.background)
     style.configure("TLabelframe", background=p.surface, foreground=p.text_muted,
                     bordercolor=p.border)

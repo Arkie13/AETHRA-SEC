@@ -153,7 +153,7 @@ class Surface(tk.Canvas):
         # first so each rung sits on top of the one beneath it.
         for step in range(depth, 0, -1):
             spread = step
-            tint = blend(self._page, "#000000", 0.62 * (1 - (step - 1) / depth))
+            tint = blend(self._page, PALETTE.shadow, 0.62 * (1 - (step - 1) / depth))
             rounded_rectangle(
                 self, spread, spread, right - spread, bottom + spread,
                 self._radius, fill=tint, outline="", tags="surface",

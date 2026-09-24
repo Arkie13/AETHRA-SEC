@@ -1,0 +1,64 @@
+BEFORE YOU INSTALL
+==================
+
+AETHRA-SEC installs on its own and starts on its own. You do not need Python,
+Visual Studio Code, PyCharm or any development tool: the Python runtime and
+every library are inside this installer.
+
+What you DO need is the security tooling AETHRA-SEC integrates with. Those are
+separate products with their own licences, so they are installed separately.
+The next page reports which of them are already on this machine.
+
+
+REQUIRED
+--------
+
+  MySQL 8.0+ / MariaDB 10.6+ / XAMPP
+      Where AETHRA-SEC stores hosts, alerts, incidents, vulnerability findings
+      and the audit trail. The setup wizard creates the schema for you; it just
+      needs a running server and an account that may create it.
+
+  Npcap
+      The Windows packet driver. Live capture is impossible without it. It is
+      included in the Wireshark installer - keep that component selected.
+
+
+REQUIRED FOR THE MAIN FEATURES
+------------------------------
+
+  Wireshark / TShark
+      Traffic analysis. AETHRA-SEC drives TShark through PyShark. Without it
+      the Network Monitoring screen reports TSHARK UNAVAILABLE.
+
+  Nmap
+      Host discovery and vulnerability assessment. Without it the assessment
+      screens report NMAP UNAVAILABLE.
+
+
+OPTIONAL
+--------
+
+  Snort
+      Intrusion detection. AETHRA-SEC reads alerts that a Snort sensor has
+      already written; it never launches Snort itself. Without it, AETHRA-SEC's
+      own traffic-analysis detection rules continue to work, and the interface
+      reports SNORT UNAVAILABLE rather than implying a sensor is running.
+
+
+NOTES BEFORE YOU CONTINUE
+-------------------------
+
+  * Any missing component can be installed later. AETHRA-SEC starts either way,
+    and its System Health screen re-checks all of them every time you look.
+
+  * Live packet capture needs an elevated process. The shortcut this installer
+    creates will prompt for elevation.
+
+  * On a switched network, a monitoring machine does not automatically see
+    unicast traffic between two OTHER hosts. If you intend to watch traffic
+    that does not involve this machine, you will need switch port mirroring
+    (SPAN), a network TAP, or AETHRA-SEC placed in the traffic path. The setup
+    wizard says this again when you choose an interface, and AETHRA-SEC will
+    honestly show that it saw nothing rather than inventing packets.
+
+  * AETHRA-SEC must only be used on networks you are authorised to monitor.

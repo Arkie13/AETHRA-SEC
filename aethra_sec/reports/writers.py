@@ -22,11 +22,41 @@ from aethra_sec.utils.logging import get_logger
 LOGGER = get_logger("reports.writers")
 
 
+#: Characters that make a spreadsheet treat a cell as a formula rather than as
+#: text. Tab and carriage return are included because Excel strips leading
+#: whitespace before deciding, so " =cmd|..." is a formula too.
+_FORMULA_LEAD = ("=", "+", "-", "@", chr(9), chr(13))
+
+
+def _is_number(text: str) -> bool:
+    """True when the text is an ordinary number, including a negative one."""
+    try:
+        float(text.replace(",", ""))
+    except ValueError:
+        return False
+    return True
+
+
 def _stringify(value: Any) -> str:
-    """Render a cell value as text."""
+    """Render a cell value as text that a spreadsheet will not execute.
+
+    Every string in a report can come from an attacker. A hostname is whatever
+    a device announces over DHCP, mDNS or NetBIOS; a Snort alert message, an
+    incident title and a service banner are all equally external. Excel,
+    LibreOffice and Google Sheets treat a cell beginning ``=``, ``+``, ``-`` or
+    ``@`` as a formula, so a device named ``=cmd|'/c calc'!A1`` runs a command
+    on the analyst's workstation the moment they open the export.
+
+    Prefixing with an apostrophe is the standard neutralisation: the cell reads
+    as the original text and is never evaluated. Plain numbers are left alone,
+    so a negative figure stays a figure.
+    """
     if value is None:
         return ""
-    return str(value)
+    text = str(value)
+    if text and text[0] in _FORMULA_LEAD and not _is_number(text):
+        return "'" + text
+    return text
 
 
 def write_csv(document: ReportDocument, path: Path) -> Path:
@@ -51,23 +81,23 @@ def write_csv(document: ReportDocument, path: Path) -> Path:
                 writer.writerow([])
 
             for section in document.sections:
-                writer.writerow([section.title])
-                writer.writerow(list(section.columns))
+                writer.writerow([_stringify(section.title)])
+                writer.writerow([_stringify(c) for c in section.columns])
                 if section.has_rows:
                     for row in section.rows:
                         writer.writerow([_stringify(cell) for cell in row])
                 else:
                     writer.writerow([NO_RECORDS_TEXT])
                 if section.note:
-                    writer.writerow(["Note", section.note])
+                    writer.writerow(["Note", _stringify(section.note)])
                 writer.writerow([])
 
             if document.observations:
                 writer.writerow(["Observations"])
                 for note in document.observations:
-                    writer.writerow([note])
+                    writer.writerow([_stringify(note)])
                 writer.writerow([])
-            writer.writerow(["Conclusion", document.conclusion])
+            writer.writerow(["Conclusion", _stringify(document.conclusion)])
     except OSError as exc:
         raise ReportError(
             f"Could not write {path}: {exc}",
@@ -89,7 +119,7 @@ def write_rows_csv(
     try:
         with path.open("w", newline="", encoding="utf-8-sig") as handle:
             writer = csv.writer(handle)
-            writer.writerow(list(columns))
+            writer.writerow([_stringify(c) for c in columns])
             if rows:
                 for row in rows:
                     writer.writerow([_stringify(cell) for cell in row])

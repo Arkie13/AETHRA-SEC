@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from tkinter import ttk
 from typing import Callable, Sequence
 
-from aethra_sec.ui.theme import PALETTE, Fonts, configure_text_widget
+from aethra_sec.ui.theme import PALETTE, Fonts, configure_text_widget, motion_enabled
 from aethra_sec.ui.widgets.cards import Card, KeyValueList, ScrollableFrame
 from aethra_sec.ui.widgets.chips import SeverityChip
 
@@ -56,7 +56,7 @@ class DetailDrawer(ttk.Frame):
 
     def __init__(self, parent: tk.Misc, fonts: Fonts) -> None:
         """Build the drawer hidden; call :meth:`show` to reveal it."""
-        super().__init__(parent, style="Raised.TFrame")
+        super().__init__(parent, style="TFrame")
         self._parent = parent
         self._fonts = fonts
         self._open = False
@@ -70,13 +70,13 @@ class DetailDrawer(ttk.Frame):
         self._edge = tk.Frame(self, background=PALETTE.accent, width=2)
         self._edge.pack(side="left", fill="y")
 
-        body = ttk.Frame(self, style="Raised.TFrame")
+        body = ttk.Frame(self, style="TFrame")
         body.pack(side="left", fill="both", expand=True)
 
-        header = ttk.Frame(body, style="Raised.TFrame", padding=(16, 14, 12, 10))
+        header = ttk.Frame(body, style="TFrame", padding=(16, 14, 12, 10))
         header.pack(fill="x")
 
-        title_row = ttk.Frame(header, style="Raised.TFrame")
+        title_row = ttk.Frame(header, style="TFrame")
         title_row.pack(fill="x")
         self._title = ttk.Label(title_row, text="", style="DrawerHeading.TLabel")
         self._title.pack(side="left")
@@ -91,7 +91,7 @@ class DetailDrawer(ttk.Frame):
         )
         self._subtitle.pack(anchor="w", pady=(2, 0))
 
-        self._chip_row = ttk.Frame(header, style="Raised.TFrame")
+        self._chip_row = ttk.Frame(header, style="TFrame")
         self._chip_row.pack(anchor="w", pady=(8, 0))
         self._chips: list[SeverityChip] = []
 
@@ -101,7 +101,7 @@ class DetailDrawer(ttk.Frame):
         self._scroller.pack(fill="both", expand=True)
         self._content = self._scroller.interior
 
-        self._footer = ttk.Frame(body, style="Raised.TFrame", padding=(14, 10))
+        self._footer = ttk.Frame(body, style="TFrame", padding=(14, 10))
         self._footer.pack(fill="x", side="bottom")
         self._hint = ttk.Label(
             self._footer, text="Esc closes  ·  click outside closes",
@@ -157,7 +157,7 @@ class DetailDrawer(ttk.Frame):
                 continue
             chip = SeverityChip(
                 self._chip_row, value, kind=kind, fonts=self._fonts,
-                surface=PALETTE.surface_raised,
+                surface=PALETTE.background,
             )
             chip.pack(side="left", padx=(0, 6))
             self._chips.append(chip)
@@ -171,7 +171,7 @@ class DetailDrawer(ttk.Frame):
         for index, section in enumerate(sections):
             card = Card(
                 self._content, section.title, subtitle=section.subtitle,
-                fonts=self._fonts, padding=18,
+                fonts=self._fonts, padding=12,
             )
             card.pack(fill="x", pady=(0 if index == 0 else 10, 0))
 
@@ -229,7 +229,15 @@ class DetailDrawer(ttk.Frame):
         if not self._open:
             self._open = True
             self._bind_dismissals()
-            self._animate(step=0)
+            if motion_enabled():
+                self._animate(step=0)
+            else:
+                # Reduced motion: place it at its resting position at once.
+                self.place(
+                    relx=1.0, rely=0, anchor="ne", relheight=1.0,
+                    width=self._width, x=0,
+                )
+                self._animation = None
         else:
             # Already open on another record: stay put and swap the content.
             self.place(relx=1.0, rely=0, anchor="ne", relheight=1.0, width=self._width)

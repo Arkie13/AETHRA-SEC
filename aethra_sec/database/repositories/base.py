@@ -18,7 +18,7 @@ from typing import Any, Callable, Iterable, Sequence, TypeVar
 
 from aethra_sec.database.connection import DatabaseManager
 from aethra_sec.utils.logging import get_logger
-from aethra_sec.utils.timeutil import from_db
+from aethra_sec.utils.timeutil import from_db, to_db
 
 LOGGER = get_logger("database.repository")
 
@@ -115,6 +115,20 @@ class QueryFilter:
         self.params.append(value)
         return self
 
+    def lt(self, column: str, value: Any) -> "QueryFilter":
+        """Add ``column < %s`` - the exclusive upper bound.
+
+        Preferred over :meth:`lte` for a time window, so that a record stamped
+        exactly on the boundary belongs to one period only. A screen using
+        ``lte`` and a dashboard using ``<`` disagree by exactly the records on
+        the boundary, which is the kind of discrepancy nobody can explain.
+        """
+        if value is None:
+            return self
+        self.clauses.append(f"{self._check(column)} < %s")
+        self.params.append(value)
+        return self
+
     def is_null(self, column: str, null: bool = True) -> "QueryFilter":
         """Add ``column IS NULL`` / ``IS NOT NULL``."""
         suffix = "IS NULL" if null else "IS NOT NULL"
@@ -167,6 +181,46 @@ def order_clause(
     safe_direction = direction.upper() if direction.upper() in SORT_DIRECTIONS else "DESC"
     qualified = f"{prefix}.{safe_column}" if prefix else safe_column
     return f"ORDER BY {qualified} {safe_direction}"
+
+
+def period_bounds(
+    column: str,
+    start: datetime | None,
+    end: datetime | None = None,
+    *extra: str,
+) -> tuple[str, list[Any]]:
+    """Build a half-open ``[start, end)`` WHERE clause for one time column.
+
+    The upper bound is **exclusive**, deliberately and everywhere. A daily
+    figure whose upper bound is inclusive counts a record stamped at exactly
+    00:00:00 into both the day that ended and the day that began; with ``<``
+    it belongs to the new day alone, which is what a calendar day means.
+
+    Either bound may be ``None``: an absent ``start`` means "everything
+    retained up to ``end``", which is what an all-data report asks for.
+
+    Args:
+        column: time column to bound. Supplied by repository code, never by a
+            caller, so it is safe to concatenate.
+        start: inclusive lower bound, or ``None`` for no lower bound.
+        end: exclusive upper bound, or ``None`` for no upper bound.
+        extra: further literal clauses written by repository code, ANDed on.
+
+    Returns:
+        The clause (``""`` when nothing is bounded) and its bound parameters.
+    """
+    clauses: list[str] = []
+    params: list[Any] = []
+    if start is not None:
+        clauses.append(f"{column} >= %s")
+        params.append(to_db(start))
+    if end is not None:
+        clauses.append(f"{column} < %s")
+        params.append(to_db(end))
+    clauses.extend(extra)
+    if not clauses:
+        return "", params
+    return "WHERE " + " AND ".join(clauses), params
 
 
 def limit_clause(limit: int | None, offset: int = 0) -> tuple[str, tuple[Any, ...]]:

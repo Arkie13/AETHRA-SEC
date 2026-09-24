@@ -12,6 +12,7 @@ import ipaddress
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from aethra_sec.config import paths
 from aethra_sec.config.environment import (
     env_bool,
     env_int,
@@ -19,7 +20,6 @@ from aethra_sec.config.environment import (
     env_path,
     env_str,
     load_env_file,
-    project_root,
 )
 
 DEFAULT_AUTHORIZED_NETWORKS: tuple[str, ...] = (
@@ -48,7 +48,7 @@ class DatabaseSettings:
     database: str = "aethra_sec"
     user: str = "aethra_app"
     password: str = ""
-    pool_size: int = 5
+    pool_size: int = 8
     connect_timeout: int = 10
 
     @property
@@ -166,37 +166,51 @@ class AuthorizationSettings:
 
 
 @dataclass(frozen=True)
-class OtpSettings:
-    """Optional email second factor.
+class SmtpSettings:
+    """Outbound email, used for notifications and for nothing else.
 
-    Disabled unless explicitly enabled *and* SMTP is configured. The System
-    Health screen always reports the true status rather than implying that a
-    second factor is active when it is not.
+    AETHRA-SEC has no email step in its sign-in. A session is issued on a
+    correct username and password, and no state of the mail configuration can
+    grant access or withhold it. That separation is deliberate: an outage of a
+    mail server is an operational inconvenience here, not a lockout.
+
+    The password is read from the configuration file and is never written to a
+    log, an audit record, an export or the interface.
     """
 
-    enabled: bool = False
-    smtp_host: str = ""
-    smtp_port: int = 587
-    smtp_user: str = ""
-    smtp_password: str = ""
+    host: str = ""
+    port: int = 587
+    username: str = ""
+    password: str = ""
     mail_from: str = ""
     use_starttls: bool = True
-    ttl_seconds: int = 300
+    #: Where administrative and security notifications are sent. Falls back to
+    #: the administrator's own registered address when left empty.
+    recipient: str = ""
+    timeout_seconds: int = 20
 
     @property
-    def is_operational(self) -> bool:
-        """True only when OTP delivery can actually be attempted."""
-        return bool(self.enabled and self.smtp_host and self.mail_from)
+    def is_configured(self) -> bool:
+        """True when a message could actually be addressed and sent.
+
+        A host and a sender are the minimum. Authentication is optional - an
+        internal relay that accepts unauthenticated mail from the LAN is a
+        legitimate configuration, and demanding a username would rule it out.
+        """
+        return bool(self.host and self.mail_from)
 
     def status_text(self) -> str:
-        """Exact configured status for display."""
-        if not self.enabled:
-            return "Disabled (AETHRA_OTP_ENABLED=false)"
-        if not self.smtp_host:
-            return "Enabled but not operational: SMTP host not configured"
-        if not self.mail_from:
-            return "Enabled but not operational: sender address not configured"
-        return f"Enabled via {self.smtp_host}:{self.smtp_port}"
+        """The exact configured status, in the words the interface displays.
+
+        Two states only, and neither is optimistic: "configured" means the
+        settings are complete enough to attempt delivery, never that delivery
+        has been proven. Whether a message actually arrived is reported by the
+        send itself, which is the only thing that knows.
+        """
+        if not self.is_configured:
+            return "SMTP NOT CONFIGURED"
+        security = "STARTTLS" if self.use_starttls else "implicit TLS"
+        return f"SMTP CONFIGURED - {self.host}:{self.port} ({security})"
 
 
 @dataclass(frozen=True)
@@ -208,20 +222,31 @@ class AppSettings:
     snort: SnortSettings = field(default_factory=SnortSettings)
     capture: CaptureSettings = field(default_factory=CaptureSettings)
     authorization: AuthorizationSettings = field(default_factory=AuthorizationSettings)
-    otp: OtpSettings = field(default_factory=OtpSettings)
-    log_dir: Path = field(default_factory=lambda: project_root() / "logs")
+    smtp: SmtpSettings = field(default_factory=SmtpSettings)
+    log_dir: Path = field(default_factory=paths.log_dir)
     log_level: str = "INFO"
-    report_dir: Path = field(default_factory=lambda: project_root() / "reports_output")
+    report_dir: Path = field(default_factory=paths.report_dir)
+    #: Where a capture session writes its pcap. The packet inspector re-reads
+    #: individual frames from that file, which is what lets it show real
+    #: decoded fields and real bytes rather than the summary the table holds.
+    capture_dir: Path = field(default_factory=paths.capture_dir)
     ui_refresh_ms: int = 2000
     env_file: Path | None = None
 
 
 def _resolve_dir(raw: str, fallback: Path) -> Path:
-    """Resolve a configured directory relative to the project root."""
+    """Resolve a configured directory, relative entries against the data dir.
+
+    A relative path in the configuration file means "inside this installation's
+    own data area", which is the project folder for a checkout and the
+    application-data directory for an installed build. Resolving it against the
+    working directory instead would put an operator's reports wherever the
+    shortcut happened to start the process.
+    """
     if not raw:
         return fallback
     candidate = Path(raw).expanduser()
-    return candidate if candidate.is_absolute() else (project_root() / candidate)
+    return candidate if candidate.is_absolute() else (paths.data_dir() / candidate)
 
 
 def load_settings(env_file: Path | None = None) -> AppSettings:
@@ -250,7 +275,7 @@ def load_settings(env_file: Path | None = None) -> AppSettings:
             database=env_str("AETHRA_DB_NAME", "aethra_sec"),
             user=env_str("AETHRA_DB_USER", "aethra_app"),
             password=env_str("AETHRA_DB_PASSWORD"),
-            pool_size=max(1, min(32, env_int("AETHRA_DB_POOL_SIZE", 5))),
+            pool_size=max(1, min(32, env_int("AETHRA_DB_POOL_SIZE", 8))),
             connect_timeout=max(1, env_int("AETHRA_DB_CONNECT_TIMEOUT", 10)),
         ),
         tools=ToolSettings(
@@ -276,20 +301,23 @@ def load_settings(env_file: Path | None = None) -> AppSettings:
             networks=networks,
             allow_public=env_bool("AETHRA_ALLOW_PUBLIC_TARGETS", False),
         ),
-        otp=OtpSettings(
-            enabled=env_bool("AETHRA_OTP_ENABLED", False),
-            smtp_host=env_str("AETHRA_SMTP_HOST"),
-            smtp_port=env_int("AETHRA_SMTP_PORT", 587),
-            smtp_user=env_str("AETHRA_SMTP_USER"),
-            smtp_password=env_str("AETHRA_SMTP_PASSWORD"),
+        smtp=SmtpSettings(
+            host=env_str("AETHRA_SMTP_HOST"),
+            port=env_int("AETHRA_SMTP_PORT", 587),
+            username=env_str("AETHRA_SMTP_USER"),
+            password=env_str("AETHRA_SMTP_PASSWORD"),
             mail_from=env_str("AETHRA_SMTP_FROM"),
             use_starttls=env_bool("AETHRA_SMTP_STARTTLS", True),
-            ttl_seconds=max(30, env_int("AETHRA_OTP_TTL_SECONDS", 300)),
+            recipient=env_str("AETHRA_SMTP_TO"),
+            timeout_seconds=max(5, env_int("AETHRA_SMTP_TIMEOUT_SECONDS", 20)),
         ),
-        log_dir=_resolve_dir(env_str("AETHRA_LOG_DIR"), project_root() / "logs"),
+        log_dir=_resolve_dir(env_str("AETHRA_LOG_DIR"), paths.log_dir()),
         log_level=env_str("AETHRA_LOG_LEVEL", "INFO").upper(),
         report_dir=_resolve_dir(
-            env_str("AETHRA_REPORT_DIR"), project_root() / "reports_output"
+            env_str("AETHRA_REPORT_DIR"), paths.report_dir()
+        ),
+        capture_dir=_resolve_dir(
+            env_str("AETHRA_CAPTURE_DIR"), paths.capture_dir()
         ),
         ui_refresh_ms=max(250, env_int("AETHRA_UI_REFRESH_MS", 2000)),
         env_file=loaded,

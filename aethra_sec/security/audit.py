@@ -39,7 +39,24 @@ class AuditAction:
     LOGIN_SUCCESS = "LOGIN_SUCCESS"
     LOGIN_FAILED = "LOGIN_FAILED"
     LOGIN_LOCKED = "LOGIN_LOCKED"
+    #: Raised once a run of failed sign-ins reaches the alerting threshold.
+    #: Distinct from LOGIN_FAILED, which records every individual attempt: this
+    #: one marks the moment the pattern became worth an administrator's time.
+    MULTIPLE_LOGIN_FAILURES = "MULTIPLE_LOGIN_FAILURES_DETECTED"
     LOGOUT = "LOGOUT"
+
+    # Notification email. Sign-in never involves email, so these say only
+    # whether a notification about something that already happened reached the
+    # administrator - a delivery failure is an operational fact to record, not
+    # an access decision. The recorded detail names the reason and never the
+    # credential used to send.
+    #
+    # Historical "2FA_*" rows written by earlier versions are left exactly as
+    # they are: the column is free text, the audit chain covers them, and
+    # rewriting settled history to match a removed feature would be the one
+    # thing an audit trail must never do.
+    NOTIFICATION_EMAIL_SENT = "NOTIFICATION_EMAIL_SENT"
+    NOTIFICATION_EMAIL_FAILED = "NOTIFICATION_EMAIL_FAILED"
     SESSION_EXPIRED = "SESSION_EXPIRED"
     SESSION_TERMINATED = "SESSION_TERMINATED"
 
@@ -68,6 +85,22 @@ class AuditAction:
     SCAN_FAILED = "SCAN_FAILED"
     SCAN_STOPPED = "SCAN_STOPPED"
     SCAN_REFUSED = "SCAN_REFUSED"
+    SCAN_TIMED_OUT = "SCAN_TIMED_OUT"
+    FINDING_RECORDED = "FINDING_RECORDED"
+    HOST_DISCOVERED = "HOST_DISCOVERED"
+    ASSESSMENT_QUEUED = "ASSESSMENT_QUEUED"
+    ASSESSMENT_SCOPE_UNAVAILABLE = "ASSESSMENT_SCOPE_UNAVAILABLE"
+    ASSESSMENT_SCOPE_CHANGED = "ASSESSMENT_SCOPE_CHANGED"
+    # EVALUATION_RUN_STARTED / EVALUATION_RUN_COMPLETED were removed with the
+    # Evaluation Runs feature. Nothing writes them any more. The audit rows
+    # that already carry them are untouched and still readable: the audit
+    # repository reads `action` as stored text rather than parsing it back
+    # through this enum, and the Logs & Audit filter is built from the
+    # distinct values in the table - so the history stays visible and
+    # filterable without a constant that no code can now produce.
+    #
+    # EVALUATION_RECORDED stays: it is an analyst classifying a real alert,
+    # which is a different thing entirely and is still offered on Alerts.
 
     CAPTURE_STARTED = "CAPTURE_STARTED"
     CAPTURE_STOPPED = "CAPTURE_STOPPED"
@@ -92,6 +125,7 @@ class AuditAction:
     REPORT_GENERATED = "REPORT_GENERATED"
     DATA_EXPORTED = "DATA_EXPORTED"
     LOG_INTEGRITY_VERIFIED = "LOG_INTEGRITY_VERIFIED"
+    LOG_CHAIN_REHASHED = "LOG_CHAIN_REHASHED"
     DATA_PRUNED = "DATA_PRUNED"
     DATABASE_BACKUP = "DATABASE_BACKUP"
 
@@ -136,11 +170,9 @@ class AuditService:
         self._repository = repository
         self._enabled = enable_hash_chain
         self._lock = threading.Lock()
-        self._head_hash = GENESIS_HASH
         self._host_context = host_context or self._detect_host()
         self._failures = 0
         self._written = 0
-        self._load_head()
 
     @staticmethod
     def _detect_host() -> str:
@@ -149,16 +181,6 @@ class AuditService:
             return socket.gethostname()[:128]
         except Exception:  # noqa: BLE001
             return ""
-
-    def _load_head(self) -> None:
-        """Read the most recent record's hash so new entries chain onto it."""
-        try:
-            last = self._repository.last_record()
-        except Exception:  # noqa: BLE001 - database may be offline at startup
-            LOGGER.warning("Could not load the audit chain head; will retry on write.")
-            return
-        if last and last.record_hash:
-            self._head_hash = last.record_hash
 
     @property
     def host_context(self) -> str:
@@ -230,18 +252,16 @@ class AuditService:
         with self._lock:
             try:
                 if self._enabled:
-                    record.previous_hash = self._head_hash
-                    # The id participates in the hash, so the row is inserted
-                    # first with a provisional hash and then finalised.
-                    record.record_hash = ""
-                    record_id = self._repository.append(record)
-                    record.id = record_id
-                    record.record_hash = compute_hash(record, self._head_hash)
-                    self._repository.db.execute(
-                        "UPDATE audit_logs SET record_hash = %s WHERE id = %s",
-                        (record.record_hash, record_id),
+                    # The predecessor is read and locked inside the append's own
+                    # transaction. It used to come from a head cached in this
+                    # object, which was correct only while one process wrote:
+                    # a second window, or a background job in another process,
+                    # linked its records to the head it had seen at start-up,
+                    # and the log verified as broken although nothing had been
+                    # touched. That was PT-04's chain noise.
+                    record_id, _ = self._repository.append_chained(
+                        record, compute_hash, GENESIS_HASH
                     )
-                    self._head_hash = record.record_hash
                 else:
                     record_id = self._repository.append(record)
                 self._written += 1
@@ -286,6 +306,7 @@ class AuditService:
         issues: list[Any] = []
         checked = 0
         unhashed = 0
+        legacy = 0
         first_id: int | None = None
         last_id: int | None = None
         expected_previous = GENESIS_HASH
@@ -299,6 +320,7 @@ class AuditService:
             issues.extend(report.issues)
             checked += report.checked
             unhashed += report.unhashed
+            legacy += report.legacy
             if first_id is None:
                 first_id = report.first_record_id
             last_id = report.last_record_id
@@ -316,18 +338,39 @@ class AuditService:
             first_record_id=first_id,
             last_record_id=last_id,
             unhashed=unhashed,
+            legacy=legacy,
         )
 
     def rebase_chain_head(self) -> None:
-        """Reload the chain head after an administrative prune.
+        """No-op kept for callers that ran after an administrative prune.
 
-        Pruning removes the oldest records, so the surviving prefix no longer
-        links to the genesis hash. Verification reports that truncation; this
-        call simply ensures new records continue from the surviving head.
+        There is no head to reload any more: every append reads and locks the
+        real last row inside its own transaction, so a prune is picked up by
+        the next write without being told. Pruning still leaves the surviving
+        prefix no longer linked to the genesis hash, and verification still
+        reports that truncation - which is the point, and must not be repaired
+        away.
         """
-        with self._lock:
-            self._head_hash = GENESIS_HASH
-            self._load_head()
+        return
+
+
+    def rehash_chain(self) -> tuple[int, int]:
+        """Re-hash records carried over from the earlier canonical format.
+
+        The mechanical half of audit maintenance. Authorization and the audit
+        of the maintenance itself belong to
+        :meth:`~aethra_sec.services.log_service.LogService.rehash_chain`, which
+        is the only caller: this class is the primitive every service records
+        through, so it cannot hold the access control that records denials.
+
+        Only ``previous_hash`` and ``record_hash`` are written. No timestamp,
+        actor, action, target or detail is rewritten, so the evidence itself is
+        untouched - what changes is the representation its hash is taken over.
+
+        Returns:
+            ``(examined, rehashed)``.
+        """
+        return self._repository.rehash_chain(compute_hash, GENESIS_HASH)
 
     # ------------------------------------------------------------------
     # Reading

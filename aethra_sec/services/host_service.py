@@ -10,10 +10,14 @@ from aethra_sec.core.permissions import Permission
 from aethra_sec.core.session import Session
 from aethra_sec.database.repositories.alerts import AlertRepository
 from aethra_sec.database.repositories.hosts import HostRepository
-from aethra_sec.database.repositories.incidents import IncidentRepository
 from aethra_sec.database.repositories.scans import ScanRepository
 from aethra_sec.database.repositories.traffic import TrafficRepository
-from aethra_sec.models.host import Host, TrustedHost
+from aethra_sec.models.host import (
+    AssessmentSummary,
+    Host,
+    TrustedHost,
+    summarize_assessment,
+)
 from aethra_sec.security.audit import AuditAction, AuditCategory, AuditService
 from aethra_sec.security.rbac import AccessControl
 from aethra_sec.utils.logging import get_logger
@@ -67,7 +71,6 @@ class HostService:
         hosts: HostRepository,
         scans: ScanRepository,
         alerts: AlertRepository,
-        incidents: IncidentRepository,
         traffic: TrafficRepository,
         audit: AuditService,
         access: AccessControl,
@@ -76,7 +79,6 @@ class HostService:
         self._hosts = hosts
         self._scans = scans
         self._alerts = alerts
-        self._incidents = incidents
         self._traffic = traffic
         self._audit = audit
         self._access = access
@@ -85,6 +87,42 @@ class HostService:
         """Search the inventory."""
         self._access.require(session, Permission.HOST_VIEW)
         return self._hosts.search(**filters)
+
+    def assessment_overview(
+        self,
+        session: Session,
+        *,
+        text: str = "",
+        limit: int = 1000,
+        scope: Any = None,
+        in_scope_only: bool = False,
+    ) -> list[Host]:
+        """The host inventory with assessment state and security result.
+
+        Feeds the automatic-assessment table: every observed host, its current
+        reachability, where it stands in the assessment cycle, and what the
+        assessment concluded - each derived from stored evidence, none typed by
+        an operator (§4). When a resolved scope is given, each host is marked
+        in or out of it; ``in_scope_only`` selects only in-scope hosts in SQL.
+        """
+        self._access.require(session, Permission.HOST_VIEW)
+        ranges = None
+        if in_scope_only and scope is not None and getattr(scope, "available", False):
+            ranges = scope.address_ranges
+        hosts = self._hosts.assessment_overview(text=text, limit=limit, ranges=ranges)
+        if scope is not None and getattr(scope, "available", False):
+            for host in hosts:
+                host.in_scope = bool(scope.contains(host.ip_address))
+        return hosts
+
+    def assessment_summary(self, session: Session, scope: Any = None) -> AssessmentSummary:
+        """Assessment counts over the whole inventory, inside ``scope``.
+
+        The single source for the Vulnerability Assessment tiles and the
+        Dashboard. Uncapped: it counts every host, not the rows a table loaded.
+        """
+        self._access.require(session, Permission.HOST_VIEW)
+        return summarize_assessment(self._hosts.assessment_summary_hosts(), scope)
 
     def get(self, session: Session, host_id: int) -> Host | None:
         """Fetch one host."""
@@ -105,7 +143,6 @@ class HostService:
             "scans": self._scans.scans_for_host(host_id, limit=20),
             "findings": self._scans.findings_for_host(host_id, limit=100),
             "alerts": self._alerts.alerts_for_host(host_id, limit=100),
-            "incidents": self._incidents.for_host(host_id, limit=50),
             "recent_traffic": self._traffic.recent_for_host(host.ip_address, limit=100),
             "timeline": self._timeline(host_id, host.ip_address),
         }
@@ -127,14 +164,6 @@ class HostService:
                     "at": alert.effective_time,
                     "source": "Snort",
                     "summary": f"[{alert.severity}] {alert.message}",
-                }
-            )
-        for incident in self._incidents.for_host(host_id, limit=50):
-            entries.append(
-                {
-                    "at": incident.created_at,
-                    "source": "Correlation Engine",
-                    "summary": f"{incident.reference} [{incident.severity}] {incident.title}",
                 }
             )
         for finding in self._scans.findings_for_host(host_id, limit=50):

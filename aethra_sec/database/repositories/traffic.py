@@ -22,6 +22,7 @@ from aethra_sec.database.repositories.base import (
     as_text,
     limit_clause,
     order_clause,
+    period_bounds,
 )
 from aethra_sec.models.traffic import (
     PortCount,
@@ -180,16 +181,23 @@ class TrafficRepository(Repository):
             (to_db(since),),
         )
 
-    def packets_today(self, day_start: datetime) -> int:
-        """Packets captured since local midnight, from aggregates.
+    def packets_in_period(self, start: datetime | None, end: datetime) -> int:
+        """Packets captured inside ``[start, end)``, from aggregates.
 
         Aggregates are authoritative here: they count every observed packet,
         including any that row-level sampling skipped.
+
+        ``start`` of ``None`` means "everything retained up to ``end``", which
+        is what the Dashboard's ALL DATA period asks for. There is deliberately
+        no open-ended "since" form: an upper bound is what stops a daily figure
+        from quietly counting into the next day.
         """
+        if start is not None:
+            return self.packets_between(start, end)
         value = self.db.query_value(
             "SELECT COALESCE(SUM(packet_count), 0) FROM traffic_aggregates "
-            "WHERE interval_start >= %s",
-            (to_db(day_start),),
+            "WHERE interval_start < %s",
+            (to_db(end),),
             default=0,
         )
         return int(value or 0)
@@ -234,10 +242,20 @@ class TrafficRepository(Repository):
         )
 
     def aggregates_between(
-        self, start: datetime, end: datetime, interface: str = ""
+        self, start: datetime | None, end: datetime, interface: str = ""
     ) -> list[TrafficAggregate]:
-        """Interval rollups inside a window, oldest first."""
-        params: list[Any] = [to_db(start), to_db(end)]
+        """Interval rollups inside ``[start, end)``, oldest first.
+
+        The upper bound is exclusive so that an interval beginning exactly at
+        midnight belongs to the new day alone; with an inclusive bound it was
+        counted in both days' charts.
+        """
+        params: list[Any] = []
+        lower_clause = ""
+        if start is not None:
+            lower_clause = "interval_start >= %s AND "
+            params.append(to_db(start))
+        params.append(to_db(end))
         interface_clause = ""
         if interface:
             interface_clause = "AND interface = %s "
@@ -248,7 +266,7 @@ class TrafficRepository(Repository):
             "other_packets, unique_sources, unique_destinations, "
             "packets_per_second, bytes_per_second, dropped_packets "
             "FROM traffic_aggregates "
-            f"WHERE interval_start >= %s AND interval_start <= %s {interface_clause}"
+            f"WHERE {lower_clause}interval_start < %s {interface_clause}"
             "ORDER BY interval_start ASC LIMIT 5000",
             params,
         )
@@ -274,16 +292,23 @@ class TrafficRepository(Repository):
             for r in rows
         ]
 
-    def protocol_distribution(self, since: datetime) -> list[ProtocolCount]:
-        """Protocol mix from aggregates, so it reflects every observed packet."""
+    def protocol_distribution(
+        self, since: datetime | None, end: datetime | None = None
+    ) -> list[ProtocolCount]:
+        """Protocol mix from aggregates, so it reflects every observed packet.
+
+        ``end`` is exclusive. Passing it is what keeps the Dashboard's protocol
+        chart inside its reporting period instead of running on to the present.
+        """
+        clauses, params = period_bounds("interval_start", since, end)
         row = self.db.query_one(
             "SELECT COALESCE(SUM(tcp_packets),0) AS tcp, "
             "COALESCE(SUM(udp_packets),0) AS udp, "
             "COALESCE(SUM(icmp_packets),0) AS icmp, "
             "COALESCE(SUM(arp_packets),0) AS arp, "
             "COALESCE(SUM(other_packets),0) AS other "
-            "FROM traffic_aggregates WHERE interval_start >= %s",
-            (to_db(since),),
+            f"FROM traffic_aggregates {clauses}",
+            params,
         )
         if not row:
             return []
@@ -296,14 +321,16 @@ class TrafficRepository(Repository):
         ]
         return [c for c in counts if c.packets > 0]
 
-    def top_sources(self, since: datetime, limit: int = 10) -> list[TalkerCount]:
+    def top_sources(
+        self, since: datetime | None, limit: int = 10, end: datetime | None = None
+    ) -> list[TalkerCount]:
         """Busiest source addresses in the stored packet metadata."""
+        clauses, params = period_bounds("captured_at", since, end, "src_ip <> ''")
         rows = self.db.query(
             "SELECT src_ip AS address, COUNT(*) AS packets, "
             "COALESCE(SUM(length),0) AS bytes FROM traffic_records "
-            "WHERE captured_at >= %s AND src_ip <> '' "
-            "GROUP BY src_ip ORDER BY packets DESC LIMIT %s",
-            (to_db(since), max(1, min(int(limit), 100))),
+            f"{clauses} GROUP BY src_ip ORDER BY packets DESC LIMIT %s",
+            [*params, max(1, min(int(limit), 100))],
         )
         return [
             TalkerCount(
@@ -314,14 +341,16 @@ class TrafficRepository(Repository):
             for r in rows
         ]
 
-    def top_destinations(self, since: datetime, limit: int = 10) -> list[TalkerCount]:
+    def top_destinations(
+        self, since: datetime | None, limit: int = 10, end: datetime | None = None
+    ) -> list[TalkerCount]:
         """Busiest destination addresses in the stored packet metadata."""
+        clauses, params = period_bounds("captured_at", since, end, "dst_ip <> ''")
         rows = self.db.query(
             "SELECT dst_ip AS address, COUNT(*) AS packets, "
             "COALESCE(SUM(length),0) AS bytes FROM traffic_records "
-            "WHERE captured_at >= %s AND dst_ip <> '' "
-            "GROUP BY dst_ip ORDER BY packets DESC LIMIT %s",
-            (to_db(since), max(1, min(int(limit), 100))),
+            f"{clauses} GROUP BY dst_ip ORDER BY packets DESC LIMIT %s",
+            [*params, max(1, min(int(limit), 100))],
         )
         return [
             TalkerCount(
@@ -332,13 +361,16 @@ class TrafficRepository(Repository):
             for r in rows
         ]
 
-    def top_ports(self, since: datetime, limit: int = 10) -> list[PortCount]:
+    def top_ports(
+        self, since: datetime | None, limit: int = 10, end: datetime | None = None
+    ) -> list[PortCount]:
         """Most contacted destination ports in the stored packet metadata."""
+        clauses, params = period_bounds("captured_at", since, end, "dst_port IS NOT NULL")
         rows = self.db.query(
             "SELECT dst_port AS port, protocol, COUNT(*) AS packets "
-            "FROM traffic_records WHERE captured_at >= %s AND dst_port IS NOT NULL "
+            f"FROM traffic_records {clauses} "
             "GROUP BY dst_port, protocol ORDER BY packets DESC LIMIT %s",
-            (to_db(since), max(1, min(int(limit), 100))),
+            [*params, max(1, min(int(limit), 100))],
         )
         return [
             PortCount(

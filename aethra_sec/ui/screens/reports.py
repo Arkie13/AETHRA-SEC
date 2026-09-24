@@ -23,7 +23,6 @@ from aethra_sec.ui.widgets import (
     Card,
     Column,
     DataTable,
-    ScrollableFrame,
     Toolbar,
     show_message,
 )
@@ -66,17 +65,8 @@ class ReportsScreen(Screen):
     # Layout
     # ------------------------------------------------------------------
     def build(self) -> None:
-        """Construct the reporting screen.
-
-        Wrapped in a :class:`ScrollableFrame`, matching the Alerts screen: a
-        fixed-height page must never leave content unreachable whenever it is
-        taller than the window (§ layout).
-        """
-        scroller = ScrollableFrame(self)
-        scroller.pack(fill="both", expand=True)
-        root = scroller.interior
-
-        controls = Card(root, "Generate a report", fonts=self.fonts, padding=18)
+        """Construct the reporting screen."""
+        controls = Card(self, "Generate a report", fonts=self.fonts, padding=12)
         controls.pack(fill="x")
 
         row = ttk.Frame(controls, style="Card.TFrame")
@@ -118,8 +108,13 @@ class ReportsScreen(Screen):
         self._output_label = ttk.Label(controls, text="", style="CardDim.TLabel")
         self._output_label.pack(anchor="w", pady=(8, 0))
 
-        preview_card = Card(root, "Preview", fonts=self.fonts, padding=18)
-        preview_card.pack(fill="both", expand=True, pady=(16, 0))
+        panes = ttk.PanedWindow(self, orient="vertical")
+        panes.pack(fill="both", expand=True, pady=(10, 0))
+
+        preview_host = ttk.Frame(panes, style="TFrame")
+        panes.add(preview_host, weight=3)
+        preview_card = Card(preview_host, "Preview", fonts=self.fonts, padding=12)
+        preview_card.pack(fill="both", expand=True)
         self._preview_text = tk.Text(preview_card, wrap="word")
         configure_text_widget(self._preview_text, self.fonts)
         scrollbar = ttk.Scrollbar(
@@ -135,11 +130,13 @@ class ReportsScreen(Screen):
         self._preview_text.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
+        history_host = ttk.Frame(panes, style="TFrame")
+        panes.add(history_host, weight=2)
         history_card = Card(
-            root, "Report history", subtitle="who generated what, and when",
-            fonts=self.fonts, padding=18,
+            history_host, "Report history", subtitle="who generated what, and when",
+            fonts=self.fonts, padding=12,
         )
-        history_card.pack(fill="both", expand=True, pady=(16, 0))
+        history_card.pack(fill="both", expand=True)
         toolbar = Toolbar(history_card)
         toolbar.pack(fill="x", pady=(0, 6))
         toolbar.add_button("Refresh", self._load_history)
@@ -346,7 +343,7 @@ class ReportsScreen(Screen):
             self, "Report output folder", str(reports.output_dir),
             detail=(
                 "Change this on the Settings screen or with AETHRA_REPORT_DIR "
-                "in .env."
+                "in the configuration file."
             ),
             fonts=self.fonts,
         )

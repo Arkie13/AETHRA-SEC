@@ -32,6 +32,14 @@ LOGGER = get_logger("integrations.nmap.parser")
 # actually printed.
 _CVE_PATTERN = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.IGNORECASE)
 
+# The ``vulners`` NSE script prints one vulnerability per line as
+# ``<id> <cvss> <url>``, e.g. ``CVE-2023-38408  9.8  https://vulners.com/...``.
+# Only a CVE identifier followed directly by a score is read, so a stray number
+# elsewhere in some other script's output can never become a CVSS score.
+_VULNERS_LINE = re.compile(
+    r"\b(CVE-\d{4}-\d{4,7})\s+(10\.0|\d\.\d)\b", re.IGNORECASE
+)
+
 
 @dataclass(frozen=True)
 class VulnKnowledgeEntry:
@@ -51,6 +59,8 @@ class VulnKnowledgeEntry:
     risk_level: RiskLevel
     reference: str
     reference_source: str
+    #: CVSS v3.1 base score the administrator recorded with the entry, if any.
+    cvss_base_score: float | None = None
 
     def matches(self, port: PortResult) -> bool:
         """True when this entry applies to an observed port."""
@@ -265,6 +275,43 @@ def extract_script_references(host_entry: dict[str, Any]) -> dict[int, list[str]
     return references
 
 
+def extract_script_scores(host_entry: dict[str, Any]) -> dict[int, tuple[float, str]]:
+    """The highest CVSS score an NSE script printed beside a CVE, per port.
+
+    Only the ``vulners`` output form ``CVE-YYYY-NNNN <score>`` is read. When no
+    such script ran - the normal case in an isolated laboratory, because
+    ``vulners`` queries an online database - the result is empty and findings
+    carry no score.
+
+    Returns:
+        ``port -> (score, cve)``.
+    """
+    scores: dict[int, tuple[float, str]] = {}
+    for protocol in ("tcp", "udp"):
+        section = host_entry.get(protocol) or {}
+        if not isinstance(section, dict):
+            continue
+        for port_number, entry in section.items():
+            port = _int_or_none(port_number)
+            if port is None or not isinstance(entry, dict):
+                continue
+            scripts = entry.get("script") or {}
+            if not isinstance(scripts, dict):
+                continue
+            for output in scripts.values():
+                for match in _VULNERS_LINE.finditer(str(output)):
+                    try:
+                        score = float(match.group(2))
+                    except ValueError:
+                        continue
+                    if not 0.0 <= score <= 10.0:
+                        continue
+                    current = scores.get(port)
+                    if current is None or score > current[0]:
+                        scores[port] = (score, match.group(1).upper())
+    return scores
+
+
 class FindingBuilder:
     """Derives explainable security findings from real scan observations."""
 
@@ -291,6 +338,7 @@ class FindingBuilder:
         scan_id: int | None = None,
         script_references: dict[int, list[str]] | None = None,
         host_is_trusted: bool = False,
+        script_scores: dict[int, tuple[float, str]] | None = None,
     ) -> list[ScanFinding]:
         """Derive findings for one scanned host.
 
@@ -300,6 +348,7 @@ class FindingBuilder:
         """
         findings: list[ScanFinding] = []
         references = script_references or {}
+        scores = script_scores or {}
 
         for port in host.open_ports:
             knowledge_hit = next(
@@ -370,6 +419,16 @@ class FindingBuilder:
             if script_cves:
                 evidence_parts.append(f"nse_references={', '.join(script_cves)}")
 
+            cvss_score: float | None = None
+            cvss_source = ""
+            if knowledge_hit and knowledge_hit.cvss_base_score is not None:
+                cvss_score = knowledge_hit.cvss_base_score
+                cvss_source = "Configured knowledge base"
+            elif port.port in scores:
+                cvss_score, scored_cve = scores[port.port]
+                cvss_source = f"Nmap NSE vulners ({scored_cve})"
+                evidence_parts.append(f"cvss={cvss_score:.1f} ({scored_cve})")
+
             findings.append(
                 ScanFinding(
                     scan_id=scan_id,
@@ -389,6 +448,8 @@ class FindingBuilder:
                     reference_source=reference_source,
                     verification_required=not reference,
                     source=EvidenceSource.NMAP,
+                    cvss_base_score=cvss_score,
+                    cvss_source=cvss_source,
                 )
             )
 

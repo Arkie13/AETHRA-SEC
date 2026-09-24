@@ -28,7 +28,6 @@ from aethra_sec.ui import login as login_module
 from aethra_sec.ui import theme as theme_module
 from aethra_sec.ui.screens.dashboard import _balanced_columns
 from aethra_sec.ui.screens.hosts import _host_counts
-from aethra_sec.ui.screens.incidents import _incident_counts
 from aethra_sec.ui.widgets.cards import SummaryCell, SummaryStrip
 
 
@@ -182,49 +181,6 @@ class TestSummaryCounts:
             id=1, reference="INC-1", title="t", description="d",
             severity=severity, status=status,
         )
-
-    def test_incidents_are_graded_by_severity(self) -> None:
-        """The question an analyst opens the queue with."""
-        counts = _incident_counts([
-            self._incident(Severity.CRITICAL, IncidentStatus.NEW),
-            self._incident(Severity.HIGH, IncidentStatus.NEW),
-            self._incident(Severity.MEDIUM, IncidentStatus.NEW),
-            self._incident(Severity.LOW, IncidentStatus.NEW),
-        ])
-        assert counts["critical"] == 1
-        assert counts["high"] == 1
-        assert counts["medium"] == 1
-        assert counts["low"] == 1
-
-    def test_settled_incidents_are_not_counted_as_open(self) -> None:
-        """Resolved, closed and false-positive are all finished."""
-        counts = _incident_counts([
-            self._incident(Severity.HIGH, IncidentStatus.RESOLVED),
-            self._incident(Severity.HIGH, IncidentStatus.CLOSED),
-            self._incident(Severity.HIGH, IncidentStatus.FALSE_POSITIVE),
-            self._incident(Severity.HIGH, IncidentStatus.NEW),
-        ])
-        assert counts["resolved"] == 3
-        assert counts["open"] == 1
-
-    def test_every_incident_lands_in_exactly_one_severity_bucket(self) -> None:
-        """A total that does not add up is worse than no total."""
-        incidents = [
-            self._incident(s, IncidentStatus.NEW)
-            for s in (Severity.CRITICAL, Severity.HIGH, Severity.MEDIUM,
-                      Severity.LOW, Severity.INFO)
-        ]
-        counts = _incident_counts(incidents)
-        graded = sum(counts[k] for k in ("critical", "high", "medium", "low"))
-        assert graded == len(incidents)
-        assert counts["open"] + counts["resolved"] == len(incidents)
-
-    def test_an_empty_queue_counts_zero_rather_than_nothing(self) -> None:
-        """A genuine zero is information on a security console."""
-        assert _incident_counts([]) == {
-            "critical": 0, "high": 0, "medium": 0, "low": 0,
-            "open": 0, "resolved": 0,
-        }
 
     def test_hosts_report_online_from_observed_status(self) -> None:
         """Not from "exists in the inventory", which is always true."""

@@ -10,11 +10,10 @@ from aethra_sec.core.events import Event, EventType
 from aethra_sec.models.host import Host
 from aethra_sec.ui.base import Screen
 from aethra_sec.ui.detail_panels import host_chips, host_sections
-from aethra_sec.ui.theme import PALETTE, configure_text_widget
+from aethra_sec.ui.theme import METRICS, PALETTE, configure_text_widget
 from aethra_sec.ui.widgets import (
     Card, Column, DataTable, DetailDrawer, FilterBar, FormDialog, FormField,
-    RowAction, ScrollableFrame, SummaryCell, SummaryStrip, Toolbar, confirm,
-    show_message,
+    Kpi, KpiStrip, RowAction, Toolbar, Workspace, confirm, show_message,
 )
 from aethra_sec.services.host_service import MAX_RESOLVE_BATCH
 from aethra_sec.utils.formatting import format_bytes, format_count
@@ -29,7 +28,6 @@ HOST_COLUMNS = (
     Column("ports", "Open ports", width=85, anchor="e"),
     Column("packets", "Packets", width=95, anchor="e"),
     Column("alerts", "Alerts", width=65, anchor="e"),
-    Column("incidents", "Incidents", width=75, anchor="e"),
     Column("findings", "Findings", width=75, anchor="e"),
     Column("trusted", "Trusted", width=70),
     Column("last_seen", "Last seen", width=140),
@@ -75,72 +73,80 @@ class HostsScreen(Screen):
     # Layout
     # ------------------------------------------------------------------
     def build(self) -> None:
-        """Construct the inventory screen.
+        """An asset workspace: the inventory beside the selected host.
 
-        Wrapped in a :class:`ScrollableFrame`, matching the Alerts screen: a
-        fixed-height page must never leave content unreachable whenever it is
-        taller than the window (§ layout).
+        This was a summary strip, a filter panel, and then a *vertical* split
+        whose lower half - the host detail - carried more weight than the
+        table above it. Several hundred real hosts therefore rendered as about
+        five visible rows, with the detail tabs pushed off the bottom of the
+        page. The inventory now sits beside the detail and takes the full
+        height of the workspace.
         """
-        scroller = ScrollableFrame(self)
-        scroller.pack(fill="both", expand=True)
-        root = scroller.interior
-
-        self._summary = SummaryStrip(
-            root,
-            (
-                SummaryCell("total", "Total hosts", PALETTE.accent,
-                            tooltip="Every host in the inventory."),
-                SummaryCell("online", "Online", PALETTE.ok,
-                            tooltip="Hosts whose last observation reported them up."),
-                SummaryCell("offline", "Not up", PALETTE.offline,
-                            tooltip="Hosts last seen down, or never confirmed up."),
-                SummaryCell("active", "Seen 24h", PALETTE.info,
-                            tooltip="Hosts observed in the last 24 hours."),
-                SummaryCell("elevated", "Elevated risk", PALETTE.high,
-                            tooltip="Hosts at HIGH or CRITICAL risk, from stored "
-                                    "assessment findings."),
-                SummaryCell("trusted", "Trusted", PALETTE.low,
-                            tooltip="Hosts registered as trusted assets."),
-            ),
+        # The same strip the dashboard uses, so a figure means the same thing
+        # and looks the same wherever it appears.
+        self._kpis = KpiStrip(
+            self,
+            [
+                Kpi("total", "Total hosts", PALETTE.accent,
+                    tooltip="Every host in the inventory."),
+                Kpi("online", "Online", PALETTE.ok,
+                    tooltip="Hosts whose last observation reported them up."),
+                Kpi("offline", "Not up", PALETTE.offline,
+                    tooltip="Hosts last seen down, or never confirmed up."),
+                Kpi("active", "Seen 24h", PALETTE.info,
+                    tooltip="Hosts observed in the last 24 hours."),
+                Kpi("elevated", "Elevated risk", PALETTE.high,
+                    tooltip="Hosts at HIGH or CRITICAL risk, from stored "
+                            "assessment findings."),
+                Kpi("trusted", "Trusted", PALETTE.low,
+                    tooltip="Hosts registered as trusted assets."),
+            ],
             fonts=self.fonts,
         )
-        self._summary.pack(fill="x", pady=(0, 10))
+        self._kpis.pack(fill="x", pady=(0, METRICS.space_md))
+        # The screen still addresses figures by key.
+        self._summary = self._kpis
 
-        controls = Card(root, "Search and filter", fonts=self.fonts, padding=18)
-        controls.pack(fill="x")
-        row = FilterBar(controls)
+        workspace = Workspace(self, share=0.52)
+        workspace.pack(fill="both", expand=True)
+
+        # Filters on one line rather than inside a titled panel.
+        row = FilterBar(workspace.toolbar)
         row.pack(fill="x")
-
         ttk.Label(row, text="Search", style="CardMuted.TLabel").pack(side="left")
         self._search_var = tk.StringVar()
-        entry = ttk.Entry(row, textvariable=self._search_var, width=26)
-        entry.pack(side="left", padx=(8, 14))
+        entry = ttk.Entry(row, textvariable=self._search_var, width=24)
+        entry.pack(side="left", padx=(METRICS.space_sm, METRICS.space_md))
         entry.bind("<Return>", lambda _e: self.refresh())
 
         self._risk_var = tk.StringVar(value="All")
         ttk.Label(row, text="Risk", style="CardMuted.TLabel").pack(side="left")
         ttk.Combobox(
-            row, textvariable=self._risk_var, state="readonly", width=14,
+            row, textvariable=self._risk_var, state="readonly", width=13,
             values=["All", "CRITICAL", "HIGH", "MEDIUM", "LOW", "INFORMATIONAL"],
-        ).pack(side="left", padx=(8, 14))
+        ).pack(side="left", padx=(METRICS.space_sm, METRICS.space_md))
 
         self._trusted_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            row, text="Trusted assets only", variable=self._trusted_var,
-            command=self.refresh,
-        ).pack(side="left", padx=(0, 14))
+            row, text="Trusted only", variable=self._trusted_var,
+            command=self.refresh, style="Toolbar.TCheckbutton",
+        ).pack(side="left", padx=(0, METRICS.space_md))
+        ttk.Button(
+            row, text="Apply", style="Accent.TButton", command=self.refresh
+        ).pack(side="left")
 
-        ttk.Button(row, text="Apply", style="Accent.TButton", command=self.refresh).pack(
-            side="left", padx=(0, 6)
+        self._stats_label = ttk.Label(
+            workspace.context, text="", style="CardDim.TLabel",
+            wraplength=1200, justify="left",
         )
-        self._stats_label = ttk.Label(controls, text="", style="CardDim.TLabel")
-        self._stats_label.pack(anchor="w", pady=(8, 0))
+        self._stats_label.pack(anchor="w")
 
-        card = Card(root, "Hosts", fonts=self.fonts, padding=18)
-        card.pack(fill="both", expand=True, pady=(16, 0))
+        # --- master: the inventory --------------------------------------
+        listing = Card(workspace.master_pane, "Hosts", fonts=self.fonts)
+        listing.pack(fill="x")
 
-        toolbar = Toolbar(card)
-        toolbar.pack(fill="x", pady=(0, 6))
+        toolbar = Toolbar(workspace.master_pane)
+        toolbar.pack(fill="x", pady=(0, METRICS.space_sm))
         toolbar.add_button("Resolve hostnames", self._resolve_hostname)
         toolbar.add_button("Mark trusted", self._add_trusted)
         toolbar.add_button("Remove trust", self._remove_trusted)
@@ -148,8 +154,11 @@ class HostsScreen(Screen):
         toolbar.add_button("Export", self._export)
         self._count_label = toolbar.add_label("", side="right")
 
+        # `height` is a floor: the table fills the pane, so the visible row
+        # count follows the window rather than this number.
         self._table = DataTable(
-            card, HOST_COLUMNS, height=9, on_select=self._load_detail,
+            workspace.master_pane, HOST_COLUMNS, height=16,
+            on_select=self._load_detail,
             selectmode="extended",
             on_activate=lambda row: self._open_drawer(row),
             empty_text="No hosts observed yet",
@@ -160,28 +169,31 @@ class HostsScreen(Screen):
                 RowAction("Mark trusted", lambda _row: self._add_trusted()),
                 RowAction("Remove trust", lambda _row: self._remove_trusted()),
                 RowAction("Show alerts for this host", lambda _row: self._open_alerts()),
-                RowAction(
-                    "Show incidents for this host", lambda _row: self._open_incidents()
-                ),
             ],
         )
         self._table.pack(fill="both", expand=True)
 
-        self._detail_card = Card(root, "Host detail", fonts=self.fonts, padding=18)
-        self._detail_card.pack(fill="both", expand=True, pady=(16, 0))
+        # --- detail: the selected host ----------------------------------
+        self._detail_card = Card(
+            workspace.detail_pane, "Host detail",
+            subtitle="select a host", fonts=self.fonts,
+        )
+        self._detail_card.pack(fill="x")
 
-        self._notebook = ttk.Notebook(self._detail_card)
+        self._notebook = ttk.Notebook(workspace.detail_pane)
         self._notebook.pack(fill="both", expand=True)
         self._tabs: dict[str, tk.Text] = {}
         for key, label in (
             ("identity", "Identity & activity"),
             ("ports", "Ports & services"),
-            ("security", "Alerts & incidents"),
+            ("security", "Alerts"),
             ("timeline", "Timeline"),
         ):
             frame = ttk.Frame(self._notebook, style="TFrame")
             self._notebook.add(frame, text=label)
-            text = tk.Text(frame, wrap="word", height=10)
+            # No fixed height: the pane decides, so the text grows with the
+            # window instead of leaving dead space beneath it.
+            text = tk.Text(frame, wrap="word")
             configure_text_widget(text, self.fonts)
             scrollbar = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
             text.configure(yscrollcommand=scrollbar.set)
@@ -232,7 +244,6 @@ class HostsScreen(Screen):
                     "ports": host.open_port_count,
                     "packets": format_count(host.packet_count),
                     "alerts": host.alert_count,
-                    "incidents": host.incident_count,
                     "findings": host.finding_count,
                     "trusted": "yes" if host.is_trusted else "-",
                     "last_seen": format_local(host.last_seen, "%d %b %H:%M:%S"),
@@ -300,8 +311,8 @@ class HostsScreen(Screen):
             chips=host_chips(host),
             sections=host_sections(detail),
             primary=(
-                "Show incidents",
-                lambda ip=host.ip_address: self.app.navigate("incidents", search=ip),
+                "Show alerts",
+                lambda ip=host.ip_address: self.app.navigate("alerts", search=ip),
             ),
         )
         self.status(f"{host.display_name} detail open.")
@@ -348,12 +359,6 @@ class HostsScreen(Screen):
         host = self._selected_host()
         if host is not None:
             self.app.navigate("alerts", search=host.ip_address)
-
-    def _open_incidents(self) -> None:
-        """Show the Incidents screen filtered to the selected host."""
-        host = self._selected_host()
-        if host is not None:
-            self.app.navigate("incidents", search=host.ip_address)
 
     def _load_detail(self, _row: dict[str, Any]) -> None:
         """Load the selected host's full detail."""
@@ -453,7 +458,6 @@ class HostsScreen(Screen):
         self._write("ports", "\n".join(port_lines))
 
         alerts = detail.get("alerts", [])
-        incidents = detail.get("incidents", [])
         security = [f"IDS ALERTS ({len(alerts)})", ""]
         for alert in alerts[:40]:
             security.append(
@@ -462,14 +466,6 @@ class HostsScreen(Screen):
             )
         if not alerts:
             security.append("  No IDS alerts involve this host.")
-        security.extend(["", f"INCIDENTS ({len(incidents)})", ""])
-        for incident in incidents[:40]:
-            security.append(
-                f"  {incident.reference}  [{incident.severity}] {incident.title}"
-            )
-            security.append(f"      evidence: {incident.source_label}")
-        if not incidents:
-            security.append("  No incidents involve this host.")
         self._write("security", "\n".join(security))
 
         timeline = detail.get("timeline", [])
@@ -667,6 +663,6 @@ class HostsScreen(Screen):
     def handle_event(self, event: Event) -> None:
         """Refresh after events that change the inventory."""
         if event.type in (
-            EventType.NMAP_SCAN_COMPLETED, EventType.INCIDENT_CREATED,
+            EventType.NMAP_SCAN_COMPLETED,
         ):
             self.refresh()

@@ -256,9 +256,10 @@ An attack is input to a monitoring system, not a reason for one to stop, so the
 live view is built to stay responsive while the packet rate is not under
 anyone's control:
 
-* **A protocol view** — All, ICMP, TCP, UDP, ARP, DNS, HTTP, HTTPS — filters on
-  arrival as well as on screen. Watching ICMP means a TCP flood costs the
-  interface nothing, and switching the view re-filters the rows already shown.
+* **The display filter is applied before packets reach the screen.** The
+  capture service's packet view evaluates it on its own thread, so a flood of
+  traffic nobody asked to see costs the interface nothing, and changing the
+  filter re-evaluates the packets already retained without touching capture.
 * **Table writes are coalesced** onto a fixed cadence (250 ms) rather than
   drawn per batch, so the cost of displaying a flood is bounded by the clock
   instead of by the sender.
@@ -274,13 +275,37 @@ decoded, analysed by every detection rule, counted in the aggregates and
 written to the database — and the screen says so, stating the arrival rate and
 what it is not showing rather than going quiet.
 
-Interface selector, capture filter (BPF), **Start capture** / **Stop capture**,
-**Resume display** (pauses the scrolling table without stopping capture),
-**Filter** and **Refresh**.
+Capture strip: interface selector, **CAPTURE FILTER (BPF)** (applied by dumpcap
+before capture; changing it restarts capture), **Start capture** /
+**Stop capture**.
 
-Live packet table (time, source, destination, protocol, length, info), a packet
-detail panel for the selected row, per-second traffic charts, protocol split,
-top talkers and top destination ports.
+Display filter bar (never restarts capture):
+
+* presets **All Traffic, Incoming, Outgoing, Transit** and **HTTP, HTTPS/TLS,
+  Web, Sites, TCP, UDP, ICMP, DNS, ARP** (a direction and a protocol combine;
+  pressing the active protocol again clears it), and **Clear Filter**.
+  **Sites** lists the names this computer connected to or looked up - HTTPS
+  server names (SNI), HTTP Host headers and DNS queries - never page content;
+* a **DISPLAY FILTER** expression (a validated Wireshark-style subset; an
+  invalid expression shows **INVALID FILTER** with the reason and the previous
+  filter stays active), plus **IP** and **PORT** searches scoped to source,
+  destination or either;
+* an **ACTIVE FILTER** line, and a counts line: **CAPTURED** (never reset by a
+  filter change), **DISPLAYED** (matched), **LISTED** (rows in the table),
+  totals per direction, and totals per protocol for the matched packets;
+* **Pause display**, **Clear display**, **Export view**.
+
+Live packet table (time, source, destination, protocol, src port, dst port,
+length, direction, info), a packet detail panel for the selected row (HTTP
+request and response fields, TLS handshake, SNI and versions, TCP flags and
+sequence numbers, ARP sender and target, DNS query; N/A where the frame does
+not carry the field), per-second traffic charts, protocol split, top talkers
+and top destination ports.
+
+Empty states name what was asked for: "No HTTP traffic captured.", "No
+HTTPS/TLS traffic captured.", "No incoming traffic captured.". An empty Transit
+view, or an IP search for another device that finds nothing, adds "Traffic is
+not visible from the current capture interface." with the reason.
 
 The capture indicator reads **"Capture NOT STARTED"** until TShark is actually
 running. When the ingest queue is saturated the dropped-packet count is shown
@@ -306,7 +331,42 @@ Findings state what Nmap observed. Where no configured knowledge source
 matched, the finding says further verification is required rather than naming a
 weakness that was not established.
 
-*Empty state*: "No scan selected." / no findings recorded.
+### Open ports
+
+The results tab is a vertical split: discovered hosts above, and below them a
+horizontal split of **Open ports** and **Security findings**. Both dividers can
+be dragged. (They are splits rather than stacked panels because two panels
+that each asked for more height than the window had left the ports table
+clipped to a sliver — the count of open ports was readable while the ports
+themselves were not.)
+
+Selecting a host fills the ports panel; the first host is selected
+automatically, so a single-host scan shows its ports without being asked.
+The panel header names the host and the count — *"192.168.1.14 · 6 open of
+1000 port(s) recorded"* — and the scan summary lists the open ports inline
+as well as counting them.
+
+| Column | Source |
+| --- | --- |
+| Port / Proto / State | Nmap's port element, verbatim |
+| Service | Nmap's service name, or `unknown` |
+| Version | product and version, or `no version detected` on an open port |
+| Risk | the risk level of the finding derived from **that** port |
+| Finding | that finding's title, or `no finding raised` |
+
+Where several findings share a port the most serious is shown, because that is
+the one that decides whether the port needs attention. A port with no finding
+says so rather than borrowing a neighbour's risk — an open port is not
+automatically a vulnerability.
+
+**Open ports only** is on by default; clearing it shows every port the scan
+recorded, including closed and filtered. **Port detail** (or double-click, or
+Enter) opens the port in the drawer with its reason, CPE, tunnel and the full
+finding rationale. **View open ports** on a host's right-click menu jumps
+straight there with the keyboard on the list.
+
+*Empty state*: "No scan selected." / "Select a host to see the ports this scan
+found" / no findings recorded.
 
 ---
 

@@ -22,7 +22,7 @@ from tkinter import ttk
 from typing import Callable
 
 from aethra_sec.core.application import ApplicationContext
-from aethra_sec.core.errors import AethraError
+from aethra_sec.core.errors import AethraError, user_facing
 from aethra_sec.ui import dispatch
 from aethra_sec.ui.theme import PALETTE, Fonts
 from aethra_sec.utils.logging import get_logger
@@ -349,7 +349,7 @@ class PasswordRecoveryDialog(tk.Toplevel):
                 dispatch.post(lambda: on_error(message))
             except Exception as exc:  # noqa: BLE001
                 LOGGER.exception("Password recovery call failed unexpectedly.")
-                message = f"The request could not be completed: {exc}"
+                message = user_facing(exc)
                 dispatch.post(lambda: on_error(message))
             else:
                 dispatch.post(lambda: on_success(result))

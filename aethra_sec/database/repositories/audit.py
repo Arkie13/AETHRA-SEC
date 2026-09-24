@@ -66,6 +66,74 @@ class AuditRepository(Repository):
             record_hash=as_text(row.get("record_hash")),
         )
 
+    def append_chained(
+        self, record: AuditRecord, compute: Any, genesis: str
+    ) -> tuple[int, str]:
+        """Append ``record``, linking it to whatever is genuinely last.
+
+        The head is read inside this transaction and locked, so two appenders -
+        two windows, a background job, a second process - cannot both link to
+        the same predecessor. That is what produced the chain mismatches PT-04
+        found: each service instance cached the head it saw at start-up and
+        kept linking to it, so a log that had never been touched verified as
+        broken. The cache is gone; the database is the head.
+
+        Args:
+            record: the record to append. Its ``previous_hash`` and
+                ``record_hash`` are filled in here.
+            compute: ``compute(record, previous_hash) -> str``, the chained
+                hash function.
+            genesis: the hash an empty chain starts from. Both are passed in so
+                persistence does not import the security package, which imports
+                this one.
+
+        Returns:
+            ``(record_id, record_hash)``.
+        """
+        with self.db.transaction() as cursor:
+            # FOR UPDATE holds the last row until this transaction commits, so
+            # a concurrent append waits here rather than racing for the head.
+            cursor.execute(
+                "SELECT id, record_hash FROM audit_logs ORDER BY id DESC LIMIT 1 "
+                "FOR UPDATE"
+            )
+            head = cursor.fetchone()
+            record.previous_hash = (head or {}).get("record_hash") or genesis
+
+            cursor.execute(
+                "INSERT INTO audit_logs (occurred_at, user_id, username, action, "
+                "category, target_type, target_id, result, detail, host_context, "
+                "source, previous_hash, record_hash) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    to_db(record.occurred_at or utcnow()),
+                    record.user_id,
+                    record.username[:64],
+                    record.action[:64],
+                    record.category[:32],
+                    record.target_type[:48],
+                    record.target_id[:64],
+                    record.result[:16],
+                    record.detail,
+                    record.host_context[:128],
+                    record.source[:24],
+                    record.previous_hash,
+                    "",
+                ),
+            )
+            record_id = int(cursor.lastrowid)
+            record.id = record_id
+
+            # The id is part of the hashed material, so it can only be computed
+            # once the row exists. Both statements commit together: a record
+            # with a provisional empty hash is never visible to a reader.
+            record.record_hash = compute(record, record.previous_hash)
+            cursor.execute(
+                "UPDATE audit_logs SET record_hash = %s WHERE id = %s",
+                (record.record_hash, record_id),
+            )
+        return record_id, record.record_hash
+
     def append(self, record: AuditRecord) -> int:
         """Insert an audit record and return its id."""
         return self.db.insert(
@@ -89,6 +157,51 @@ class AuditRepository(Repository):
                 record.record_hash,
             ),
         )
+
+    def rehash_chain(
+        self, compute: Any, genesis: str, batch_size: int = 500
+    ) -> tuple[int, int]:
+        """Recompute the chain over every record, in id order.
+
+        Only the two hash columns are written. The record's own fields are read
+        and hashed but never updated, so this cannot alter evidence even by
+        accident - there is no UPDATE here that names an evidence column.
+
+        Each batch commits as one transaction, so an interrupted run leaves a
+        prefix that is consistent rather than a chain half in each format.
+
+        Returns:
+            ``(examined, rewritten)``.
+        """
+        previous_hash = genesis
+        examined = 0
+        rewritten = 0
+        cursor_id = 0
+
+        while True:
+            batch = self.iterate_for_verification(cursor_id, batch_size)
+            if not batch:
+                break
+            with self.db.transaction() as cursor:
+                for record in batch:
+                    examined += 1
+                    fresh = compute(record, previous_hash)
+                    if (
+                        fresh != record.record_hash
+                        or record.previous_hash != previous_hash
+                    ):
+                        cursor.execute(
+                            "UPDATE audit_logs SET previous_hash = %s, "
+                            "record_hash = %s WHERE id = %s",
+                            (previous_hash, fresh, record.id),
+                        )
+                        rewritten += 1
+                    previous_hash = fresh
+            cursor_id = int(batch[-1].id or cursor_id)
+            if len(batch) < batch_size:
+                break
+
+        return examined, rewritten
 
     def last_record(self) -> AuditRecord | None:
         """Most recently inserted audit record (the hash-chain head)."""

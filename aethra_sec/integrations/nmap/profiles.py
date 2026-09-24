@@ -11,6 +11,8 @@ port state, service/version detection and OS detection only (§16, §89).
 
 from __future__ import annotations
 
+import re
+
 import os
 from dataclasses import dataclass, field
 
@@ -32,6 +34,11 @@ TIMING_DESCRIPTIONS: dict[str, str] = {
     "T4": "Aggressive - faster; suitable for a healthy local LAN.",
     "T5": "Insane - fastest; may miss results on a congested network.",
 }
+
+
+#: Nmap device names as it reports them: letters, digits, dots, underscores
+#: and hyphens. Nothing else may reach the argument list.
+_INTERFACE_PATTERN = re.compile(r"[A-Za-z0-9_.\-]{1,32}")
 
 
 @dataclass(frozen=True)
@@ -181,6 +188,10 @@ class ScanRequest:
     timing: str
     arguments: tuple[str, ...]
     script_categories: tuple[str, ...] = field(default_factory=tuple)
+    #: True when ``-Pn`` was added, so the record shows discovery was skipped.
+    skip_host_discovery: bool = False
+    #: Interface probes were pinned to, empty when Nmap chose for itself.
+    interface: str = ""
 
     @property
     def argument_string(self) -> str:
@@ -234,6 +245,8 @@ def build_scan_request(
     port_spec: str = "",
     timing: str = DEFAULT_TIMING,
     script_categories: tuple[str, ...] = (),
+    skip_host_discovery: bool = False,
+    interface: str = "",
 ) -> ScanRequest:
     """Validate operator choices and assemble the Nmap argument list.
 
@@ -245,6 +258,15 @@ def build_scan_request(
         timing: one of :data:`TIMING_TEMPLATES`.
         script_categories: optional NSE categories, filtered against
             :data:`ALLOWED_SCRIPT_CATEGORIES`.
+        interface: Nmap device name (``eth9``) to send from, or empty to let
+            Nmap choose. Validated against a strict device grammar, so it can
+            never carry operator text into the argument list.
+        skip_host_discovery: add ``-Pn``, so Nmap scans the target instead of
+            first deciding whether it is up. Needed for a host that does not
+            answer discovery probes - one behind a firewall that drops ICMP,
+            or one Nmap probes over the wrong interface because two adapters
+            claim the same subnet. It changes only whether discovery runs; the
+            port results reported afterwards are still Nmap's own.
 
     Returns:
         A :class:`ScanRequest`.
@@ -263,6 +285,24 @@ def build_scan_request(
     safe_timing = validate_choice(timing or DEFAULT_TIMING, TIMING_TEMPLATES, "Timing")
 
     arguments: list[str] = list(profile.arguments)
+    # -Pn goes first so it is visible at the head of the recorded command
+    # line. A discovery-only profile has nothing left to do without discovery,
+    # so it never takes it.
+    if skip_host_discovery and "-sn" not in arguments:
+        arguments.insert(0, "-Pn")
+
+    # -e pins the interface probes leave from. Needed where two adapters claim
+    # one subnet and Nmap's own choice cannot reach the target.
+    safe_interface = ""
+    if interface:
+        safe_interface = (interface or "").strip()
+        if not _INTERFACE_PATTERN.fullmatch(safe_interface):
+            raise ValidationError(
+                f"Invalid interface name '{interface}'. Use a device name as "
+                "Nmap reports it (for example 'eth0')."
+            )
+        arguments.extend(["-e", safe_interface])
+
     arguments.append(f"-{safe_timing}")
 
     effective_ports = ""
@@ -313,4 +353,6 @@ def build_scan_request(
         timing=safe_timing,
         arguments=tuple(arguments),
         script_categories=tuple(sorted(set(cleaned_scripts))),
+        skip_host_discovery=skip_host_discovery and "-sn" not in profile.arguments,
+        interface=safe_interface,
     )

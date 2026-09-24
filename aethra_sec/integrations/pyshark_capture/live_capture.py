@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import queue
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -25,6 +25,7 @@ from aethra_sec.integrations.pyshark_capture.interfaces import (
     TSHARK_MISSING_MESSAGE,
     probe_tshark,
 )
+from aethra_sec.integrations.pyshark_capture import jobs
 from aethra_sec.integrations.pyshark_capture.mapper import map_packet
 from aethra_sec.models.traffic import CapturedPacket
 from aethra_sec.utils.logging import get_logger
@@ -77,6 +78,7 @@ class LiveCaptureReader:
         bpf_filter: str = "",
         tshark_path: Path | None = None,
         use_json: bool = False,
+        output_file: Path | None = None,
         on_error: Callable[[str], None] | None = None,
         on_started: Callable[[], None] | None = None,
         on_stopped: Callable[[str], None] | None = None,
@@ -90,6 +92,10 @@ class LiveCaptureReader:
             tshark_path: explicit tshark executable.
             use_json: use TShark's JSON output; faster but exposes fewer
                 fields. PDML (the default) is preferred for analysis fidelity.
+            output_file: pcap TShark writes every captured frame to. This is
+                what makes packet inspection possible at all: the live path
+                keeps only a summary per packet, so the inspector re-reads the
+                frame from this file to obtain its real fields and bytes.
             on_error / on_started / on_stopped: lifecycle callbacks invoked on
                 the reader thread.
         """
@@ -99,12 +105,20 @@ class LiveCaptureReader:
         self._queue = packet_queue
         self._tshark_path = tshark_path
         self._use_json = use_json
+        self._output_file = output_file
+        #: 1-based position of the next frame in ``output_file``. Incremented
+        #: for every frame TShark yields - including ones that fail to map -
+        #: because the pcap numbers frames in arrival order regardless of
+        #: whether this process could decode them.
+        self._frame_index = 0
         self._on_error = on_error
         self._on_started = on_started
         self._on_stopped = on_stopped
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._capture: Any = None
+        #: Capture children already placed under the process job.
+        self._adopted: set[int] = set()
         self._stop_reason = ""
 
     # ------------------------------------------------------------------
@@ -172,39 +186,130 @@ class LiveCaptureReader:
             thread.join(timeout=timeout)
         self.counters.stopped_at = utcnow()
 
-    def _terminate_tshark(self) -> None:
-        """Terminate the TShark child process by pid.
+    def _child_pids(self) -> list[int]:
+        """Process ids of the capture children PyShark started.
 
-        PyShark's own ``close()`` drives the capture's asyncio loop, which
-        belongs to the reader thread; calling it from the UI thread is unsafe.
-        Signalling the process by pid is thread-safe on both Windows and POSIX.
+        Every pid seen here is also adopted into this process's Job Object, so
+        that a forced kill of the console - Task Manager, ``Stop-Process
+        -Force``, a crash - is cleaned up by the kernel rather than depending
+        on an exit path that will not run. PyShark spawns TShark itself, so
+        there is no spawn to intercept; adoption on first sight is the
+        earliest point available, and it is idempotent.
         """
         capture = self._capture
         if capture is None:
-            return
+            return []
         pids: list[int] = []
         for attribute in ("_running_processes", "_current_tshark"):
             candidate = getattr(capture, attribute, None)
             if candidate is None:
                 continue
-            processes = candidate if isinstance(candidate, (set, list, tuple)) else [candidate]
-            for process in processes:
+            group = candidate if isinstance(candidate, (list, tuple, set)) else [candidate]
+            for process in group:
                 pid = getattr(process, "pid", None)
                 if isinstance(pid, int) and pid > 0:
                     pids.append(pid)
+        found = sorted(set(pids))
+        for pid in found:
+            if pid not in self._adopted:
+                self._adopted.add(pid)
+                jobs.adopt(pid)
+        return found
 
-        for pid in set(pids):
+    def capture_process_alive(self) -> bool:
+        """True while a capture child process is actually running.
+
+        The thread being alive is not evidence of capture: with a filter
+        TShark rejects, dumpcap exits within a second while the thread waits
+        for packets forever. This asks the operating system instead.
+
+        A reader that has not yet spawned its child reports False; the caller
+        distinguishes "starting" from "failed" by how long that lasts.
+
+        This is asked on every interface tick, so it must be inert. It must
+        never be written as ``os.kill(pid, 0)``: that is a POSIX idiom, and on
+        Windows ``signal.CTRL_C_EVENT`` *is* 0, so ``os.kill`` routes it to
+        ``GenerateConsoleCtrlEvent`` and delivers a real Ctrl+C to that process
+        group. Called from a UI timer against a console-attached TShark, it
+        interrupts the console the console itself is running in.
+
+        psutil is used instead because it also settles the harder question:
+        Windows recycles process ids quickly, and psutil compares the process
+        creation time, so a pid that now belongs to something else reads as
+        gone rather than as our capture.
+        """
+        pids = self._child_pids()
+        if not pids:
+            return False
+
+        try:
+            import psutil
+        except Exception:  # noqa: BLE001 - psutil absent
+            # Without a way to check, say nothing rather than something wrong.
+            # Reporting "dead" here would mark a healthy capture FAILED.
+            LOGGER.debug("psutil is unavailable; capture liveness unverified.")
+            return True
+
+        for pid in pids:
             try:
-                import psutil
+                process = psutil.Process(pid)
+                if process.is_running() and process.status() != psutil.STATUS_ZOMBIE:
+                    return True
+            except psutil.Error:
+                continue
+        return False
 
-                proc = psutil.Process(pid)
-                proc.terminate()
-                try:
-                    proc.wait(timeout=3)
-                except psutil.TimeoutExpired:
-                    proc.kill()
+    def _terminate_tshark(self) -> None:
+        """Terminate the capture children, and their children.
+
+        PyShark's own ``close()`` drives the capture's asyncio loop, which
+        belongs to the reader thread; calling it from the UI thread is unsafe.
+        Signalling by pid is thread-safe on both Windows and POSIX.
+
+        The whole tree has to go, not just the process PyShark holds. TShark
+        does not capture: it spawns ``dumpcap``, which is what actually opens
+        the adapter. Terminating TShark alone left dumpcap running with the
+        interface still open - it outlived the console that started it, kept
+        writing, and the next capture had to contend with it for the adapter.
+        Children are terminated before their parent, so a parent cannot respawn
+        one on its way out.
+        """
+        pids = self._child_pids()
+        if not pids:
+            return
+
+        try:
+            import psutil
+        except Exception:  # noqa: BLE001 - psutil absent; nothing else can do this
+            LOGGER.debug("psutil is unavailable; capture children left to exit.")
+            return
+
+        doomed: list[Any] = []
+        for pid in pids:
+            try:
+                parent = psutil.Process(pid)
             except Exception:  # noqa: BLE001 - already gone, or not ours
-                LOGGER.debug("Could not terminate TShark pid %s.", pid, exc_info=True)
+                continue
+            try:
+                doomed.extend(parent.children(recursive=True))
+            except Exception:  # noqa: BLE001 - it exited while being inspected
+                pass
+            doomed.append(parent)
+
+        for process in doomed:
+            try:
+                process.terminate()
+            except Exception:  # noqa: BLE001
+                LOGGER.debug("Could not signal pid %s.", process.pid, exc_info=True)
+
+        _, survivors = psutil.wait_procs(doomed, timeout=3)
+        for process in survivors:
+            try:
+                process.kill()
+            except Exception:  # noqa: BLE001
+                LOGGER.debug("Could not kill pid %s.", process.pid, exc_info=True)
+        if survivors:
+            psutil.wait_procs(survivors, timeout=2)
 
     # ------------------------------------------------------------------
     # Reader thread
@@ -235,6 +340,20 @@ class LiveCaptureReader:
                 kwargs["bpf_filter"] = self.bpf_filter
             if self._tshark_path:
                 kwargs["tshark_path"] = str(self._tshark_path)
+            if self._output_file is not None:
+                try:
+                    self._output_file.parent.mkdir(parents=True, exist_ok=True)
+                    kwargs["output_file"] = str(self._output_file)
+                except OSError as exc:
+                    # An unwritable capture directory must not stop capture -
+                    # it costs packet inspection, not monitoring. The reason is
+                    # recorded so the inspector can say why it has no frame.
+                    LOGGER.warning(
+                        "Cannot write the capture file %s (%s); packet "
+                        "inspection will be unavailable for this session.",
+                        self._output_file, exc,
+                    )
+                    self._output_file = None
 
             capture = pyshark.LiveCapture(**kwargs)
             self._capture = capture
@@ -289,11 +408,21 @@ class LiveCaptureReader:
 
     def _handle(self, raw_packet: Any) -> None:
         """Map one packet and enqueue it, applying backpressure when full."""
+        # Counted before the mapping is attempted, so the index keeps step with
+        # the pcap even when this packet cannot be decoded here.
+        self._frame_index += 1
         mapped = map_packet(raw_packet, self.interface)
         if mapped is None:
             with self.counters._lock:  # noqa: SLF001 - counters own this lock
                 self.counters.decode_errors += 1
             return
+
+        if self._output_file is not None:
+            mapped = replace(
+                mapped,
+                pcap_path=str(self._output_file),
+                frame_index=self._frame_index,
+            )
 
         with self.counters._lock:  # noqa: SLF001
             self.counters.captured += 1

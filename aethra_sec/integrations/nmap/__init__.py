@@ -6,6 +6,7 @@ from aethra_sec.integrations.nmap.parser import (
     FindingBuilder,
     VulnKnowledgeEntry,
     extract_script_references,
+    extract_script_scores,
     parse_scan_result,
 )
 from aethra_sec.integrations.nmap.profiles import (
@@ -44,6 +45,7 @@ __all__ = [
     "available_profiles",
     "build_scan_request",
     "extract_script_references",
+    "extract_script_scores",
     "find_nmap",
     "has_raw_socket_privilege",
     "parse_scan_result",

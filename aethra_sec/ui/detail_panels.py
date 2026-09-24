@@ -1,9 +1,9 @@
 """Turn a stored record into the sections a details drawer renders.
 
-Three screens need to answer "what is this device?" without leaving the page -
-the incident investigation, the host inventory and an assessment result - and
-they must answer it identically. The shaping lives here so the drawer widget
-stays free of domain knowledge and the three callers cannot drift apart.
+Two screens need to answer "what is this device?" without leaving the page -
+the host inventory and an assessment result - and they must answer it
+identically. The shaping lives here so the drawer widget
+stays free of domain knowledge and the callers cannot drift apart.
 
 Every value comes from a record the services returned. Where the record holds
 nothing, the line says so; nothing here substitutes a plausible-looking value.
@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import Any
 
 from aethra_sec.models.host import Host
-from aethra_sec.models.scan import ScanHostResult
+from aethra_sec.models.scan import PortResult, ScanFinding, ScanHostResult
 from aethra_sec.ui.widgets.drawer import DrawerSection
 from aethra_sec.utils.formatting import format_bytes, format_count
 from aethra_sec.utils.timeutil import format_local
@@ -39,7 +39,7 @@ def host_sections(detail: dict[str, Any]) -> list[DrawerSection]:
 
     Args:
         detail: the bundle the host service returns - the host itself plus its
-            observations, ports, findings, scans, alerts and incidents.
+            observations, ports, findings, scans and alerts.
     """
     host: Host | None = detail.get("host")
     if host is None:
@@ -49,7 +49,6 @@ def host_sections(detail: dict[str, Any]) -> list[DrawerSection]:
     ports = detail.get("open_ports", [])
     findings = detail.get("findings", [])
     alerts = detail.get("alerts", [])
-    incidents = detail.get("incidents", [])
     scans = detail.get("scans", [])
 
     identity = DrawerSection(
@@ -57,12 +56,23 @@ def host_sections(detail: dict[str, Any]) -> list[DrawerSection]:
         rows=[
             ("IP address", host.ip_address),
             ("Hostname", host.hostname_text),
+            # The identity column says only "Unknown"; here is which absence
+            # it is - a lookup that came back empty, or one never made.
+            ("Hostname lookup", host.hostname_lookup_text),
             ("MAC address", _or_unknown(host.mac_address, "not observed")),
             ("Vendor", _or_unknown(host.vendor, "not identified")),
             ("Operating system", host.os_text),
             ("Status", str(host.status)),
             ("Risk level", str(host.risk_level)),
             ("Discovered by", host.discovery_source.label),
+            (
+                "Discovery evidence",
+                host.discovery_detail or "not recorded for this row",
+            ),
+            (
+                "Discovered on",
+                host.discovery_interface or "not recorded for this row",
+            ),
             (
                 "Trusted asset",
                 f"yes - {host.trust_note}" if host.is_trusted else "no",
@@ -132,21 +142,6 @@ def host_sections(detail: dict[str, Any]) -> list[DrawerSection]:
 
     sections.append(
         DrawerSection(
-            f"Related incidents ({len(incidents)})",
-            text=(
-                "\n".join(
-                    f"{incident.reference}  [{incident.severity}] {incident.title}\n"
-                    f"    evidence: {incident.source_label}"
-                    for incident in incidents[:20]
-                )
-                if incidents
-                else "No incidents involve this host."
-            ),
-        )
-    )
-
-    sections.append(
-        DrawerSection(
             f"Related alerts ({len(alerts)})",
             text=(
                 "\n".join(
@@ -175,6 +170,87 @@ def host_sections(detail: dict[str, Any]) -> list[DrawerSection]:
     return sections
 
 
+def port_chips(port: PortResult, finding: ScanFinding | None) -> list[tuple[str, str]]:
+    """Header chips for one port: its state and the risk raised from it."""
+    chips = [(port.state.upper(), "state")]
+    if finding is not None:
+        chips.insert(0, (str(finding.risk_level), "severity"))
+    return chips
+
+
+def port_sections(
+    port: PortResult, finding: ScanFinding | None
+) -> list[DrawerSection]:
+    """Everything this scan recorded about one port.
+
+    The port and the finding derived from it are shown together because that
+    is the question an operator is actually asking - not "what is on 445" and
+    separately "why does 445 matter", but both at once.
+    """
+    sections = [
+        DrawerSection(
+            "Port",
+            subtitle="exactly as Nmap reported it",
+            rows=[
+                ("Port", f"{port.port}/{port.protocol.upper()}"),
+                ("State", port.state.upper()),
+                ("Reason", _or_unknown(port.reason, "not recorded")),
+                ("Service", _or_unknown(port.service, "not identified")),
+                ("Product", _or_unknown(port.product, "no banner")),
+                ("Version", _or_unknown(port.version, "not detected")),
+                ("Extra information", _or_unknown(port.extra_info, "-")),
+                ("CPE", _or_unknown(port.cpe, "-")),
+                ("Tunnel", _or_unknown(port.tunnel, "none")),
+            ],
+        )
+    ]
+    if finding is None:
+        sections.append(
+            DrawerSection(
+                "Finding",
+                text=(
+                    "No finding was raised for this port.\n\n"
+                    "An open port is not automatically a vulnerability. This "
+                    "one matched no configured knowledge entry and no rule "
+                    "the risk engine applies, so nothing is claimed about it."
+                    if port.is_open
+                    else "This port is not open, so no finding applies to it."
+                ),
+            )
+        )
+        return sections
+
+    sections.append(
+        DrawerSection(
+            f"Finding · {finding.risk_level}",
+            rows=[
+                ("Title", finding.title),
+                ("Risk level", str(finding.risk_level)),
+                ("Status", finding.status_text),
+                ("Reference", _or_unknown(finding.reference_text, "none recorded")),
+            ],
+        )
+    )
+    sections.append(
+        DrawerSection(
+            "Why this matters",
+            text="\n\n".join(
+                part
+                for part in (
+                    f"Observed: {finding.observation}" if finding.observation else "",
+                    f"Concern: {finding.concern}" if finding.concern else "",
+                    f"Risk rationale: {finding.risk_rationale}"
+                    if finding.risk_rationale
+                    else "",
+                )
+                if part
+            )
+            or "No further explanation was recorded for this finding.",
+        )
+    )
+    return sections
+
+
 def scan_host_chips(host: ScanHostResult) -> list[tuple[str, str]]:
     """Header chips for a scanned host: its highest finding risk and status."""
     return [(str(host.highest_risk), "severity"), (str(host.status), "state")]
@@ -193,14 +269,30 @@ def scan_host_sections(host: ScanHostResult, os_text: str) -> list[DrawerSection
             subtitle="as recorded by this assessment",
             rows=[
                 ("IP address", host.ip_address),
-                ("Hostname", _or_unknown(host.hostname, "not resolved")),
+                ("Hostname", host.hostname_text),
+                ("Hostname source", _or_unknown(host.hostname_source, "-")),
                 ("MAC address", _or_unknown(host.mac_address, "not observed")),
                 ("Vendor", _or_unknown(host.vendor, "not identified")),
                 ("Operating system", os_text),
+                ("OS source", _or_unknown(host.os_source, "-")),
+                ("OS CPE", _or_unknown(host.os_cpe, "-")),
                 ("Status", str(host.status)),
                 ("Open ports", str(len(open_ports))),
                 ("Highest risk", str(host.highest_risk)),
             ],
+        ),
+        # Why a field says "Unknown" is as useful as the field itself: it is
+        # the difference between "this host refuses to say" and "we were not
+        # allowed to ask". Shown only when there is something to explain.
+        *(
+            [
+                DrawerSection(
+                    "Why identity is incomplete",
+                    text="\n".join(host.identity_notes),
+                )
+            ]
+            if host.identity_notes
+            else []
         ),
         DrawerSection(
             f"Ports and services ({len(host.ports)})",
@@ -233,40 +325,3 @@ def scan_host_sections(host: ScanHostResult, os_text: str) -> list[DrawerSection
         ),
     ]
     return sections
-
-
-def incident_device_chips(device: dict[str, Any]) -> list[tuple[str, str]]:
-    """Header chips for a device named by an incident's evidence."""
-    chips: list[tuple[str, str]] = []
-    if device.get("risk"):
-        chips.append((str(device["risk"]), "severity"))
-    if device.get("status"):
-        chips.append((str(device["status"]), "state"))
-    return chips
-
-
-def unknown_device_sections(device: dict[str, Any]) -> list[DrawerSection]:
-    """Sections for an address the host inventory has never seen.
-
-    The incident named it, so it is real; the inventory simply holds nothing
-    about it yet, and the drawer says exactly that rather than guessing.
-    """
-    return [
-        DrawerSection(
-            "Address",
-            rows=[
-                ("IP address", str(device.get("ip", ""))),
-                ("Role in this incident", str(device.get("role", "-"))),
-            ],
-        ),
-        DrawerSection(
-            "Host inventory",
-            text=(
-                "This address is not in the host inventory, so no hostname, MAC "
-                "address, operating system, port or risk information is stored "
-                "for it.\n\n"
-                "It will appear in the inventory once packet capture observes "
-                "it or an authorised assessment reaches it."
-            ),
-        ),
-    ]

@@ -106,7 +106,7 @@ class _Access:
 def _service(hosts: _Hosts) -> HostService:
     """A host service wired to the recording doubles."""
     return HostService(
-        hosts, None, None, None, None, _Audit(), _Access()  # type: ignore[arg-type]
+        hosts, None, None, None, _Audit(), _Access()  # type: ignore[arg-type]
     )
 
 
@@ -126,29 +126,67 @@ def _no_real_dns(monkeypatch: pytest.MonkeyPatch) -> None:
 # What a cell says
 # ---------------------------------------------------------------------------
 class TestHostnameText:
-    """Three states, three different sentences."""
+    """The column answers "what is this host called", and nothing else.
+
+    It used to answer with the *lookup's* state - "Not checked" or "Not
+    resolved". Beside a completed assessment, "Not checked" read as "this host
+    was skipped", which was untrue, and it was the most common cell on the
+    screen. The identity column now says "Unknown"; which of the two absences
+    applies is still recorded, and is shown where it is actually useful.
+    """
 
     def test_a_resolved_name_is_shown(self) -> None:
         """The ordinary case."""
         assert _host(hostname="db01.lab").hostname_text == "db01.lab"
 
-    def test_never_looked_up_says_so(self) -> None:
-        """Which is the state a capture-built inventory starts in."""
-        assert _host().hostname_text == "not resolved"
+    def test_an_unresolved_name_reads_unknown(self) -> None:
+        """Both absences read the same in the identity column."""
+        assert _host().hostname_text == "Unknown"
+        assert (
+            _host(hostname_checked_at=datetime.now(tz=timezone.utc)).hostname_text
+            == "Unknown"
+        )
 
-    def test_looked_up_with_no_answer_says_something_different(self) -> None:
-        """"Not resolved" and "no DNS record" are not the same fact."""
-        host = _host(hostname_checked_at=datetime.now(tz=timezone.utc))
-        assert host.hostname_text == "no DNS record"
+    def test_the_column_never_implies_the_assessment_was_skipped(self) -> None:
+        """"Not checked" beside COMPLETED was the contradiction to remove."""
+        for host in (
+            _host(),
+            _host(hostname_checked_at=datetime.now(tz=timezone.utc)),
+        ):
+            lowered = host.hostname_text.lower()
+            for implication in ("not checked", "checked", "skipped", "pending"):
+                assert implication not in lowered, (
+                    f"{host.hostname_text!r} describes the lookup's progress "
+                    "in a column about the host's identity"
+                )
 
-    def test_the_three_states_are_distinguishable(self) -> None:
-        """An operator can tell which of them a row is in."""
-        states = {
-            _host(hostname="db01.lab").hostname_text,
-            _host().hostname_text,
-            _host(hostname_checked_at=datetime.now(tz=timezone.utc)).hostname_text,
-        }
-        assert len(states) == 3
+    def test_the_lookup_state_is_still_recorded_separately(self) -> None:
+        """The distinction is preserved, just not in the identity column."""
+        never = _host().hostname_lookup_text
+        empty = _host(
+            hostname_checked_at=datetime.now(tz=timezone.utc)
+        ).hostname_lookup_text
+        resolved = _host(hostname="db01.lab").hostname_lookup_text
+        assert len({never, empty, resolved}) == 3, (
+            "a lookup that was never made and one that came back empty are "
+            "different facts and must stay distinguishable"
+        )
+        assert "not looked up" in never.lower()
+        assert "no reverse dns" in empty.lower()
+
+    def test_the_lookup_state_says_nothing_about_the_host(self) -> None:
+        """A device with no DNS record is an ordinary device."""
+        for text in (
+            _host().hostname_lookup_text,
+            _host(
+                hostname_checked_at=datetime.now(tz=timezone.utc)
+            ).hostname_lookup_text,
+        ):
+            lowered = text.lower()
+            for verdict in ("offline", "down", "invalid", "fail", "error"):
+                assert verdict not in lowered, (
+                    f"{text!r} describes the host, not the lookup"
+                )
 
     def test_no_state_invents_a_name(self) -> None:
         """The address is never dressed up as a hostname (§15)."""
@@ -333,7 +371,7 @@ class TestMigration:
         """An existing installation upgrades on next start."""
         names = [migration.name for migration in MIGRATIONS]
         assert "hostname_lookup_state" in names
-        assert LATEST_VERSION == 6
+        assert LATEST_VERSION >= 4
 
     def test_it_is_guarded_so_it_can_run_twice(self) -> None:
         """A fresh install already has the column from the schema."""

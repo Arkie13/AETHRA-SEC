@@ -1,15 +1,28 @@
 @echo off
 rem ===========================================================================
-rem  AETHRA-SEC first-run setup (Windows)
+rem  AETHRA-SEC development setup (Windows)
 rem
-rem  Creates the virtual environment, installs the dependencies, prepares .env,
-rem  creates the database schema and offers to create the first administrator.
-rem  Safe to run again: every step checks what is already done.
+rem  For working from the source checkout. If you installed AETHRA-SEC with
+rem  AETHRA-SEC-Setup.exe you do not need this file at all - the installed
+rem  application runs its own setup wizard the first time it starts.
+rem
+rem  This script prepares the Python environment and then hands over to
+rem  aethra_sec.setup.console, which is the SAME setup the graphical wizard
+rem  runs: the same dependency probes, the same configuration writer, the same
+rem  database provisioning, the same administrator creation and the same health
+rem  report. There is deliberately no second implementation here - two setup
+rem  paths that each knew how to create an administrator would eventually
+rem  create two different ones.
+rem
+rem  Safe to run again. Every step checks what is already done, an existing
+rem  configuration is offered back as the default, and an existing
+rem  administrator is reported rather than replaced.
 rem
 rem  Prerequisites, installed separately:
 rem    * Python 3.10+ with the "tcl/tk and IDLE" option
-rem    * MySQL 8.0+ or MariaDB 10.6+, running
-rem    * Nmap and Wireshark/TShark for assessment and capture
+rem    * MySQL 8.0+ / MariaDB 10.6+ / XAMPP, running
+rem    * Nmap, Wireshark/TShark (with Npcap) for assessment and capture
+rem    * Snort, optionally, for intrusion detection
 rem ===========================================================================
 
 setlocal
@@ -17,7 +30,7 @@ pushd "%~dp0"
 
 echo.
 echo  ===========================================================
-echo   AETHRA-SEC setup
+echo   AETHRA-SEC development setup
 echo  ===========================================================
 echo.
 
@@ -64,53 +77,75 @@ if errorlevel 1 (
 )
 echo   [ OK ] Dependencies installed
 
-rem --- 4. Configuration -----------------------------------------------------
-if exist ".env" (
-    echo   [ OK ] .env already exists ^(left untouched^)
+rem --- 4. Application icon --------------------------------------------------
+if exist "assets\aethra-sec.ico" (
+    echo   [ OK ] Application icon present
 ) else (
-    copy /y ".env.example" ".env" >nul
-    echo   [ OK ] .env created from .env.example
-    echo.
-    echo   Set at least these two before continuing:
-    echo       AETHRA_DB_PASSWORD          the password of your MySQL account
-    echo       AETHRA_AUTHORIZED_NETWORKS  the networks you may scan/monitor
-    echo.
-    echo   Opening .env in Notepad - save and close it to continue.
-    notepad ".env"
+    echo   [ .. ] Rendering the application icon
+    "%PYTHON%" launcher\make_icon.py
 )
 
-rem --- 5. Database ----------------------------------------------------------
+rem --- 5. Setup -------------------------------------------------------------
+rem  Everything from here is the shared setup: administrator, database,
+rem  security tools, network interface, email and the health check.
+rem
+rem  Choose the graphical wizard or the console. Both do exactly the same
+rem  thing; the wizard is easier to read, the console works over SSH.
 echo.
-echo   [ .. ] Creating the database schema
-"%PYTHON%" scripts\init_db.py
+echo   ===========================================================
+echo    Setup: administrator, database, tools, interface, email
+echo   ===========================================================
+echo.
+echo     [1] Graphical setup wizard  ^(recommended^)
+echo     [2] Console setup
+echo     [3] Skip setup - only run the health check
+echo.
+choice /c 123 /n /m "   Choose [1/2/3]: "
+if errorlevel 3 goto :healthonly
+if errorlevel 2 goto :consolesetup
+
+:wizard
+echo.
+echo   [ .. ] Starting the graphical setup wizard
+"%PYTHON%" -m aethra_sec.main --setup
+if errorlevel 1 (
+    echo   [WARN] The wizard did not complete. Run setup.bat again, or choose
+    echo          the console setup.
+)
+goto :shortcut
+
+:consolesetup
+echo.
+"%PYTHON%" -m aethra_sec.setup.console
 if errorlevel 1 (
     echo.
-    echo   [FAIL] The schema could not be created.
-    echo          Check that MySQL is running and that the credentials in .env
-    echo          are correct, then run setup.bat again. If the account may not
-    echo          create databases, apply sql\aethra_sec_schema.sql as root:
-    echo              mysql -u root -p ^< sql\aethra_sec_schema.sql
+    echo   [FAIL] Setup did not complete. Fix the problem reported above and
+    echo          run setup.bat again.
     goto :failed
 )
-echo   [ OK ] Schema ready
+goto :shortcut
 
-rem --- 6. First administrator ----------------------------------------------
+:healthonly
 echo.
-echo   Create the first administrator account now? The password is prompted
-echo   for and never echoed. Skip this if you already have an account.
-choice /c YN /n /m "   Create an account? [Y/N] "
-if errorlevel 2 goto :health
-"%PYTHON%" scripts\create_admin.py
+"%PYTHON%" -m aethra_sec.setup.console --check-only
+goto :shortcut
 
-rem --- 7. Diagnostics -------------------------------------------------------
-:health
+rem --- 6. Desktop shortcut --------------------------------------------------
+:shortcut
 echo.
-echo   [ .. ] Running diagnostics
-"%PYTHON%" scripts\health_check.py
+echo   [ .. ] Creating the desktop shortcut
+powershell -NoProfile -ExecutionPolicy Bypass -File "launcher\create_shortcut.ps1"
+if errorlevel 1 (
+    echo   [WARN] The desktop shortcut could not be created.
+    echo          run.bat still starts AETHRA-SEC normally.
+)
 
 echo.
 echo  ===========================================================
-echo   Setup finished. Start AETHRA-SEC with:  run.bat
+echo   Setup finished.
+echo     Desktop:  double-click the AETHRA-SEC icon
+echo     Terminal: run.bat
+echo     Health:   run.bat --check
 echo  ===========================================================
 echo.
 popd

@@ -98,22 +98,42 @@ class TestLaunchersInvokeRealEntryPoints:
         assert "-m aethra_sec.main %*" in text
         assert (PROJECT_ROOT / "aethra_sec" / "main.py").exists()
 
-    def test_setup_bat_uses_the_real_scripts(
+    def test_setup_bat_runs_the_shared_setup(
         self, batch_text: dict[str, str]
     ) -> None:
-        """Every script setup.bat runs is present."""
+        """setup.bat drives the same setup the installed application runs.
+
+        It used to call three separate scripts, each with its own copy of a
+        step. Those steps now live in :mod:`aethra_sec.setup`, and setup.bat
+        invokes that - which is what stops the console path and the wizard path
+        from drifting into producing different installations.
+        """
         text = batch_text["setup.bat"]
-        for script in ("init_db.py", "create_admin.py", "health_check.py"):
-            assert f"scripts\\{script}" in text, f"setup.bat does not run {script}"
-            assert (PROJECT_ROOT / "scripts" / script).exists()
+        for entry_point in ("aethra_sec.setup.console", "aethra_sec.main --setup"):
+            assert entry_point in text, f"setup.bat does not run {entry_point}"
         assert "requirements.txt" in text
         assert (PROJECT_ROOT / "requirements.txt").exists()
 
-    def test_setup_bat_offers_the_sql_fallback(
-        self, batch_text: dict[str, str]
-    ) -> None:
-        """When the account cannot create a database, the SQL file is named."""
-        assert "sql\\aethra_sec_schema.sql" in batch_text["setup.bat"]
+    def test_the_entry_points_setup_bat_names_are_importable(self) -> None:
+        """A batch file naming a module that does not exist fails at run time."""
+        import importlib
+
+        for module in ("aethra_sec.setup.console", "aethra_sec.main"):
+            assert importlib.import_module(module) is not None
+
+    def test_the_sql_fallback_is_still_offered_somewhere_reachable(self) -> None:
+        """When the account may not create a database, the SQL file is named.
+
+        The message moved out of setup.bat and into the provisioning failure
+        path, so it now reaches the wizard, the console and the installed
+        application alike rather than only whoever ran the batch file.
+        """
+        import inspect
+
+        from aethra_sec.setup import provisioning
+
+        source = inspect.getsource(provisioning)
+        assert "sql/aethra_sec_schema.sql" in source
         assert (PROJECT_ROOT / "sql" / "aethra_sec_schema.sql").exists()
 
     def test_run_sh_matches(self) -> None:

@@ -1,0 +1,750 @@
+{
+  "exitstatus": 0,
+  "total": 53,
+  "failed": 0,
+  "passed": 53,
+  "results": [
+    {
+      "nodeid": "skills_test/tests/test_database_and_auth.py::test_a_host_is_created_once_and_then_updated",
+      "name": "test_a_host_is_created_once_and_then_updated",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/database/repositories/hosts.py",
+        "qualname": "HostRepository.upsert_observed",
+        "feature": "Hosts",
+        "action": "Host upsert",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_database_and_auth.py::test_a_stale_host_goes_offline_but_is_not_deleted",
+      "name": "test_a_stale_host_goes_offline_but_is_not_deleted",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/database/repositories/hosts.py",
+        "qualname": "HostRepository.mark_stale_offline",
+        "feature": "Hosts",
+        "action": "Offline sweep",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_database_and_auth.py::test_a_host_seen_again_returns_to_up",
+      "name": "test_a_host_seen_again_returns_to_up",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/database/repositories/hosts.py",
+        "qualname": "HostRepository.upsert_observed",
+        "feature": "Hosts",
+        "action": "Return from offline",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_database_and_auth.py::test_the_schema_is_complete",
+      "name": "test_the_schema_is_complete",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/database/migrations.py",
+        "qualname": "verify_schema",
+        "feature": "Database",
+        "action": "Schema integrity",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_database_and_auth.py::test_a_fresh_database_contains_no_security_records",
+      "name": "test_a_fresh_database_contains_no_security_records",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "Visual completeness must never come from fabricated rows.",
+      "target": {
+        "path": "aethra_sec/database/migrations.py",
+        "qualname": "",
+        "feature": "Database",
+        "action": "No seeded security data",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_database_and_auth.py::test_a_wrong_password_is_rejected",
+      "name": "test_a_wrong_password_is_rejected",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/security/password.py",
+        "qualname": "PasswordHashService.verify",
+        "feature": "Authentication",
+        "action": "Password verification",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_database_and_auth.py::test_a_password_is_never_stored_in_clear",
+      "name": "test_a_password_is_never_stored_in_clear",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/security/password.py",
+        "qualname": "PasswordHashService.hash",
+        "feature": "Authentication",
+        "action": "Password storage",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_database_and_auth.py::test_a_permission_the_role_lacks_is_refused",
+      "name": "test_a_permission_the_role_lacks_is_refused",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/security/rbac.py",
+        "qualname": "AccessControl.require",
+        "feature": "Authentication",
+        "action": "RBAC",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_ids.py::test_priority_one_is_high",
+      "name": "test_priority_one_is_high",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "Snort priority 1 is its most severe; it must not read as anything less.",
+      "target": {
+        "path": "aethra_sec/analytics/risk_engine.py",
+        "qualname": "RiskEngine.severity_for_snort_priority",
+        "feature": "IDS Alerts",
+        "action": "Severity mapping",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_ids.py::test_the_whole_priority_band_maps_correctly",
+      "name": "test_the_whole_priority_band_maps_correctly",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/analytics/risk_engine.py",
+        "qualname": "RiskEngine.severity_for_snort_priority",
+        "feature": "IDS Alerts",
+        "action": "Severity mapping",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_ids.py::test_a_missing_priority_is_not_guessed_as_high",
+      "name": "test_a_missing_priority_is_not_guessed_as_high",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "No priority means unknown, which is MEDIUM - never invented as HIGH.",
+      "target": {
+        "path": "aethra_sec/analytics/risk_engine.py",
+        "qualname": "RiskEngine.severity_for_snort_priority",
+        "feature": "IDS Alerts",
+        "action": "Severity mapping",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_ids.py::test_a_fast_alert_is_parsed_into_its_fields",
+      "name": "test_a_fast_alert_is_parsed_into_its_fields",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/integrations/snort/parser.py",
+        "qualname": "parse_fast",
+        "feature": "IDS Alerts",
+        "action": "Fast-format parsing",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_ids.py::test_a_line_that_is_not_an_alert_is_rejected",
+      "name": "test_a_line_that_is_not_an_alert_is_rejected",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "Returning a half-built alert for noise would fabricate detections.",
+      "target": {
+        "path": "aethra_sec/integrations/snort/parser.py",
+        "qualname": "parse_fast",
+        "feature": "IDS Alerts",
+        "action": "Fast-format parsing",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_ids.py::test_the_dispatcher_recognises_the_fast_format",
+      "name": "test_the_dispatcher_recognises_the_fast_format",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/integrations/snort/parser.py",
+        "qualname": "parse_alert_line",
+        "feature": "IDS Alerts",
+        "action": "Alert parsing",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_ids.py::test_a_json_alert_is_parsed",
+      "name": "test_a_json_alert_is_parsed",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/integrations/snort/parser.py",
+        "qualname": "parse_json",
+        "feature": "IDS Alerts",
+        "action": "JSON parsing",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_ids.py::test_the_alert_timestamp_is_read_not_invented",
+      "name": "test_the_alert_timestamp_is_read_not_invented",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "Detection time is measured from this; a wrong value corrupts the metric.",
+      "target": {
+        "path": "aethra_sec/integrations/snort/parser.py",
+        "qualname": "_parse_fast_timestamp",
+        "feature": "IDS Alerts",
+        "action": "Alert timestamp",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_ids.py::test_an_alert_is_written_to_the_database",
+      "name": "test_an_alert_is_written_to_the_database",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/database/repositories/alerts.py",
+        "qualname": "AlertRepository.insert_alert",
+        "feature": "IDS Alerts",
+        "action": "Alert persistence",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_ids.py::test_marking_alerts_reviewed_persists",
+      "name": "test_marking_alerts_reviewed_persists",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "The button must change stored state, not just the row on screen.",
+      "target": {
+        "path": "aethra_sec/database/repositories/alerts.py",
+        "qualname": "AlertRepository.mark_all_reviewed",
+        "feature": "IDS Alerts",
+        "action": "Mark reviewed",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_ids.py::test_a_decision_already_made_is_not_overwritten",
+      "name": "test_a_decision_already_made_is_not_overwritten",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "A bulk review must not quietly undo an escalation.",
+      "target": {
+        "path": "aethra_sec/database/repositories/alerts.py",
+        "qualname": "AlertRepository.mark_all_reviewed",
+        "feature": "IDS Alerts",
+        "action": "Mark reviewed",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_ids.py::test_an_evaluation_is_recorded",
+      "name": "test_an_evaluation_is_recorded",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/database/repositories/alerts.py",
+        "qualname": "AlertRepository.set_alert_evaluation",
+        "feature": "IDS Alerts",
+        "action": "True/false positive",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_ids.py::test_a_repeat_alert_is_recognised_as_a_duplicate",
+      "name": "test_a_repeat_alert_is_recognised_as_a_duplicate",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "Without this, one flood writes a row per packet.",
+      "target": {
+        "path": "aethra_sec/database/repositories/alerts.py",
+        "qualname": "AlertRepository.find_duplicate",
+        "feature": "IDS Alerts",
+        "action": "Duplicate prevention",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_live_monitoring.py::test_only_addresses_on_the_sensor_subnet_are_on_link",
+      "name": "test_only_addresses_on_the_sensor_subnet_are_on_link",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/utils/net.py",
+        "qualname": "is_on_link",
+        "feature": "Live Monitoring",
+        "action": "On-link decision",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_live_monitoring.py::test_addresses_no_device_owns_are_refused",
+      "name": "test_addresses_no_device_owns_are_refused",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/utils/net.py",
+        "qualname": "host_address_rejection",
+        "feature": "Live Monitoring",
+        "action": "Address validation",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_live_monitoring.py::test_only_a_sender_counts_as_evidence_of_a_host",
+      "name": "test_only_a_sender_counts_as_evidence_of_a_host",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "A destination is an address someone named, not a device that answered.",
+      "target": {
+        "path": "aethra_sec/services/packet_capture.py",
+        "qualname": "PacketCaptureService._accumulate_host",
+        "feature": "Live Monitoring",
+        "action": "Host discovery from packets",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_live_monitoring.py::test_the_admission_rule_requires_transmission_and_on_link",
+      "name": "test_the_admission_rule_requires_transmission_and_on_link",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "Both halves, plus the address being a host at all.",
+      "target": {
+        "path": "aethra_sec/services/packet_capture.py",
+        "qualname": "PacketCaptureService._flush_host_observations",
+        "feature": "Live Monitoring",
+        "action": "Host inventory admission",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_live_monitoring.py::test_flood_severity_rises_with_the_rate",
+      "name": "test_flood_severity_rises_with_the_rate",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "A band that stops escalating hides the worst floods.",
+      "target": {
+        "path": "aethra_sec/analytics/anomaly_rules.py",
+        "qualname": "flood_severity",
+        "feature": "Live Monitoring",
+        "action": "Flood severity bands",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_live_monitoring.py::test_the_load_bands_are_ordered",
+      "name": "test_the_load_bands_are_ordered",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/analytics/traffic_classes.py",
+        "qualname": "traffic_load_class",
+        "feature": "Live Monitoring",
+        "action": "Load classification",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_live_monitoring.py::test_one_percent_loss_is_not_reliable",
+      "name": "test_one_percent_loss_is_not_reliable",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "The manuscript's threshold is < 1%, not <= 1%.",
+      "target": {
+        "path": "aethra_sec/analytics/traffic_classes.py",
+        "qualname": "CaptureReliability",
+        "feature": "Live Monitoring",
+        "action": "Packet loss (ITU-T Y.1541)",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_ui_actions.py::test_mark_reviewed_is_bound_and_reaches_the_backend",
+      "name": "test_mark_reviewed_is_bound_and_reaches_the_backend",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/ui/screens/alerts.py",
+        "qualname": "AlertsScreen._mark_all_reviewed",
+        "feature": "IDS Alerts",
+        "action": "Mark reviewed button",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_ui_actions.py::test_classification_reaches_the_backend",
+      "name": "test_classification_reaches_the_backend",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/ui/screens/alerts.py",
+        "qualname": "AlertsScreen._classify",
+        "feature": "IDS Alerts",
+        "action": "True/false positive buttons",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_ui_actions.py::test_the_filter_apply_button_is_bound",
+      "name": "test_the_filter_apply_button_is_bound",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/ui/screens/alerts.py",
+        "qualname": "AlertsScreen.refresh",
+        "feature": "IDS Alerts",
+        "action": "Apply filter button",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_ui_actions.py::test_start_scan_is_bound_and_starts_a_scan",
+      "name": "test_start_scan_is_bound_and_starts_a_scan",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/ui/screens/vulnerabilities.py",
+        "qualname": "VulnerabilitiesScreen._start_scan",
+        "feature": "Vulnerability Assessment",
+        "action": "Start scan button",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_ui_actions.py::test_stop_scan_is_bound_and_stops_a_scan",
+      "name": "test_stop_scan_is_bound_and_stops_a_scan",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/ui/screens/vulnerabilities.py",
+        "qualname": "VulnerabilitiesScreen._stop_scan",
+        "feature": "Vulnerability Assessment",
+        "action": "Stop scan button",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_ui_actions.py::test_refresh_is_bound_and_loads_off_the_ui_thread",
+      "name": "test_refresh_is_bound_and_loads_off_the_ui_thread",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/ui/screens/vulnerabilities.py",
+        "qualname": "VulnerabilitiesScreen._refresh_automation",
+        "feature": "Vulnerability Assessment",
+        "action": "Refresh button",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_ui_actions.py::test_the_automation_toggle_reaches_the_queue",
+      "name": "test_the_automation_toggle_reaches_the_queue",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/ui/screens/vulnerabilities.py",
+        "qualname": "VulnerabilitiesScreen._toggle_automation",
+        "feature": "Vulnerability Assessment",
+        "action": "Automatic assessment toggle",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_ui_actions.py::test_start_capture_is_bound_and_starts_capture",
+      "name": "test_start_capture_is_bound_and_starts_capture",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/ui/screens/traffic.py",
+        "qualname": "TrafficScreen._start_capture",
+        "feature": "Live Monitoring",
+        "action": "Start capture button",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_ui_actions.py::test_stop_capture_is_bound_and_stops_capture",
+      "name": "test_stop_capture_is_bound_and_stops_capture",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/ui/screens/traffic.py",
+        "qualname": "TrafficScreen._stop_capture",
+        "feature": "Live Monitoring",
+        "action": "Stop capture button",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_ui_actions.py::test_interface_selection_is_bound",
+      "name": "test_interface_selection_is_bound",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/ui/screens/traffic.py",
+        "qualname": "TrafficScreen._load_interfaces",
+        "feature": "Live Monitoring",
+        "action": "Interface selection",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_ui_actions.py::test_the_display_filter_is_applied",
+      "name": "test_the_display_filter_is_applied",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/ui/screens/traffic.py",
+        "qualname": "TrafficScreen._apply_display_filter",
+        "feature": "Live Monitoring",
+        "action": "Display filter",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_ui_actions.py::test_the_worker_bridge_exists",
+      "name": "test_the_worker_bridge_exists",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "Workers hand results back through this; without it they touch Tk.",
+      "target": {
+        "path": "aethra_sec/ui/dispatch.py",
+        "qualname": "post",
+        "feature": "User interface",
+        "action": "Worker to UI bridge",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_vulnerability_assessment.py::test_a_host_that_did_not_answer_is_not_safe",
+      "name": "test_a_host_that_did_not_answer_is_not_safe",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "0 hosts up means the scan proved nothing, not that nothing is wrong.",
+      "target": {
+        "path": "aethra_sec/models/host.py",
+        "qualname": "derive_security_result",
+        "feature": "Vulnerability Assessment",
+        "action": "Security result",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_vulnerability_assessment.py::test_a_failed_scan_is_not_safe",
+      "name": "test_a_failed_scan_is_not_safe",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/models/host.py",
+        "qualname": "derive_security_result",
+        "feature": "Vulnerability Assessment",
+        "action": "Security result",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_vulnerability_assessment.py::test_a_timed_out_scan_is_not_safe",
+      "name": "test_a_timed_out_scan_is_not_safe",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/models/host.py",
+        "qualname": "derive_security_result",
+        "feature": "Vulnerability Assessment",
+        "action": "Security result",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_vulnerability_assessment.py::test_no_findings_requires_a_scan_that_actually_answered",
+      "name": "test_no_findings_requires_a_scan_that_actually_answered",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "The one path to Safe: completed, answered, nothing confirmed.",
+      "target": {
+        "path": "aethra_sec/models/host.py",
+        "qualname": "derive_security_result",
+        "feature": "Vulnerability Assessment",
+        "action": "Security result",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_vulnerability_assessment.py::test_an_open_finding_outranks_every_lifecycle_state",
+      "name": "test_an_open_finding_outranks_every_lifecycle_state",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/models/host.py",
+        "qualname": "classify_by_highest_finding",
+        "feature": "Vulnerability Assessment",
+        "action": "CVSS classification",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_vulnerability_assessment.py::test_the_cvss_bands_follow_the_standard",
+      "name": "test_the_cvss_bands_follow_the_standard",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/models/host.py",
+        "qualname": "cvss_band",
+        "feature": "Vulnerability Assessment",
+        "action": "CVSS v3.1 bands",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_vulnerability_assessment.py::test_a_scan_result_is_parsed_into_hosts_and_ports",
+      "name": "test_a_scan_result_is_parsed_into_hosts_and_ports",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/integrations/nmap/parser.py",
+        "qualname": "parse_scan_result",
+        "feature": "Vulnerability Assessment",
+        "action": "Nmap result parsing",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_vulnerability_assessment.py::test_a_down_host_is_reported_down_not_dropped",
+      "name": "test_a_down_host_is_reported_down_not_dropped",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/integrations/nmap/parser.py",
+        "qualname": "parse_scan_result",
+        "feature": "Vulnerability Assessment",
+        "action": "Nmap result parsing",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_vulnerability_assessment.py::test_an_empty_scan_invents_nothing",
+      "name": "test_an_empty_scan_invents_nothing",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/integrations/nmap/parser.py",
+        "qualname": "parse_scan_result",
+        "feature": "Vulnerability Assessment",
+        "action": "Nmap result parsing",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_vulnerability_assessment.py::test_a_host_nmap_gave_up_on_is_detected",
+      "name": "test_a_host_nmap_gave_up_on_is_detected",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "A timed-out host must never settle as a completed clean scan.",
+      "target": {
+        "path": "aethra_sec/integrations/nmap/runner.py",
+        "qualname": "timed_out_hosts",
+        "feature": "Vulnerability Assessment",
+        "action": "Timeout detection",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_vulnerability_assessment.py::test_every_required_assessment_state_exists",
+      "name": "test_every_required_assessment_state_exists",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "",
+      "target": {
+        "path": "aethra_sec/models/enums.py",
+        "qualname": "AssessmentState",
+        "feature": "Vulnerability Assessment",
+        "action": "Assessment states",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_vulnerability_assessment.py::test_an_offline_host_is_not_scanned",
+      "name": "test_an_offline_host_is_not_scanned",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "Probing an address nobody is using is what a scan storm is made of.",
+      "target": {
+        "path": "aethra_sec/services/assessment_queue.py",
+        "qualname": "AssessmentQueueService.eligibility",
+        "feature": "Vulnerability Assessment",
+        "action": "Scan eligibility",
+        "extra": []
+      }
+    },
+    {
+      "nodeid": "skills_test/tests/test_vulnerability_assessment.py::test_a_host_outside_the_authorised_network_is_never_scanned",
+      "name": "test_a_host_outside_the_authorised_network_is_never_scanned",
+      "outcome": "passed",
+      "message": "",
+      "docstring": "The hard safety boundary: never scan what was not authorised.",
+      "target": {
+        "path": "aethra_sec/services/assessment_queue.py",
+        "qualname": "AssessmentQueueService.eligibility",
+        "feature": "Vulnerability Assessment",
+        "action": "Scan authorisation",
+        "extra": []
+      }
+    }
+  ]
+}

@@ -33,7 +33,6 @@ from aethra_sec.core.events import (
     EventType,
     IncidentPayload,
     MitigationPayload,
-    NotificationPayload,
 )
 from aethra_sec.core.permissions import Permission
 from aethra_sec.core.session import Session
@@ -46,7 +45,6 @@ from aethra_sec.models.enums import (
     EvaluationLabel,
     EvidenceSource,
     IncidentStatus,
-    NotificationLevel,
     Severity,
     ThreatCategory,
 )
@@ -65,17 +63,14 @@ LOGGER = get_logger("services.correlation")
 
 #: Keyword rules mapping Snort signature text to a threat category. Ordered:
 #: the first matching group wins, so specific patterns precede general ones.
+#: Malware and brute-force groups were removed from this table. They classified
+#: a Snort signature's *text*, so they could attribute an incoming alert to a
+#: category AETHRA-SEC has no detection rule for and the study does not test.
+#: A Snort alert whose text used to match them now falls through to the general
+#: groups below, or to UNCLASSIFIED - which is the honest outcome: the alert is
+#: still recorded in full, and no category is claimed for it that this system
+#: cannot stand behind.
 _CATEGORY_KEYWORDS: tuple[tuple[ThreatCategory, tuple[str, ...]], ...] = (
-    (
-        ThreatCategory.MALWARE_INDICATOR,
-        ("trojan", "malware", "botnet", "command and control", "c2 ", "cnc",
-         "ransomware", "backdoor", "spyware", "worm", "exploit kit"),
-    ),
-    (
-        ThreatCategory.BRUTE_FORCE,
-        ("brute", "login attempt", "failed login", "password guess",
-         "authentication failure", "excessive login", "credential"),
-    ),
     (
         ThreatCategory.SUSPICIOUS_PAYLOAD,
         ("shellcode", "buffer overflow", "sql injection", "sqli",
@@ -83,7 +78,40 @@ _CATEGORY_KEYWORDS: tuple[tuple[ThreatCategory, tuple[str, ...]], ...] = (
          "command injection", "obfuscat", "suspicious payload", "attempted-admin",
          "attempted-user", "web-application-attack"),
     ),
+    # The four flood categories AETHRA-SEC detects for itself, named before
+    # the general denial-of-service group below so a sensor that says which
+    # flood it saw is taken at its word.
+    #
+    # They were previously absent, so every flood alert - SYN, UDP, ICMP
+    # alike - was filed as DENIAL_OF_SERVICE and carried the one generic
+    # entry, while MIT-TCP-SYN-FLOOD, MIT-UDP-FLOOD and MIT-ICMP-FLOOD sat
+    # active and mapped in the knowledge base and were reachable only from
+    # AETHRA-SEC's own rules. Nothing is invented here: each keyword resolves
+    # to a category the mapping table already carries an entry for.
+    #
+    # Keyword order inside the group matters as much as the group order. A
+    # SYN flood aimed at a web server is a SYN flood, so "syn flood" is
+    # tested before anything HTTP - HTTP_FLOOD means request volume, which is
+    # a different observation with different guidance.
     (
+        ThreatCategory.TCP_SYN_FLOOD,
+        ("syn flood", "tcp syn flood", "synflood"),
+    ),
+    (
+        ThreatCategory.UDP_FLOOD,
+        ("udp flood", "udp packet flood"),
+    ),
+    (
+        ThreatCategory.ICMP_FLOOD,
+        ("icmp flood", "ping flood", "icmp packet flood"),
+    ),
+    (
+        ThreatCategory.HTTP_FLOOD,
+        ("http flood", "http request flood", "web request flood"),
+    ),
+    (
+        # Anything that says only that it is a denial of service, without
+        # naming which kind. The generic entry is the honest answer there.
         ThreatCategory.DENIAL_OF_SERVICE,
         ("denial of service", "dos ", "ddos", "flood", "resource exhaustion",
          "attempted-dos"),
@@ -99,8 +127,15 @@ _CATEGORY_KEYWORDS: tuple[tuple[ThreatCategory, tuple[str, ...]], ...] = (
     ),
     (
         ThreatCategory.RECONNAISSANCE,
-        ("scan", "recon", "probe", "enumeration", "information leak",
-         "attempted-recon", "banner"),
+        # Not a bare "scan": that matches the "ET SCAN" prefix Emerging
+        # Threats puts on a whole family of rules, which says what vendor
+        # named the rule and not what the traffic was. It used to be masked
+        # by the brute-force group sitting above it; with that gone, a
+        # credential-guessing alert would have been filed as reconnaissance on
+        # the strength of a naming convention. Unmatched text falls through to
+        # UNCLASSIFIED instead, which is the honest answer.
+        ("recon", "probe", "enumeration", "information leak",
+         "attempted-recon", "banner grab"),
     ),
     (
         ThreatCategory.POLICY_VIOLATION,
@@ -171,6 +206,56 @@ class CorrelationService:
     # ------------------------------------------------------------------
     # Correlation cycle
     # ------------------------------------------------------------------
+    def close_stale_incidents(self) -> int:
+        """Close incidents whose evidence stopped, so the open count falls.
+
+        Without this the open-incident figure only ever rises: the correlation
+        engine opens incidents from real detections, and nothing but an analyst
+        clicking Resolve has ever closed one. After a few weeks the number is
+        no longer "what needs attention" but "everything ever detected", which
+        is precisely as useful as no number at all.
+
+        The cutoff is measured from an incident's *last evidence*, not from
+        when it was created. An attack that has been running for three days
+        keeps its incident open the whole time, because every new packet that
+        matches refreshes ``last_seen``.
+
+        Each closure is audited individually with the reason and the age, so
+        the trail shows the system closed it and why - never a silent edit.
+        Returns the number closed.
+        """
+        hours = self._settings.get_int("incidents.auto_close_hours", 24)
+        if hours <= 0:
+            # Explicitly disabled: every incident stays open until a person
+            # closes it. Some deployments want exactly that.
+            return 0
+        cutoff = utcnow() - timedelta(hours=hours)
+        try:
+            closed = self._incidents.close_stale(cutoff)
+        except Exception:  # noqa: BLE001 - never stop correlation
+            LOGGER.exception("Could not retire stale incidents.")
+            return 0
+        if not closed:
+            return 0
+
+        for incident_id in closed:
+            self._audit.record(
+                AuditAction.INCIDENT_UPDATED,
+                category=AuditCategory.DETECTION,
+                target_type="incident",
+                target_id=str(incident_id),
+                result="SUCCESS",
+                detail=(
+                    f"Closed automatically: no new evidence for {hours} hour(s). "
+                    "The incident and its evidence are retained."
+                ),
+            )
+        LOGGER.info(
+            "Closed %d incident(s) with no evidence in the last %d hour(s).",
+            len(closed), hours,
+        )
+        return len(closed)
+
     def correlate_recent(self) -> int:
         """Correlate evidence that has not yet been attached to an incident.
 
@@ -183,6 +268,10 @@ class CorrelationService:
         with self._lock:
             self.statistics.runs += 1
             self.statistics.last_run_at = utcnow()
+
+        # Retire the quiet tail before correlating, so "open incidents" means
+        # what it says rather than growing forever.
+        self.close_stale_incidents()
 
         window = max(10, self._settings.get_int("correlation.window_seconds", 300))
         # Look back over several windows so evidence that arrived while the
@@ -337,13 +426,11 @@ class CorrelationService:
         titles = {
             ThreatCategory.PORT_SCAN: "Port scanning behaviour",
             ThreatCategory.HOST_SWEEP: "Network sweep behaviour",
-            ThreatCategory.BRUTE_FORCE: "Potential brute-force activity",
             ThreatCategory.TCP_SYN_FLOOD: "Potential TCP SYN flood",
             ThreatCategory.UDP_FLOOD: "UDP flood indicator",
             ThreatCategory.ICMP_FLOOD: "Excessive ICMP traffic",
             ThreatCategory.HTTP_FLOOD: "Abnormal HTTP request volume",
             ThreatCategory.SUSPICIOUS_PAYLOAD: "Suspicious payload detected",
-            ThreatCategory.MALWARE_INDICATOR: "Malware-related indicator",
             ThreatCategory.DENIAL_OF_SERVICE: "Denial of service indicators",
             ThreatCategory.SERVICE_EXPOSURE: "Exposed network service",
             ThreatCategory.RECONNAISSANCE: "Reconnaissance activity",
@@ -475,8 +562,7 @@ class CorrelationService:
                 incident, alerts, anomalies, findings, sources, assessment
             )
             advice = self._mitigation.advice_for_incident(
-                incident,
-                self._evidence_lines(alerts, anomalies, findings),
+                incident, self._evidence_lines(alerts, anomalies, findings)
             )
             mitigation_id = advice.recommendation.id if advice else None
 
@@ -519,7 +605,6 @@ class CorrelationService:
                         f"{refreshed.source_label}"
                     ),
                 )
-                self._notify(refreshed)
             if advice and mitigation_id:
                 self._bus.publish(
                     EventType.MITIGATION_GENERATED,
@@ -691,35 +776,6 @@ class CorrelationService:
                 LOGGER.debug("Service lookup failed.", exc_info=True)
         return service_name_for_port(port, protocol or "tcp")
 
-    def _notify(self, incident: Incident) -> None:
-        """Raise a notification for a genuinely new incident (§52)."""
-        if not self._settings.get_bool("notifications.enabled", True):
-            return
-        minimum = Severity.parse(
-            self._settings.get_str("notifications.min_severity", "MEDIUM"),
-            Severity.MEDIUM,
-        )
-        if not incident.severity.at_least(minimum):
-            return
-        level = (
-            NotificationLevel.CRITICAL
-            if incident.severity is Severity.CRITICAL
-            else NotificationLevel.WARNING
-            if incident.severity is Severity.HIGH
-            else NotificationLevel.INFO
-        )
-        self._bus.publish(
-            EventType.NOTIFICATION_RAISED,
-            NotificationPayload(
-                title=f"{incident.severity} incident {incident.reference}",
-                message=f"{incident.title} ({incident.source_label})",
-                level=level,
-                category="incident",
-                reference_type="incident",
-                reference_id=incident.id,
-            ),
-        )
-
     # ------------------------------------------------------------------
     # Analyst operations (permission-checked)
     # ------------------------------------------------------------------
@@ -743,9 +799,35 @@ class CorrelationService:
         return self._incidents.mark_viewed(incident_id, session.user_id)
 
     def mark_all_viewed(self, session: Session) -> int:
-        """Mark every unread incident as read (the sidebar's "mark all read")."""
-        self._access.require(session, Permission.INCIDENT_VIEW)
-        return self._incidents.mark_all_viewed(session.user_id)
+        """Clear the unread incident badge in one action.
+
+        Reading an incident normally clears it one at a time; this is the bulk
+        form, for an analyst who has taken in the list and does not want the
+        counter to keep reporting the same backlog. It marks exactly the
+        incidents the badge counts.
+
+        This records that they were read - it does not resolve, close or
+        otherwise judge them. Their status is untouched, so nothing an
+        investigation depends on is changed by clearing a counter.
+
+        Returns:
+            How many incidents were marked.
+        """
+        live = self._access.require(session, Permission.INCIDENT_VIEW)
+        marked = self._incidents.mark_all_viewed(live.user_id)
+        if marked:
+            self._audit.record(
+                AuditAction.INCIDENT_UPDATED,
+                session=live,
+                category=AuditCategory.MONITORING,
+                target_type="incident",
+                target_id=str(marked),
+                detail=(
+                    f"{marked} unread incident(s) marked as read. Status and "
+                    "evidence unchanged."
+                ),
+            )
+        return marked
 
     def get_investigation(self, session: Session, incident_id: int) -> Incident | None:
         """Fetch one incident with all of its evidence and notes (§44)."""

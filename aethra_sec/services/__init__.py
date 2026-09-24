@@ -14,11 +14,18 @@ from aethra_sec.services.backup_service import (
 )
 from aethra_sec.services.correlation_service import CorrelationService
 from aethra_sec.services.dashboard_service import DashboardService
+from aethra_sec.services.email_service import (
+    DeliveryResult,
+    EmailNotifier,
+    mask_email,
+)
 from aethra_sec.services.health_service import HealthService, SubsystemProbes
 from aethra_sec.services.host_service import HostService
 from aethra_sec.services.log_service import LogService
 from aethra_sec.services.mitigation_service import MitigationService
+from aethra_sec.services.assessment_queue import AssessmentQueueService
 from aethra_sec.services.nmap_service import NmapService
+from aethra_sec.services.audio_alert_service import AudioAlertService
 from aethra_sec.services.notification_service import NotificationService
 from aethra_sec.services.packet_capture import PacketCaptureService
 from aethra_sec.services.recovery_service import (
@@ -39,11 +46,16 @@ __all__ = [
     "BackupStatus",
     "CorrelationService",
     "DashboardService",
+    "DeliveryResult",
+    "EmailNotifier",
+    "mask_email",
     "HealthService",
     "HostService",
     "LogService",
     "MitigationService",
+    "AssessmentQueueService",
     "NmapService",
+    "AudioAlertService",
     "NotificationService",
     "PacketCaptureService",
     "PasswordRecoveryService",

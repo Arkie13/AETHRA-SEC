@@ -18,6 +18,7 @@ an icon rail, F5 refreshes the visible screen and Escape closes any overlay.
 from __future__ import annotations
 
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
@@ -33,12 +34,23 @@ from aethra_sec.ui.base import Screen
 from aethra_sec.ui.state import (
     KEY_GEOMETRY,
     KEY_LAST_SCREEN,
+    KEY_REDUCED_MOTION,
+    KEY_THEME,
     KEY_SIDEBAR_COLLAPSED,
     UiState,
 )
-from aethra_sec.ui.theme import ICONS, PALETTE, Fonts
+from aethra_sec.ui.theme import (
+    ICONS,
+    PALETTE,
+    Fonts,
+    apply_theme,
+    current_theme,
+    set_motion,
+    set_theme,
+)
+from aethra_sec.ui.widgets.tooltip import Tooltip
 from aethra_sec.ui.widgets.cards import ScrollableFrame
-from aethra_sec.ui.widgets.chips import CountBadge, StatusChip
+from aethra_sec.ui.widgets.chips import CountBadge, StatusChip, StatusRail
 from aethra_sec.ui.widgets.dialogs import confirm
 from aethra_sec.ui.widgets.palette import Command, CommandPalette
 from aethra_sec.ui.widgets.toast import ToastManager
@@ -58,7 +70,6 @@ NAVIGATION: tuple[tuple[str, str, str], ...] = (
     ("vulnerabilities", "Vulnerabilities", Permission.SCAN_VIEW),
     ("hosts", "Hosts", Permission.HOST_VIEW),
     ("alerts", "Alerts", Permission.ALERT_VIEW),
-    ("incidents", "Incidents", Permission.INCIDENT_VIEW),
     ("mitigation", "Mitigation", Permission.MITIGATION_VIEW),
     ("reports", "Reports", Permission.REPORT_GENERATE),
     ("logs", "Logs & Audit", Permission.LOG_VIEW),
@@ -77,7 +88,7 @@ NAVIGATION: tuple[tuple[str, str, str], ...] = (
 #: groups nobody opens during an incident sit at the bottom.
 NAV_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("MONITOR", ("dashboard", "traffic")),
-    ("SECURITY", ("incidents", "alerts", "mitigation")),
+    ("SECURITY", ("alerts", "mitigation")),
     ("ASSETS", ("hosts", "vulnerabilities")),
     ("REPORTING", ("reports", "logs")),
     ("ADMINISTRATION", ("users", "health", "settings")),
@@ -86,29 +97,45 @@ NAV_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 #: Screens that carry a live count badge in the sidebar, and where it comes
 #: from. Each callable returns a real stored count - never an estimate.
-BADGE_SOURCES: tuple[str, ...] = ("alerts", "incidents", "users")
+BADGE_SOURCES: tuple[str, ...] = ("alerts", "users")
 
 #: Records of each kind the command palette offers for one query. Enough to
 #: recognise the one you meant, few enough not to bury the screen commands.
 RECORD_SEARCH_LIMIT = 6
 
 #: Sidebar widths, and the frames the slide between them takes.
-SIDEBAR_WIDTH = 264
+SIDEBAR_WIDTH = 208
 SIDEBAR_RAIL_WIDTH = 76
 SIDEBAR_STEPS = 7
 SIDEBAR_STEP_MS = 12
 
 #: Resting text in the header's command bar.
-SEARCH_PLACEHOLDER = "Search screens, hosts, incidents, alerts…"
+SEARCH_PLACEHOLDER = "Search screens, hosts, alerts…"
+
+#: Screens that have been removed, and where a link to one now leads.
+#:
+#: Threat Incidents was a second view of the same security events the IDS
+#: Alerts screen already shows. It was removed rather than hidden; these
+#: entries exist so a stale link, a saved "last screen" or an old bookmark
+#: opens Alerts instead of failing.
+RETIRED_SCREENS: dict[str, str] = {
+    "incidents": "alerts",
+    "incident_detail": "alerts",
+    # Evaluation Runs was a separate test-run measurement system, not a
+    # view of production security data. It was removed rather than
+    # hidden; an old link lands on Reports, which is where the figures a
+    # reader wants now come from - and from real stored records only.
+    "evaluation": "reports",
+}
 
 #: Events every screen may want, drained on the UI tick.
 _UI_EVENTS: tuple[str, ...] = (
     EventType.CAPTURE_STARTED, EventType.CAPTURE_STOPPED, EventType.CAPTURE_ERROR,
-    EventType.PACKET_BATCH_PROCESSED, EventType.TRAFFIC_STATS_UPDATED,
+    EventType.PACKET_BATCH_PROCESSED, EventType.DISPLAY_VIEW_RESET,
+    EventType.DISPLAY_VIEW_BATCH, EventType.TRAFFIC_STATS_UPDATED,
     EventType.TRAFFIC_ANOMALY_DETECTED, EventType.SNORT_ALERT_RECEIVED,
     EventType.SNORT_STATUS_CHANGED, EventType.NMAP_SCAN_STARTED,
     EventType.NMAP_SCAN_COMPLETED, EventType.NMAP_SCAN_FAILED,
-    EventType.INCIDENT_CREATED, EventType.INCIDENT_UPDATED,
     EventType.MITIGATION_GENERATED, EventType.DATABASE_STATUS_CHANGED,
     EventType.SERVICE_STATUS_CHANGED, EventType.NOTIFICATION_RAISED,
     EventType.REPORT_GENERATED, EventType.SYSTEM_ERROR,
@@ -144,6 +171,13 @@ class MainWindow:
         self._sidebar_collapsed = False
         self._busy_jobs = 0
         self._sidebar_job: str | None = None
+        #: Sidebar badge counts, refreshed off the Tk thread and painted from
+        #: this cache on the tick. The tick must never issue a DB query itself:
+        #: a synchronous read on the UI thread stalls every repaint behind a
+        #: network round-trip, which is felt as the interface "lagging".
+        self._badge_counts: dict[str, int] = {}
+        self._badge_job_running = False
+        self._badge_refreshed_at = 0.0
         #: How this console ended: "sign out" returns to the login window,
         #: "quit" exits the application. run_console() returns this.
         self.outcome = "quit"
@@ -154,6 +188,8 @@ class MainWindow:
         dispatch.ensure(root)
 
         self.state = UiState(Path(context.settings.log_dir))
+        # Apply the stored motion preference before any screen animates.
+        set_motion(not self.state.get_bool(KEY_REDUCED_MOTION, False))
 
         self.root.title(f"{APP_NAME} - {session.username} ({session.role})")
         self.root.configure(background=PALETTE.background)
@@ -246,7 +282,7 @@ class MainWindow:
         )
         attach_tooltip(
             self._search_entry,
-            "Search screens, actions, hosts, incidents and alerts  (Ctrl+K)",
+            "Search screens, actions, hosts and alerts  (Ctrl+K)",
         )
 
         right = ttk.Frame(self.header, style="Header.TFrame")
@@ -256,6 +292,23 @@ class MainWindow:
             right, text="Sign out", style="Ghost.TButton", command=self._sign_out
         ).pack(side="right", padx=(8, 0))
         self._header_divider(right, side="right")
+
+        # Theme control. An icon button rather than a labelled control: the
+        # header is a fixed height and this must not add to it.
+        self._theme_button = ttk.Button(
+            right, text="", style="HeaderIcon.TButton", width=3,
+            command=self._toggle_theme,
+        )
+        self._theme_button.pack(side="right", padx=(4, 4))
+        self._paint_theme_button()
+
+        # Reduced-motion control, beside the theme control for the same reason.
+        self._motion_button = ttk.Button(
+            right, text="", style="HeaderIcon.TButton", width=3,
+            command=self._toggle_motion,
+        )
+        self._motion_button.pack(side="right", padx=(0, 2))
+        self._paint_motion_button()
 
         bell_host = ttk.Frame(right, style="Header.TFrame")
         bell_host.pack(side="right", padx=(8, 4))
@@ -292,27 +345,24 @@ class MainWindow:
         self._clock = ttk.Label(right, text="", style="Clock.TLabel")
         self._clock.pack(side="right", padx=(14, 14))
 
-        # The subsystem chips get their own row so a long status string can
-        # never squeeze the clock or the sign-out control off the header.
-        self.status_strip = ttk.Frame(
-            self.root, style="Header.TFrame", padding=(16, 0, 16, 9)
+        # Subsystem state lives on the command bar, not on a row of its own.
+        # The rail measures the width it is actually given and falls back from
+        # "DB CONNECTED" to "DB" to a bare dot rather than letting the last
+        # indicators fall off the end - a subsystem that is down has to stay
+        # visible at 1280 wide, not only at 1920.
+        self.status_strip = StatusRail(
+            self.header, fonts=self.fonts, surface=PALETTE.surface_alt,
+            on_click=lambda: self.navigate("health"),
         )
-        self.status_strip.pack(fill="x", side="top")
-        ttk.Label(
-            self.status_strip, text="SUBSYSTEMS", style="HeaderMuted.TLabel"
-        ).pack(side="left", padx=(0, 12))
+        self.status_strip.pack(side="left", padx=(18, 8), fill="x", expand=True)
         for key, label in (
-            ("database", "DATABASE"), ("nmap", "NMAP"), ("tshark", "TSHARK"),
+            ("database", "DB"), ("nmap", "NMAP"), ("tshark", "TSHARK"),
             ("capture", "CAPTURE"), ("snort", "SNORT"),
         ):
-            chip = StatusChip(
-                self.status_strip, label, fonts=self.fonts,
-                surface=PALETTE.surface_alt,
-                on_click=lambda: self.navigate("health"),
+            self._status_chips[key] = self.status_strip.add(
+                key, label,
                 tooltip_provider=lambda k=key: self._subsystem_detail(k),
             )
-            chip.pack(side="left", padx=(0, 8))
-            self._status_chips[key] = chip
 
         body = ttk.Frame(self.root, style="TFrame")
         body.pack(fill="both", expand=True)
@@ -325,7 +375,7 @@ class MainWindow:
         content_host = ttk.Frame(body, style="TFrame")
         content_host.pack(side="left", fill="both", expand=True)
 
-        self.page_header = ttk.Frame(content_host, style="TFrame", padding=(26, 20, 26, 10))
+        self.page_header = ttk.Frame(content_host, style="TFrame", padding=(20, 14, 20, 6))
         self.page_header.pack(fill="x")
         title_row = ttk.Frame(self.page_header, style="TFrame")
         title_row.pack(fill="x")
@@ -350,7 +400,7 @@ class MainWindow:
         refresh.pack(side="right")
         attach_tooltip(refresh, "Reload this screen from the database  (F5)")
 
-        self.content = ttk.Frame(content_host, style="TFrame", padding=(26, 8, 26, 18))
+        self.content = ttk.Frame(content_host, style="TFrame", padding=(20, 4, 20, 10))
         self.content.pack(fill="both", expand=True)
 
         self.status_bar = ttk.Frame(self.root, style="Header.TFrame", padding=(16, 6))
@@ -463,10 +513,9 @@ class MainWindow:
             # Letter-spaced, so a four-character heading still reads as a
             # section label rather than as another entry.
             group_label = ttk.Label(
-                group, text=" ".join(heading), style="NavGroup.TLabel",
-                font=self.fonts.small_bold,
+                group, text=heading, style="NavGroup.TLabel",
             )
-            group_label.pack(anchor="w", padx=20, pady=(14, 5))
+            group_label.pack(anchor="w", padx=16, pady=(12, 3))
             self._nav_group_headings.append(group_label)
 
             for key in allowed:
@@ -475,12 +524,12 @@ class MainWindow:
     def _add_nav_entry(self, parent: tk.Misc, key: str, label: str) -> None:
         """One sidebar row: indicator, icon, label, and sometimes a badge."""
         row = ttk.Frame(parent, style="Sidebar.TFrame")
-        row.pack(fill="x", padx=8, pady=2)
+        row.pack(fill="x", padx=6, pady=0)
 
         # A filled background alone is easy to lose against a dark sidebar, so
         # the current page also carries an accent bar down its left edge.
         indicator = tk.Frame(row, background=PALETTE.surface, width=3)
-        indicator.pack(side="left", fill="y", padx=(0, 5))
+        indicator.pack(side="left", fill="y", padx=(0, 4))
         indicator.pack_propagate(False)
         self._nav_indicators[key] = indicator
 
@@ -542,6 +591,20 @@ class MainWindow:
                     )
                 except tk.TclError:  # pragma: no cover - window closing
                     pass
+            row = self._nav_rows.get(key)
+            if row is not None:
+                try:
+                    row.configure(
+                        style="SidebarActive.TFrame" if active
+                        else "Sidebar.TFrame"
+                    )
+                except tk.TclError:  # pragma: no cover - window closing
+                    pass
+            badge = self._nav_badges.get(key)
+            if badge is not None:
+                badge.set_surface(
+                    PALETTE.surface_alt if active else PALETTE.surface
+                )
             indicator = self._nav_indicators.get(key)
             if indicator is not None:
                 try:
@@ -668,7 +731,7 @@ class MainWindow:
         self._palette.open()
 
     def _search_records(self, query: str) -> None:
-        """Look real hosts, incidents and alerts up for the palette (§61).
+        """Look real hosts and alerts up for the palette (§61).
 
         The palette is the fastest way into a record an analyst already has a
         name for - an address, a reference, a signature. The lookup runs off the
@@ -699,7 +762,7 @@ class MainWindow:
         ).start()
 
     def _record_commands(self, query: str) -> list[Command]:
-        """Build palette entries from stored hosts, incidents and alerts."""
+        """Build palette entries from stored hosts and alerts."""
         session = self.session
         commands: list[Command] = []
         if session is None:
@@ -720,27 +783,6 @@ class MainWindow:
                         detail=f"{host.ip_address} · {host.risk_level}",
                         run=lambda identifier=host.id: self.navigate(
                             "hosts", focus_host=identifier
-                        ),
-                    )
-                )
-
-        correlation = self.context.correlation
-        if correlation is not None and self._may("incident.view"):
-            for incident in self._safe_search(
-                lambda: correlation.search(
-                    session, text=query, limit=RECORD_SEARCH_LIMIT
-                )
-            ):
-                if incident.id is None:
-                    continue
-                commands.append(
-                    Command(
-                        key=f"incident-{incident.id}",
-                        title=f"{incident.reference}  {incident.title}",
-                        category="Incident",
-                        detail=f"{incident.severity} · {incident.status}",
-                        run=lambda identifier=incident.id: self.navigate(
-                            "incidents", focus_incident=identifier
                         ),
                     )
                 )
@@ -877,8 +919,15 @@ class MainWindow:
         """Switch to a screen, building it on first use."""
         if screen_key == self._current and not kwargs:
             return
+        if screen_key in RETIRED_SCREENS:
+            # An old link, a saved last-screen, or a bookmark to a screen that
+            # no longer exists. It lands somewhere real rather than on a
+            # broken page, and only the arguments that still mean something
+            # there come with it: a search does, an incident id does not.
+            screen_key = RETIRED_SCREENS[screen_key]
+            kwargs = {k: v for k, v in kwargs.items() if k == "search"}
         if screen_key not in self._nav_buttons and screen_key not in (
-            "host_detail", "incident_detail"
+            "host_detail",
         ):
             LOGGER.debug("Navigation to '%s' is not permitted.", screen_key)
             return
@@ -915,6 +964,110 @@ class MainWindow:
         except Exception:  # noqa: BLE001
             LOGGER.exception("Screen '%s' failed on_show.", screen_key)
 
+    # ------------------------------------------------------------------
+    # Appearance
+    # ------------------------------------------------------------------
+    def _paint_theme_button(self) -> None:
+        """Show the theme the button switches *to*, which is what it does."""
+        going_to_light = current_theme() == "dark"
+        self._theme_button.configure(text="☀" if going_to_light else "☾")
+        tooltip = (
+            "Switch to light theme" if going_to_light else "Switch to dark theme"
+        )
+        try:
+            Tooltip(self._theme_button, tooltip)
+        except Exception:  # noqa: BLE001 - a tooltip is never worth a crash
+            pass
+
+    def _toggle_theme(self) -> None:
+        """Switch between the dark and light themes and remember the choice."""
+        self.apply_appearance("light" if current_theme() == "dark" else "dark")
+
+    def _paint_motion_button(self) -> None:
+        """Show whether animation is on, and what the button will do."""
+        from aethra_sec.ui.theme import motion_enabled
+
+        on = motion_enabled()
+        # A filled glyph while animation is on, an outline while it is reduced.
+        self._motion_button.configure(text="◉" if on else "◯")
+        tooltip = "Reduce motion (animations on)" if on else "Enable motion (reduced)"
+        try:
+            Tooltip(self._motion_button, tooltip)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _toggle_motion(self) -> None:
+        """Turn subtle animation on or off, and remember the choice."""
+        from aethra_sec.ui.theme import motion_enabled, set_motion
+
+        reduce_now = motion_enabled()  # currently on -> reduce it
+        set_motion(not reduce_now)
+        self.state.set(KEY_REDUCED_MOTION, reduce_now)
+        self.state.save()
+        self._paint_motion_button()
+        # Repaint the status strip so any active dot starts/stops pulsing at
+        # once rather than at the next probe.
+        self._refresh_status_strip()
+        self.set_status(
+            "Reduced motion on." if reduce_now else "Animations on."
+        )
+
+    def apply_appearance(self, theme: str) -> None:
+        """Adopt ``theme`` across the whole interface.
+
+        There is one set of screens and one shell; only the tokens change. But
+        ttk styles are configured from those tokens once, and every canvas
+        widget - cards, chips, charts, the header rail - paints itself with the
+        colours current when it was drawn. Restyling alone therefore leaves the
+        chrome in the old theme.
+
+        So the shell is rebuilt through the same methods that built it in the
+        first place. There is no second code path and no duplicated layout: the
+        switch re-runs :meth:`_build_layout`, which is what a fresh window runs.
+
+        Screen state is deliberately not carried across. A rebuilt screen
+        reloads from the repositories it always reads, so what comes back is
+        the real current data rather than a snapshot preserved through a
+        repaint.
+        """
+        applied = set_theme(theme)
+        self.state.set(KEY_THEME, applied)
+        # Written now rather than at shutdown: this is a deliberate preference,
+        # and it has to survive the application not closing cleanly.
+        self.state.save()
+
+        remember_screen = self._current
+        collapsed = self._sidebar_collapsed
+
+        # Restyle ttk from the new tokens, then rebuild everything that painted
+        # itself with the old ones.
+        self.fonts = apply_theme(self.root)
+        self._close_overlays()
+
+        for screen in list(self._screens.values()):
+            try:
+                screen.destroy()
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("A screen failed to close during a theme change.")
+        self._screens.clear()
+        self._current = ""
+
+        for child in list(self.root.winfo_children()):
+            try:
+                child.destroy()
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Shell teardown failed during a theme change.")
+
+        self.root.configure(background=PALETTE.background)
+        self._sidebar_collapsed = False
+        self._build_layout()
+        if collapsed:
+            self.toggle_sidebar()
+
+        target = remember_screen if remember_screen in self._nav_buttons else ""
+        self.navigate(target or self._initial_screen())
+        self.set_status(f"{applied.capitalize()} theme applied.")
+
     def _get_screen(self, key: str) -> Screen | None:
         """Return a screen, constructing and building it on first use."""
         if key in self._screens:
@@ -939,7 +1092,6 @@ class MainWindow:
         from aethra_sec.ui.screens.dashboard import DashboardScreen
         from aethra_sec.ui.screens.health import HealthScreen
         from aethra_sec.ui.screens.hosts import HostsScreen
-        from aethra_sec.ui.screens.incidents import IncidentsScreen
         from aethra_sec.ui.screens.logs import LogsScreen
         from aethra_sec.ui.screens.mitigation import MitigationScreen
         from aethra_sec.ui.screens.reports import ReportsScreen
@@ -954,7 +1106,6 @@ class MainWindow:
             "vulnerabilities": VulnerabilitiesScreen,
             "hosts": HostsScreen,
             "alerts": AlertsScreen,
-            "incidents": IncidentsScreen,
             "mitigation": MitigationScreen,
             "reports": ReportsScreen,
             "logs": LogsScreen,
@@ -983,6 +1134,12 @@ class MainWindow:
             payload = event.payload
             title = str(getattr(payload, "title", "Notification"))
             message = str(getattr(payload, "message", ""))
+            # Sound it on the same path that already shows it. The audio
+            # service queues and plays on its own worker, so this returns
+            # immediately and the Tk loop is never held for playback.
+            audio = getattr(self.context, "audio_alerts", None)
+            if audio is not None:
+                audio.notify(payload)
             self.set_status(f"{title}: {message}")
             self._toasts.show(
                 title, message,
@@ -990,24 +1147,6 @@ class MainWindow:
                 on_click=lambda: self._toggle_notifications(force_open=True),
             )
             self.refresh_notifications()
-        elif event.type == EventType.INCIDENT_CREATED:
-            incident = getattr(event.payload, "incident", None)
-            if incident is not None:
-                self.set_status(
-                    f"Incident {incident.reference} created "
-                    f"[{incident.severity}] {incident.title}"
-                )
-                self._toasts.show(
-                    f"Incident {incident.reference} · {incident.severity}",
-                    f"{incident.title}\nEvidence: {incident.source_label}",
-                    level=(
-                        "CRITICAL"
-                        if str(incident.severity) in ("CRITICAL", "HIGH")
-                        else "WARNING"
-                    ),
-                    on_click=lambda: self.navigate("incidents"),
-                )
-                self.refresh_notifications()
         elif event.type == EventType.NMAP_SCAN_COMPLETED:
             scan = getattr(event.payload, "scan", None)
             if scan is not None:
@@ -1095,59 +1234,79 @@ class MainWindow:
         if health is None:
             return
         statuses = health.statuses()
-        for key, chip in self._status_chips.items():
+        for key in self._status_chips:
             status = statuses.get(key)
             if status is None:
                 continue
-            chip.update_state(status.display_state)
+            self.status_strip.update_state(key, status.display_state)
 
-    def refresh_nav_badges(self) -> None:
-        """Public entry point for a screen to force an immediate badge repaint.
-
-        The tick loop calls this on its own cadence already; screens use this
-        after a bulk action (e.g. "mark all read") so the sidebar updates the
-        moment the action completes rather than on the next tick.
-        """
-        self._refresh_nav_badges()
+    #: Least time between sidebar badge reads. The counts change at detection
+    #: speed, not per tick, so a few seconds keeps them live without a
+    #: DB query on the Tk thread every tick.
+    BADGE_REFRESH_SECONDS = 4.0
 
     def _refresh_nav_badges(self) -> None:
-        """Update the sidebar counters from stored records only.
+        """Paint the sidebar counters from cache; refresh the cache off-thread.
 
-        An empty system shows no badges at all, because a badge means "there is
-        something here" and inventing one would misrepresent the state (§1).
+        The paint is pure UI. The counts are read on a worker thread and cached,
+        because reading them here would put three synchronous DB round-trips on
+        the Tk thread every tick - the stall an operator feels as lag. An empty
+        system shows no badges at all: a badge means "there is something here",
+        and inventing one would misrepresent the state (§1).
         """
-        snort = self.context.snort
-        if snort is not None and "alerts" in self._nav_badges:
-            try:
-                count = snort.unresolved_alert_count(self.session)
-            except Exception:  # noqa: BLE001 - a badge must not break the shell
-                count = 0
-            self._nav_badges["alerts"].set_count(count, colour=PALETTE.high)
+        colours = {
+            "alerts": PALETTE.high,
+            "users": PALETTE.medium,
+        }
+        for key, colour in colours.items():
+            if key in self._nav_badges and key in self._badge_counts:
+                self._nav_badges[key].set_count(self._badge_counts[key], colour=colour)
+        self._maybe_refresh_badge_counts()
 
-        correlation = self.context.correlation
-        if correlation is not None and "incidents" in self._nav_badges:
-            try:
-                count = correlation.open_incident_count(self.session)
-            except Exception:  # noqa: BLE001
-                count = 0
-            self._nav_badges["incidents"].set_count(count, colour=PALETTE.critical)
-
-        recovery = self.context.recovery
+    def _maybe_refresh_badge_counts(self) -> None:
+        """Read the badge counts on a worker thread, at most every few seconds."""
+        if self._badge_job_running or self._closing:
+            return
+        now = time.monotonic()
+        if now - self._badge_refreshed_at < self.BADGE_REFRESH_SECONDS:
+            return
+        self._badge_refreshed_at = now
         session = self.session
-        if (
-            recovery is not None
-            and session is not None
-            and "users" in self._nav_badges
-            and session.has(Permission.USER_RESET_APPROVE)
-        ):
+        snort = self.context.snort
+        recovery = self.context.recovery
+        may_approve = session is not None and session.has(
+            Permission.USER_RESET_APPROVE
+        )
+
+        def work() -> dict[str, int]:
+            counts: dict[str, int] = {}
+            if snort is not None:
+                try:
+                    counts["alerts"] = snort.unresolved_alert_count(session)
+                except Exception:  # noqa: BLE001
+                    pass
             # Only ask when the session may: an unauthorised read would be
-            # refused and audited on every tick, which is not a badge, it is a
-            # flood of denial records.
+            # refused and audited every refresh - a flood of denial records.
+            if recovery is not None and may_approve:
+                try:
+                    counts["users"] = recovery.pending_count(session)
+                except Exception:  # noqa: BLE001
+                    pass
+            return counts
+
+        def runner() -> None:
             try:
-                count = recovery.pending_count(session)
-            except Exception:  # noqa: BLE001
-                count = 0
-            self._nav_badges["users"].set_count(count, colour=PALETTE.medium)
+                counts = work()
+            except Exception:  # noqa: BLE001 - a badge read must not crash a worker
+                counts = {}
+            def deliver() -> None:
+                self._badge_job_running = False
+                if not self._closing:
+                    self._badge_counts.update(counts)
+            dispatch.post(deliver)
+
+        self._badge_job_running = True
+        threading.Thread(target=runner, name="nav-badges", daemon=True).start()
 
     def _set_busy(self, busy: bool) -> None:
         """Show or clear the activity marker in the status bar."""
@@ -1228,8 +1387,8 @@ class MainWindow:
                 self._notification_body,
                 text=(
                     "AETHRA-SEC raises a notification only for a real event: a "
-                    "new alert, a completed or failed assessment, a correlated "
-                    "incident or a subsystem failure. There have been none."
+                    "new alert, a completed or failed assessment, or a "
+                    "subsystem failure. There have been none."
                 ),
                 style="OverlayDim.TLabel", wraplength=380, justify="left",
             ).pack(anchor="w", pady=(6, 0))
@@ -1254,7 +1413,8 @@ class MainWindow:
             heading.configure(foreground=colour if not notification.is_read else PALETTE.text_muted)
             heading.pack(anchor="w")
             ttk.Label(
-                body, text=notification.message, style="OverlayMuted.TLabel",
+                body, text=notification.display_message,
+                style="OverlayMuted.TLabel",
                 wraplength=360, justify="left",
             ).pack(anchor="w")
             ttk.Label(
@@ -1348,7 +1508,7 @@ class MainWindow:
         capture = self.context.capture
         if capture is not None and capture.is_running:
             try:
-                capture.stop(reason=reason)
+                capture.stop_for_shutdown(reason=reason)
             except Exception:  # noqa: BLE001 - teardown must not raise
                 LOGGER.exception("Stopping capture during %s failed.", reason)
 

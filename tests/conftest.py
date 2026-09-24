@@ -34,6 +34,33 @@ TEST_DATABASE = os.environ.get("AETHRA_TEST_DB_NAME", "aethra_sec_test")
 
 
 # ---------------------------------------------------------------------------
+# Tk
+# ---------------------------------------------------------------------------
+@pytest.fixture(scope="session")
+def tk_root() -> Iterator[object]:
+    """One Tk interpreter, shared by every widget test in the session.
+
+    Creating and destroying an interpreter per test is unreliable on Windows:
+    measured here, roughly one run in three had a later ``tk.Tk()`` raise
+    TclError, and because each of those tests guards the call with a skip, the
+    run stayed green while silently losing the coverage. Reusing one root
+    removes the flake - tests build their widgets as children of it and
+    destroy those, not the interpreter.
+    """
+    import tkinter as tk
+
+    try:
+        root = tk.Tk()
+    except tk.TclError:  # pragma: no cover - genuinely headless
+        pytest.skip("no display available")
+    root.withdraw()
+    try:
+        yield root
+    finally:
+        root.destroy()
+
+
+# ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
 @pytest.fixture(scope="session")
@@ -102,32 +129,67 @@ def _drop_all(manager: DatabaseManager) -> None:
     manager.execute("SET FOREIGN_KEY_CHECKS = 1")
 
 
+#: Tables truncated between tests, in an order that respects foreign keys even
+#: if the constraint check were left on. ``users`` is included: seeding creates
+#: roles, permissions, settings and the mitigation knowledge base but never a
+#: user account, so every account in the test schema was created by a test.
+PER_TEST_TABLES = (
+    "incident_events", "incident_notes", "incidents", "snort_alerts",
+    "traffic_anomalies", "scan_findings", "ports", "scan_hosts", "scans",
+    "traffic_records", "traffic_aggregates", "host_observations",
+    "trusted_hosts", "hosts", "notification_reads", "notifications",
+    "app_errors", "reports",
+    "audit_logs", "login_attempts", "sessions",
+    "password_reset_requests", "users",
+)
+
+
 @pytest.fixture
 def clean_db(db: DatabaseManager) -> Iterator[DatabaseManager]:
     """Truncate per-test tables between tests, keeping seeded configuration.
 
-    ``users`` is included: seeding creates roles, permissions, settings and the
-    mitigation knowledge base but never a user account, so every account in the
-    test schema was created by a test.
+    The whole cleanup runs on **one** checked-out connection. This matters:
+    ``FOREIGN_KEY_CHECKS`` is a MySQL *session* variable, so issuing it through
+    the pooled ``execute`` helper set it on whichever connection happened to be
+    free, while the ``TRUNCATE`` statements that depend on it ran on others
+    with the constraint still enforced. ``TRUNCATE users`` then failed, the
+    teardown raised, and the accounts survived into the next test - which is
+    why ``test_password_recovery`` intermittently failed with a duplicate
+    ``admin`` depending on the order the suite happened to run in.
+
+    Cleared **before** the test as well as after. Cleaning up only on the way
+    out guarantees nothing about what a test *starts* with: a test using the
+    plain ``db`` fixture leaves its rows behind, so whether a ``clean_db``
+    test saw an empty database depended on the order pytest happened to
+    collect the files in. One report test asserting "the one stored alert"
+    passed alone and failed after a module that inserts alerts, which is the
+    worst kind of failure - real, but visible only in some orderings.
     """
+    _truncate_per_test_tables(db)
     yield db
-    db.execute("SET FOREIGN_KEY_CHECKS = 0")
-    for table in (
-        "incident_events", "incident_notes", "incidents", "snort_alerts",
-        "traffic_anomalies",
-        "scan_findings", "ports", "scan_hosts", "scans",
-        "traffic_records", "traffic_aggregates", "host_observations",
-        "trusted_hosts", "hosts", "notifications", "app_errors", "reports",
-        "audit_logs", "login_attempts", "sessions",
-        "password_reset_requests", "users",
-    ):
-        db.execute(f"TRUNCATE TABLE `{table}`")
-    # Configuration tables survive truncation, so clear the author columns that
-    # still point at the accounts just removed.
-    db.execute("UPDATE system_settings SET updated_by = NULL")
-    db.execute("UPDATE mitigation_recommendations SET created_by = NULL, updated_by = NULL")
-    db.execute("UPDATE vuln_knowledge SET created_by = NULL")
-    db.execute("SET FOREIGN_KEY_CHECKS = 1")
+    _truncate_per_test_tables(db)
+
+
+def _truncate_per_test_tables(db: DatabaseManager) -> None:
+    """Empty the per-test tables, keeping seeded configuration."""
+    with db.connection() as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
+            for table in PER_TEST_TABLES:
+                cursor.execute(f"TRUNCATE TABLE `{table}`")
+            # Configuration tables survive truncation, so clear the author
+            # columns that still point at the accounts just removed.
+            cursor.execute("UPDATE system_settings SET updated_by = NULL")
+            cursor.execute(
+                "UPDATE mitigation_recommendations "
+                "SET created_by = NULL, updated_by = NULL"
+            )
+            cursor.execute("UPDATE vuln_knowledge SET created_by = NULL")
+            cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
+            conn.commit()
+        finally:
+            cursor.close()
 
 
 # ---------------------------------------------------------------------------

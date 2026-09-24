@@ -159,9 +159,9 @@ class TestRepositories:
         """Hosts are created once and updated on later observations."""
         hosts = HostRepository(db)
         now = utcnow()
-        host_id = hosts.upsert_observed("192.168.1.25", observed_at=now, mac_address="aa:bb:cc:dd:ee:ff")
+        host_id = hosts.upsert_observed("192.168.1.25", observed_at=now, mac_address="aa:bb:cc:dd:ee:ff", source=EvidenceSource.PYSHARK)
         assert host_id
-        assert hosts.upsert_observed("192.168.1.25", observed_at=now) == host_id
+        assert hosts.upsert_observed("192.168.1.25", observed_at=now, source=EvidenceSource.PYSHARK) == host_id
         assert hosts.count_all() == 1
 
         hosts.update_identity(host_id, hostname="server.lab", os_name="Linux", status=HostStatus.UP)
@@ -187,7 +187,7 @@ class TestRepositories:
     def test_trusted_hosts(self, db: DatabaseManager) -> None:
         """Trust is recorded and can be withdrawn."""
         hosts = HostRepository(db)
-        hosts.upsert_observed("192.168.1.10", observed_at=utcnow())
+        hosts.upsert_observed("192.168.1.10", observed_at=utcnow(), source=EvidenceSource.PYSHARK)
         hosts.add_trusted("192.168.1.10", "Monitoring server", "Approved scanner", None)
         assert "192.168.1.10" in hosts.trusted_addresses()
         host = hosts.get_by_ip("192.168.1.10")
@@ -204,7 +204,7 @@ class TestRepositories:
                  created_at=utcnow())
         )
         scans.mark_running(scan_id, "nmap -sT -sV 192.168.1.25", "Nmap 7.94")
-        host_id = hosts.upsert_observed("192.168.1.25", observed_at=utcnow())
+        host_id = hosts.upsert_observed("192.168.1.25", observed_at=utcnow(), source=EvidenceSource.PYSHARK)
         scan_host_id = scans.add_scan_host(
             scan_id,
             ScanHostResult(
@@ -400,8 +400,16 @@ class TestRepositories:
 # Authentication
 # ---------------------------------------------------------------------------
 @pytest.fixture
-def auth_stack(db: DatabaseManager):
-    """Build the authentication stack against the test database."""
+def auth_stack(clean_db: DatabaseManager):
+    """Build the authentication stack against the test database.
+
+    Takes ``clean_db`` rather than ``db``. The accounts created below are not
+    truncated by the session-scoped fixture, so they survived into every later
+    module and made ``test_password_recovery`` fail with a duplicate ``admin``
+    whenever it happened to run afterwards - which, with the suite in random
+    order, it did about half the time.
+    """
+    db = clean_db
     users = UserRepository(db)
     audit = AuditService(AuditRepository(db))
     sessions = SessionManager(60)
@@ -533,11 +541,28 @@ class TestCorrelation:
     @pytest.mark.parametrize(
         ("message", "expected"),
         [
-            ("ET SCAN Potential SSH brute force login attempt", ThreatCategory.BRUTE_FORCE),
-            ("ET TROJAN Command and Control activity", ThreatCategory.MALWARE_INDICATOR),
             ("SQL Injection attempt detected", ThreatCategory.SUSPICIOUS_PAYLOAD),
             ("ET SCAN Nmap portscan detected", ThreatCategory.PORT_SCAN),
             ("ICMP ping sweep detected", ThreatCategory.HOST_SWEEP),
+            # A sensor that names the flood is taken at its word. This case
+            # read DENIAL_OF_SERVICE until the specific flood categories were
+            # added to the keyword table: every flood alert was filed under
+            # the one general category and carried the one general mitigation
+            # entry, while MIT-UDP-FLOOD sat active and mapped and unreachable
+            # from Snort. The general category is still the answer for text
+            # that only says "denial of service", covered below.
+            ("UDP flood - possible DoS", ThreatCategory.UDP_FLOOD),
+            ("TCP SYN flood - possible DoS", ThreatCategory.TCP_SYN_FLOOD),
+            ("ICMP flood - possible ping flood/DoS", ThreatCategory.ICMP_FLOOD),
+            # A SYN flood aimed at a web server is still a SYN flood. HTTP_FLOOD
+            # means request volume, which is a different observation with
+            # different guidance.
+            (
+                "HTTP port SYN flood - possible web server DoS",
+                ThreatCategory.TCP_SYN_FLOOD,
+            ),
+            ("Generic denial of service attempt", ThreatCategory.DENIAL_OF_SERVICE),
+            ("ET RECON banner grab attempt", ThreatCategory.RECONNAISSANCE),
             ("Something entirely unfamiliar", ThreatCategory.UNCLASSIFIED),
         ],
     )
@@ -545,6 +570,43 @@ class TestCorrelation:
         """Alerts are categorised from their own signature text."""
         alert = SnortAlert(message=message, severity=Severity.MEDIUM)
         assert categorise_alert(alert) is expected
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "ET SCAN Potential SSH brute force login attempt",
+            "ET TROJAN Command and Control activity",
+            "ET MALWARE Ransomware beacon observed",
+        ],
+    )
+    def test_out_of_scope_signatures_are_not_given_a_category(
+        self, message: str
+    ) -> None:
+        """Brute force and malware are not categories this system claims.
+
+        Both were keyword buckets that attributed an incoming Snort alert to a
+        category outside the study's tested scope and beyond anything
+        AETHRA-SEC can detect for itself. The alert is still stored in full -
+        message, addresses, priority and all - and remains searchable; what it
+        no longer gets is a classification the system cannot stand behind.
+        """
+        alert = SnortAlert(message=message, severity=Severity.MEDIUM)
+        assert categorise_alert(alert) is ThreatCategory.UNCLASSIFIED
+
+    def test_a_vendor_rule_prefix_is_not_evidence_of_reconnaissance(self) -> None:
+        """"ET SCAN" names the rule family, not the traffic.
+
+        A bare ``scan`` keyword matched every Emerging Threats rule whose name
+        begins "ET SCAN". It was harmless only while the brute-force group sat
+        above it and absorbed those alerts first; once that group was removed,
+        a credential-guessing alert would have been filed as reconnaissance on
+        the strength of a naming convention.
+        """
+        alert = SnortAlert(
+            message="ET SCAN Potential SSH brute force login attempt",
+            severity=Severity.MEDIUM,
+        )
+        assert categorise_alert(alert) is not ThreatCategory.RECONNAISSANCE
 
     def test_single_source_incident_says_so(self, db: DatabaseManager, correlation_stack) -> None:
         """An incident with one contributing subsystem states that (§78)."""
@@ -554,7 +616,7 @@ class TestCorrelation:
         alerts.insert_alert(
             SnortAlert(
                 alert_time=now, received_at=now, generator_id=1, signature_id=2001219,
-                revision=19, message="ET SCAN Potential SSH brute force login attempt",
+                revision=19, message="ET SCAN Nmap portscan detected",
                 priority=2, severity=Severity.HIGH, protocol="TCP",
                 src_ip="192.168.1.50", src_port=44321, dst_ip="192.168.1.25",
                 dst_port=22, dedup_key="one", created_at=now,
@@ -564,7 +626,7 @@ class TestCorrelation:
         incidents = IncidentRepository(db).search()
         assert len(incidents) == 1
         incident = incidents[0]
-        assert incident.category is ThreatCategory.BRUTE_FORCE
+        assert incident.category is ThreatCategory.PORT_SCAN
         assert incident.source_label == "Snort only"
         assert not incident.is_multi_source
         assert "Evidence: Snort only." in incident.description
@@ -598,7 +660,7 @@ class TestCorrelation:
         alerts.insert_alert(
             SnortAlert(
                 alert_time=now, received_at=now, generator_id=1, signature_id=2001219,
-                revision=19, message="ET SCAN Potential SSH brute force login attempt",
+                revision=19, message="ET SCAN Nmap portscan detected",
                 priority=2, severity=Severity.HIGH, protocol="TCP",
                 src_ip="192.168.1.50", src_port=44321, dst_ip="192.168.1.25",
                 dst_port=22, dedup_key="multi", created_at=now,
@@ -606,7 +668,9 @@ class TestCorrelation:
         )
         alerts.insert_anomaly(
             TrafficAnomaly(
-                rule_id="RULE-PORT-SCAN", category=ThreatCategory.BRUTE_FORCE,
+                # The category now matches the rule that raised it; the
+                # two disagreeing was never meaningful to this test.
+                rule_id="RULE-PORT-SCAN", category=ThreatCategory.PORT_SCAN,
                 title="Repeated connection attempts",
                 observation="Repeated attempts observed.", severity=Severity.MEDIUM,
                 src_ip="192.168.1.50", dst_ip="192.168.1.25", dst_port=22,
@@ -679,7 +743,7 @@ class TestCorrelation:
         alerts.insert_alert(
             SnortAlert(
                 alert_time=now, received_at=now, generator_id=1, signature_id=2001219,
-                revision=19, message="ET SCAN Potential SSH brute force login attempt",
+                revision=19, message="ET SCAN Nmap portscan detected",
                 priority=2, severity=Severity.HIGH, protocol="TCP",
                 src_ip="192.168.1.50", dst_ip="192.168.1.25", dst_port=22,
                 dedup_key="mit", created_at=now,
@@ -690,10 +754,44 @@ class TestCorrelation:
         assert incident.mitigation_id is not None
         advice = mitigation.advice_for_incident(incident, ("evidence line",))
         assert advice is not None
-        assert advice.recommendation.code == "MIT-BRUTE-FORCE"
+        assert advice.recommendation.code == "MIT-PORT-SCAN"
         text = advice.as_text()
         assert "IMMEDIATE RECOMMENDED ACTION" in text
         assert "does not apply mitigations automatically" in text
+
+    def test_an_unclassifiable_alert_gets_no_invented_guidance(
+        self, db: DatabaseManager, correlation_stack
+    ) -> None:
+        """It gets the unclassified entry, not guidance for a guessed threat.
+
+        A Snort signature naming a threat outside the study's scope used to be
+        attributed to a category with its own tailored recommendation. The
+        alert is still recorded in full; what it now receives is the guidance
+        for an event that could not be classified, which is what actually
+        happened.
+        """
+        service, _bus, mitigation = correlation_stack
+        alerts = AlertRepository(db)
+        now = utcnow()
+        alerts.insert_alert(
+            SnortAlert(
+                alert_time=now, received_at=now, generator_id=1,
+                signature_id=2001220, revision=1,
+                message="ET TROJAN Command and Control activity",
+                priority=2, severity=Severity.HIGH, protocol="TCP",
+                src_ip="192.168.1.51", dst_ip="192.168.1.25", dst_port=443,
+                dedup_key="unclassified", created_at=now,
+            )
+        )
+        service.correlate_recent()
+        incident = IncidentRepository(db).search()[0]
+        advice = mitigation.advice_for_incident(incident, ("evidence line",))
+        assert advice is not None
+        assert advice.recommendation.code == "MIT-UNCLASSIFIED"
+        # The evidence itself is untouched: the alert is still there in full.
+        stored = alerts.search_alerts(text="Command and Control")
+        assert len(stored) == 1
+        assert stored[0].message == "ET TROJAN Command and Control activity"
 
     def test_incident_lifecycle(self, db: DatabaseManager, correlation_stack) -> None:
         """Status changes are recorded and close the incident (§94)."""
@@ -859,6 +957,10 @@ class TestSettingsService:
         The session carries a real ``users`` row because a stored setting
         records who changed it; a session for an account that does not exist
         could never occur in the application.
+
+        Every caller passes ``clean_db``, so the account is removed after each
+        test. Left behind, it collided with the administrator that
+        ``test_password_recovery`` creates for itself.
         """
         audit = AuditService(AuditRepository(db))
         sessions = SessionManager(60)
@@ -882,38 +984,38 @@ class TestSettingsService:
         )
         return service, session, audit
 
-    def test_change_is_persisted_and_audited(self, db: DatabaseManager) -> None:
+    def test_change_is_persisted_and_audited(self, clean_db: DatabaseManager) -> None:
         """A valid change is stored and recorded in the audit trail."""
-        service, session, audit = self._service(db)
+        service, session, audit = self._service(clean_db)
         service.set(session, "detection.port_scan_distinct_ports", 42)
         assert service.get_int("detection.port_scan_distinct_ports") == 42
-        assert SettingsService(SettingsRepository(db)).get_int(
+        assert SettingsService(SettingsRepository(clean_db)).get_int(
             "detection.port_scan_distinct_ports"
         ) == 42
         assert audit.search(action="SETTING_CHANGED")
 
-    def test_range_is_enforced(self, db: DatabaseManager) -> None:
+    def test_range_is_enforced(self, clean_db: DatabaseManager) -> None:
         """Out-of-range values are refused."""
-        service, session, _audit = self._service(db)
+        service, session, _audit = self._service(clean_db)
         with pytest.raises(ValidationFailedError):
             service.set(session, "detection.port_scan_distinct_ports", 0)
         with pytest.raises(ValidationFailedError):
             service.set(session, "detection.port_scan_distinct_ports", 99999)
 
-    def test_unknown_setting_refused(self, db: DatabaseManager) -> None:
+    def test_unknown_setting_refused(self, clean_db: DatabaseManager) -> None:
         """Only declared settings can be written."""
-        service, session, _audit = self._service(db)
+        service, session, _audit = self._service(clean_db)
         with pytest.raises(ValidationFailedError):
             service.set(session, "detection.not_a_real_setting", 1)
 
-    def test_non_admin_is_refused(self, db: DatabaseManager) -> None:
+    def test_non_admin_is_refused(self, clean_db: DatabaseManager) -> None:
         """A normal user cannot change settings."""
         from aethra_sec.core.permissions import PermissionSet
 
-        audit = AuditService(AuditRepository(db))
+        audit = AuditService(AuditRepository(clean_db))
         sessions = SessionManager(60)
         access = AccessControl(sessions, audit)
-        service = SettingsService(SettingsRepository(db), access, audit)
+        service = SettingsService(SettingsRepository(clean_db), access, audit)
         analyst = sessions.create(
             user_id=2, username="analyst", role="USER",
             permissions=PermissionSet.for_role("USER"),

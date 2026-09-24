@@ -8,7 +8,6 @@ from aethra_sec.ui.widgets.cards import (
     EmptyState,
     FilterBar,
     KeyValueList,
-    RiskFactorList,
     ScrollableFrame,
     SeverityBadge,
     StatCard,
@@ -34,9 +33,19 @@ from aethra_sec.ui.widgets.chips import (
     rounded_rectangle,
 )
 from aethra_sec.ui.widgets.drawer import DetailDrawer, DrawerSection
+from aethra_sec.ui.widgets.kpi import Kpi, KpiStrip
+from aethra_sec.ui.widgets.factgrid import (
+    Fact,
+    FactGrid,
+)
+from aethra_sec.ui.widgets.interface_picker import InterfacePicker
+from aethra_sec.ui.widgets.mitigation_panel import MitigationPanel
+from aethra_sec.ui.widgets.splitview import SplitView, Workspace
+from aethra_sec.ui.widgets.packet_inspector import PacketInspector
 from aethra_sec.ui.widgets.dialogs import (
     ConfirmDialog,
     DetailDialog,
+    DetailSection,
     FormDialog,
     FormField,
     MessageDialog,
@@ -58,12 +67,12 @@ from aethra_sec.ui.widgets.tooltip import Tooltip, attach_tooltip
 
 __all__ = [
     "BarChart", "Card", "Chip", "Column", "Command", "CommandPalette",
-    "ConfirmDialog", "ControlBar", "CountBadge", "DataTable", "DetailDialog",
+    "ConfirmDialog", "ControlBar", "CountBadge", "DataTable", "DetailDialog", "DetailSection",
     "DetailDrawer", "DonutChart", "DrawerSection",
     "EmptyState", "FilterBar", "HoverSurface", "MetricTile", "Pill",
     "Surface", "blend", "FormDialog", "FormField", "KeyValueList",
     "MessageDialog",
-    "RiskFactorList", "RowAction", "ScrollableFrame", "SeverityBadge",
+    "Fact", "FactGrid", "InterfacePicker", "Kpi", "KpiStrip", "MitigationPanel", "PacketInspector", "SplitView", "Workspace", "RowAction", "ScrollableFrame", "SeverityBadge",
     "SeverityChip", "SparkBar", "Sparkline", "StatCard", "StatusChip",
     "StatusIndicator", "SummaryCell", "SummaryStrip", "TimeSeriesChart",
     "TimelineChart", "ToastManager", "Toolbar", "Tooltip", "attach_tooltip",

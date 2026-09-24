@@ -21,6 +21,12 @@ from aethra_sec.database.repositories.incidents import IncidentRepository
 from aethra_sec.database.repositories.scans import ScanRepository
 from aethra_sec.database.repositories.traffic import TrafficRepository
 from aethra_sec.models.enums import ReportType
+from aethra_sec.models.scope import (
+    PRIMARY_SCENARIOS,
+    scenario_name,
+    scope_of,
+)
+from aethra_sec.models.severity_source import SEVERITY_DISCLOSURE
 from aethra_sec.utils.formatting import format_bytes, format_count, format_rate
 from aethra_sec.utils.timeutil import format_local, utcnow
 from aethra_sec.version import APP_FULL_NAME, APP_VERSION, AUTHORIZED_USE_NOTICE
@@ -48,11 +54,6 @@ EDUCATIONAL_NOTES: dict[str, str] = {
         "Traffic anomalies are threshold-based observations from live packet "
         "analysis. Each one records the value measured, the configured "
         "threshold and the time window, so the judgement can be audited."
-    ),
-    "incidents": (
-        "An incident groups related evidence from one or more subsystems. The "
-        "evidence source line states exactly which subsystems contributed - an "
-        "incident supported by only one source says so."
     ),
     "traffic": (
         "Traffic figures are computed from packets actually captured on the "
@@ -153,14 +154,26 @@ class ReportBuilder:
         hosts: HostRepository,
         traffic: TrafficRepository,
         audit: AuditRepository,
+        mitigation: Any = None,
     ) -> None:
-        """Bind the builder to the repositories it reads."""
+        """Bind the builder to the repositories it reads.
+
+        Args:
+            mitigation: the mitigation service, used to map each alert to its
+                guidance the same way the IDS Alerts screen does. ``None``
+                makes the Mitigation report say so rather than guess.
+        """
         self._scans = scans
         self._alerts = alerts
+        # Retained to read historical incident records only. Incidents are no
+        # longer a screen of their own and the correlation job that created
+        # them is off by default, so no report is built from them any more;
+        # the history stays queryable.
         self._incidents = incidents
         self._hosts = hosts
         self._traffic = traffic
         self._audit = audit
+        self._mitigation = mitigation
 
     # ------------------------------------------------------------------
     # Entry point
@@ -192,7 +205,6 @@ class ReportBuilder:
             ReportType.VULNERABILITY: self._build_vulnerability,
             ReportType.NETWORK_MONITORING: self._build_network,
             ReportType.IDS_ALERT: self._build_ids,
-            ReportType.THREAT_INCIDENT: self._build_incidents,
             ReportType.MITIGATION: self._build_mitigation,
             ReportType.SYSTEM_ACTIVITY: self._build_activity,
             ReportType.EXECUTIVE_SUMMARY: self._build_executive,
@@ -299,7 +311,7 @@ class ReportBuilder:
             )
         )
 
-        protocols = self._traffic.protocol_distribution(start)
+        protocols = self._traffic.protocol_distribution(start, end)
         doc.sections.append(
             ReportSection(
                 title="Protocol distribution",
@@ -320,7 +332,7 @@ class ReportBuilder:
                 columns=("Source", "Packets", "Bytes"),
                 rows=[
                     (t.address, format_count(t.packets), format_bytes(t.bytes))
-                    for t in self._traffic.top_sources(start, 20)
+                    for t in self._traffic.top_sources(start, 20, end)
                 ],
                 derived=True,
             )
@@ -331,7 +343,7 @@ class ReportBuilder:
                 columns=("Port", "Protocol", "Packets"),
                 rows=[
                     (p.port, p.protocol, format_count(p.packets))
-                    for p in self._traffic.top_ports(start, 20)
+                    for p in self._traffic.top_ports(start, 20, end)
                 ],
                 derived=True,
             )
@@ -382,15 +394,17 @@ class ReportBuilder:
                 note=EDUCATIONAL_NOTES["alerts"],
             )
         )
-        severity = self._alerts.count_by_severity(start)
+        severity = self._alerts.count_by_severity(start, end)
         doc.sections.append(
             ReportSection(
                 title="Alert severity distribution",
                 columns=("Severity", "Alerts"),
                 rows=[(level, count) for level, count in sorted(severity.items())],
+                note=SEVERITY_DISCLOSURE,
                 derived=True,
             )
         )
+        doc.sections.append(self._scope_section(start, end))
         anomalies = self._alerts.search_anomalies(start=start, end=end, limit=limit)
         doc.sections.append(
             ReportSection(
@@ -412,7 +426,7 @@ class ReportBuilder:
         )
 
         reliability = self._alerts.reliability_counters()
-        latency = self._alerts.mean_detection_latency(start)
+        latency = self._alerts.mean_detection_latency(start, end)
         doc.sections.append(
             ReportSection(
                 title="Alert reliability",
@@ -420,7 +434,6 @@ class ReportBuilder:
                 rows=[
                     ("Alerts stored", format_count(reliability.get("stored", 0))),
                     ("Duplicate occurrences folded", format_count(reliability.get("duplicates", 0))),
-                    ("Alerts correlated into incidents", format_count(reliability.get("correlated", 0))),
                     ("Alerts still unreviewed", format_count(reliability.get("unresolved", 0))),
                     (
                         "Mean ingest latency",
@@ -433,110 +446,57 @@ class ReportBuilder:
         doc.highlights = [
             ("Alerts in period", format_count(len(alerts))),
             ("Anomalies in period", format_count(len(anomalies))),
-            ("Critical alerts", format_count(severity.get("CRITICAL", 0))),
             ("High alerts", format_count(severity.get("HIGH", 0))),
-        ]
-
-    def _build_incidents(
-        self, doc: ReportDocument, start: datetime, end: datetime, limit: int
-    ) -> None:
-        """Correlated incidents with their evidence provenance."""
-        incidents = self._incidents.search(start=start, end=end, limit=limit)
-        doc.sections.append(
-            ReportSection(
-                title="Threat incidents",
-                columns=(
-                    "Reference", "Severity", "Confidence", "Category", "Title",
-                    "Evidence sources", "Status", "First seen", "Last seen",
-                ),
-                rows=[
-                    (
-                        i.reference, str(i.severity), f"{i.confidence}%",
-                        i.category.label, i.title, i.source_label, str(i.status),
-                        format_local(i.first_seen), format_local(i.last_seen),
-                    )
-                    for i in incidents
-                ],
-                note=EDUCATIONAL_NOTES["incidents"],
-            )
-        )
-        doc.sections.append(
-            ReportSection(
-                title="Incident severity distribution",
-                columns=("Severity", "Open incidents"),
-                rows=[
-                    (level, count)
-                    for level, count in sorted(self._incidents.count_by_severity().items())
-                ],
-                derived=True,
-            )
-        )
-        doc.sections.append(
-            ReportSection(
-                title="Incident categories",
-                columns=("Category", "Incidents"),
-                rows=[
-                    (category, count)
-                    for category, count in sorted(
-                        self._incidents.count_by_category(start).items()
-                    )
-                ],
-                derived=True,
-            )
-        )
-        doc.sections.append(
-            ReportSection(
-                title="Analyst evaluation",
-                columns=("Classification", "Incidents"),
-                rows=[
-                    (label, count)
-                    for label, count in sorted(self._incidents.evaluation_counts().items())
-                ],
-                note=(
-                    "Classifications are applied by an authorised evaluator. "
-                    "AETHRA-SEC never labels a detection true or false "
-                    "positive automatically."
-                ),
-                derived=True,
-            )
-        )
-        doc.highlights = [
-            ("Incidents in period", format_count(len(incidents))),
-            ("Open incidents", format_count(self._incidents.count_open())),
-            (
-                "Multi-source incidents",
-                format_count(sum(1 for i in incidents if i.is_multi_source)),
-            ),
         ]
 
     def _build_mitigation(
         self, doc: ReportDocument, start: datetime, end: datetime, limit: int
     ) -> None:
-        """Mitigation guidance attached to real incidents."""
-        incidents = self._incidents.search(start=start, end=end, limit=limit)
+        """Mitigation guidance for the alerts raised in the period.
+
+        Each alert is mapped to its recommendation exactly as the IDS Alerts
+        screen maps it - same categorisation, same lookup - so the report and
+        the screen cannot disagree about what was advised. Built from alerts
+        because they are the security event of record; this report used to be
+        built from correlated incidents, which are no longer a screen of their
+        own.
+        """
+        alerts = self._alerts.search_alerts(start=start, end=end, limit=limit)
         rows: list[tuple[Any, ...]] = []
-        for incident in incidents:
-            if not incident.mitigation_id:
-                continue
-            rows.append(
-                (
-                    incident.reference, str(incident.severity), incident.title,
-                    incident.affected_host_ip or "-", incident.affected_service or "-",
-                    str(incident.status),
+        unmapped = 0
+        if self._mitigation is not None:
+            from aethra_sec.services.correlation_service import categorise_alert
+
+            for alert in alerts:
+                recommendation = self._mitigation.recommendation_for(
+                    categorise_alert(alert), severity=alert.severity
                 )
-            )
+                if recommendation is None:
+                    unmapped += 1
+                    continue
+                rows.append(
+                    (
+                        format_local(alert.effective_time), str(alert.severity),
+                        alert.message, alert.src_ip or "-", alert.dst_ip or "-",
+                        recommendation.code,
+                    )
+                )
         doc.sections.append(
             ReportSection(
-                title="Incidents with mitigation guidance",
+                title="Alerts with mitigation guidance",
                 columns=(
-                    "Incident", "Severity", "Threat", "Affected asset",
-                    "Affected service", "Status",
+                    "Time", "Severity", "Alert", "Source", "Destination",
+                    "Guidance",
                 ),
                 rows=rows,
                 note=(
                     "AETHRA-SEC recommends only. No mitigation is applied "
                     "automatically: an authorised operator reviews the guidance "
                     "and decides what to do."
+                    if self._mitigation is not None else
+                    "Mitigation guidance was not available when this report was "
+                    "built, so no alert could be mapped to it. Nothing has been "
+                    "substituted."
                 ),
             )
         )
@@ -558,7 +518,8 @@ class ReportBuilder:
             )
         )
         doc.highlights = [
-            ("Incidents with guidance", format_count(len(rows))),
+            ("Alerts with guidance", format_count(len(rows))),
+            ("Alerts with no mapped guidance", format_count(unmapped)),
             ("Open findings", format_count(len(findings))),
         ]
 
@@ -590,13 +551,59 @@ class ReportBuilder:
             ("Audit records (all time)", format_count(self._audit.total_count())),
         ]
 
+    def _scope_section(self, start: datetime, end: datetime) -> ReportSection:
+        """Detections split by whether they are a tested scenario.
+
+        The study defines five attack scenarios and tests each repeatedly. The
+        sensors also observe events outside that set - a host sweep, an exposed
+        service - and those are real and are kept. Reporting the two in one
+        undifferentiated total would overstate what the study tested, so the
+        report separates them and names the scenarios in the study's own terms.
+        """
+        counts: dict[str, int] = {}
+        for anomaly in self._alerts.search_anomalies(
+            start=start, end=end, limit=20_000
+        ):
+            name = scenario_name(anomaly.category)
+            counts[name] = counts.get(name, 0) + 1
+
+        rows = [
+            (scenario_name(category), scope_of(category).label,
+             counts.get(scenario_name(category), 0))
+            for category in PRIMARY_SCENARIOS
+        ]
+        rows += sorted(
+            (name, "Other detected event", count)
+            for name, count in counts.items()
+            if name not in {scenario_name(c) for c in PRIMARY_SCENARIOS}
+        )
+        tested = sum(
+            counts.get(scenario_name(c), 0) for c in PRIMARY_SCENARIOS
+        )
+        other = sum(counts.values()) - tested
+        return ReportSection(
+            title="Detections by study scope",
+            columns=("Scenario / category", "Scope", "Detections"),
+            rows=rows,
+            note=(
+                "The study defines five simulated attack scenarios. Rows "
+                "marked as another detected event are real observations "
+                "outside that set; they are recorded as evidence and are not "
+                "counted as tested scenarios."
+            ),
+            summary=(
+                f"{tested:,} detection(s) in the five tested scenarios, "
+                f"{other:,} in other observed categories."
+            ),
+            derived=True,
+        )
+
     def _build_executive(
         self, doc: ReportDocument, start: datetime, end: datetime, limit: int
     ) -> None:
         """A short summary of posture, drawn entirely from stored counts."""
-        alerts = self._alerts.count_alerts_since(start)
-        severity = self._alerts.count_by_severity(start)
-        incidents = self._incidents.search(start=start, end=end, limit=limit)
+        alerts = self._alerts.count_alerts_in_period(start, end)
+        severity = self._alerts.count_by_severity(start, end)
         findings_by_risk = self._scans.count_findings_by_risk()
         aggregates = self._traffic.aggregates_between(start, end)
         total_packets = sum(a.packet_count for a in aggregates)
@@ -605,11 +612,16 @@ class ReportBuilder:
             ("Packets observed", format_count(total_packets)),
             ("Hosts observed", format_count(self._hosts.count_active_since(start))),
             ("IDS alerts", format_count(alerts)),
-            ("Critical + high alerts", format_count(
-                severity.get("CRITICAL", 0) + severity.get("HIGH", 0)
-            )),
-            ("Incidents", format_count(len(incidents))),
-            ("Open incidents", format_count(self._incidents.count_open())),
+            ("High alerts", format_count(severity.get("HIGH", 0))),
+            (
+                "Unreviewed alerts",
+                # The same count the IDS Alerts summary shows as UNREVIEWED,
+                # bounded to this report's period.
+                format_count(self._alerts.count_unreviewed_matching(
+                    alert_filters={"start": start, "end": end},
+                    anomaly_filters=None,
+                )),
+            ),
             ("Open findings", format_count(self._scans.count_open_findings())),
         ]
         doc.sections.append(
@@ -620,17 +632,20 @@ class ReportBuilder:
                 derived=True,
             )
         )
+        serious = [
+            a for a in self._alerts.search_alerts(start=start, end=end, limit=limit)
+            if str(a.severity) == "HIGH"
+        ][:20]
         doc.sections.append(
             ReportSection(
-                title="Most serious open incidents",
-                columns=("Reference", "Severity", "Title", "Evidence", "Status"),
+                title="Most serious alerts",
+                columns=("Time", "Severity", "Alert", "Source", "Destination", "Status"),
                 rows=[
-                    (i.reference, str(i.severity), i.title, i.source_label, str(i.status))
-                    for i in sorted(
-                        (i for i in incidents if i.status.is_open),
-                        key=lambda i: i.severity.rank,
-                        reverse=True,
-                    )[:20]
+                    (
+                        format_local(a.effective_time), str(a.severity), a.message,
+                        a.src_ip or "-", a.dst_ip or "-", str(a.status),
+                    )
+                    for a in serious
                 ],
             )
         )
@@ -644,7 +659,7 @@ class ReportBuilder:
             )
         )
         doc.observations = self._observations(
-            total_packets, alerts, len(incidents), findings_by_risk
+            total_packets, alerts, findings_by_risk
         )
 
     def _build_security_assessment(
@@ -697,25 +712,13 @@ class ReportBuilder:
                 note=EDUCATIONAL_NOTES["alerts"],
             )
         )
-        incidents = self._incidents.search(start=start, end=end, limit=min(limit, 500))
-        doc.sections.append(
-            ReportSection(
-                title="Incidents and evidence provenance",
-                columns=("Reference", "Severity", "Title", "Evidence sources", "Status"),
-                rows=[
-                    (i.reference, str(i.severity), i.title, i.source_label, str(i.status))
-                    for i in incidents
-                ],
-                note=EDUCATIONAL_NOTES["incidents"],
-            )
-        )
 
     # ------------------------------------------------------------------
     # Narrative
     # ------------------------------------------------------------------
     @staticmethod
     def _observations(
-        packets: int, alerts: int, incidents: int, findings_by_risk: dict[str, int]
+        packets: int, alerts: int, findings_by_risk: dict[str, int]
     ) -> list[str]:
         """Factual observations derived from the counts above."""
         notes: list[str] = []
@@ -749,11 +752,6 @@ class ReportBuilder:
                 "assessment data."
             )
 
-        if incidents:
-            notes.append(
-                f"{format_count(incidents)} incident(s) were correlated from "
-                "the evidence recorded in this period."
-            )
         return notes
 
     @staticmethod

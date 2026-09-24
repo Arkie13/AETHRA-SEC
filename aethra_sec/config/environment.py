@@ -16,13 +16,20 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from aethra_sec.config import paths
+
 _ENV_PREFIX = "AETHRA_"
 _loaded_env_file: Path | None = None
 
 
 def project_root() -> Path:
-    """Absolute path of the repository/installation root."""
-    return Path(__file__).resolve().parents[2]
+    """Absolute path of the repository/installation root.
+
+    Delegates to :func:`aethra_sec.config.paths.install_root`, which knows the
+    difference between a source checkout and an installed build. Kept as a name
+    because the scripts and the older modules call it.
+    """
+    return paths.install_root()
 
 
 def _parse_env_file(path: Path) -> dict[str, str]:
@@ -54,14 +61,17 @@ def load_env_file(path: Path | None = None) -> Path | None:
     """Load ``.env`` into ``os.environ`` without overriding real env vars.
 
     Args:
-        path: explicit ``.env`` location; defaults to ``<project root>/.env``.
+        path: explicit configuration file; defaults to the one this
+            installation owns (see :func:`aethra_sec.config.paths.config_file`)
+            - ``.env`` beside the source in a checkout, a named file in the
+            application-data directory for an installed build.
 
     Returns:
         The path that was loaded, or ``None`` when no file was found.
     """
     global _loaded_env_file
 
-    env_path = path or (project_root() / ".env")
+    env_path = path or paths.config_file()
     if not env_path.is_file():
         return None
 

@@ -19,7 +19,6 @@ from aethra_sec.ui.widgets import (
     Card,
     Column,
     DataTable,
-    ScrollableFrame,
     StatusIndicator,
     Toolbar,
     show_message,
@@ -52,19 +51,10 @@ class HealthScreen(Screen):
     # Layout
     # ------------------------------------------------------------------
     def build(self) -> None:
-        """Construct the health screen.
-
-        Wrapped in a :class:`ScrollableFrame`, matching the Alerts screen: a
-        fixed-height page must never leave content unreachable whenever it is
-        taller than the window (§ layout).
-        """
-        scroller = ScrollableFrame(self)
-        scroller.pack(fill="both", expand=True)
-        root = scroller.interior
-
+        """Construct the health screen."""
         status_card = Card(
-            root, "Subsystem status", subtitle="probed live", fonts=self.fonts,
-            padding=18,
+            self, "Subsystem status", subtitle="probed live", fonts=self.fonts,
+            padding=12,
         )
         status_card.pack(fill="x")
 
@@ -85,15 +75,15 @@ class HealthScreen(Screen):
             grid.columnconfigure(column, weight=1)
 
         toolbar = Toolbar(status_card)
-        toolbar.pack(fill="x", pady=(16, 0))
+        toolbar.pack(fill="x", pady=(10, 0))
         toolbar.add_button("Re-probe now", self._probe, style="Accent.TButton")
         toolbar.add_button("Run diagnostics", self._run_diagnostics)
         if self.can("health.detail"):
             toolbar.add_button("Runtime detail", self._show_runtime)
         self._probe_label = toolbar.add_label("", side="right")
 
-        notebook = ttk.Notebook(root)
-        notebook.pack(fill="both", expand=True, pady=(16, 0))
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill="both", expand=True, pady=(10, 0))
 
         diagnostics = ttk.Frame(notebook, style="TFrame", padding=10)
         notebook.add(diagnostics, text="Diagnostics")
@@ -105,7 +95,7 @@ class HealthScreen(Screen):
 
     def _build_diagnostics(self, parent: tk.Misc) -> None:
         """Diagnostics results table (§71)."""
-        card = Card(parent, "Diagnostic checks", fonts=self.fonts, padding=18)
+        card = Card(parent, "Diagnostic checks", fonts=self.fonts, padding=12)
         card.pack(fill="both", expand=True)
         self._diagnostics_summary = ttk.Label(
             card, text="Select 'Run diagnostics' to check every dependency.",
@@ -117,7 +107,7 @@ class HealthScreen(Screen):
 
     def _build_runtime(self, parent: tk.Misc) -> None:
         """Runtime statistics pane."""
-        card = Card(parent, "Runtime statistics", fonts=self.fonts, padding=18)
+        card = Card(parent, "Runtime statistics", fonts=self.fonts, padding=12)
         card.pack(fill="both", expand=True)
         self._runtime_text = tk.Text(card, wrap="word")
         configure_text_widget(self._runtime_text, self.fonts, mono=True)
@@ -243,8 +233,7 @@ class HealthScreen(Screen):
             for key in (
                 "runs", "events_processed", "incidents_created",
                 "incidents_updated", "alerts_attached", "anomalies_attached",
-                "findings_linked", "errors",
-                "last_run_at",
+                "findings_linked", "errors", "last_run_at",
             ):
                 lines.append(f"  {key:<22}: {getattr(correlation, key, '-')}")
 
@@ -295,9 +284,8 @@ class HealthScreen(Screen):
         """Repaint when a subsystem changes state."""
         if event.type in (
             EventType.SERVICE_STATUS_CHANGED, EventType.DATABASE_STATUS_CHANGED,
-            EventType.SNORT_STATUS_CHANGED,
-            EventType.CAPTURE_STARTED, EventType.CAPTURE_STOPPED,
-            EventType.CAPTURE_ERROR,
+            EventType.SNORT_STATUS_CHANGED, EventType.CAPTURE_STARTED,
+            EventType.CAPTURE_STOPPED, EventType.CAPTURE_ERROR,
         ):
             health = self.context.health
             if health is not None:

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from aethra_sec.integrations.pyshark_capture.filters import (
+    validate_capture_filter,
+)
 from aethra_sec.integrations.pyshark_capture.interfaces import (
     CaptureInterface,
     TsharkAvailability,
@@ -27,4 +30,5 @@ __all__ = [
     "list_capture_interfaces",
     "map_packet",
     "probe_tshark",
+    "validate_capture_filter",
 ]

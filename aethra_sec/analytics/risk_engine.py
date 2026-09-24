@@ -19,16 +19,21 @@ from aethra_sec.models.incident import RiskAssessment
 # --------------------------------------------------------------------------
 # Score thresholds. Documented here so the mapping is auditable.
 # --------------------------------------------------------------------------
-SCORE_CRITICAL = 80
+# HIGH is the top band. There is no CRITICAL threshold: CRITICAL is not part
+# of the IDS/Incident severity model, so no score can produce it.
+#
+# This removed the top band and moved nothing else. SCORE_HIGH, SCORE_MEDIUM
+# and SCORE_LOW are the values they have always been, so a score that was
+# MEDIUM is still MEDIUM and a score that was LOW is still LOW. The only
+# change is that a score at or above the old CRITICAL cut now reads HIGH,
+# because HIGH is now the highest band there is.
 SCORE_HIGH = 55
 SCORE_MEDIUM = 30
 SCORE_LOW = 12
 
 #: Base points per threat category, reflecting inherent seriousness.
 CATEGORY_BASE_SCORE: dict[ThreatCategory, int] = {
-    ThreatCategory.MALWARE_INDICATOR: 55,
     ThreatCategory.SUSPICIOUS_PAYLOAD: 45,
-    ThreatCategory.BRUTE_FORCE: 40,
     ThreatCategory.DENIAL_OF_SERVICE: 40,
     ThreatCategory.TCP_SYN_FLOOD: 35,
     ThreatCategory.UDP_FLOOD: 30,
@@ -249,9 +254,11 @@ class RiskEngine:
 
     @staticmethod
     def severity_for_score(score: int) -> Severity:
-        """Map a score to a severity band."""
-        if score >= SCORE_CRITICAL:
-            return Severity.CRITICAL
+        """Map a score to a severity band.
+
+        HIGH is the top band. Scores are not rescaled to fill the space the
+        removed band left, and the remaining cut points are unchanged.
+        """
         if score >= SCORE_HIGH:
             return Severity.HIGH
         if score >= SCORE_MEDIUM:
@@ -348,17 +355,23 @@ class RiskEngine:
 
     @staticmethod
     def severity_for_snort_priority(priority: int | None) -> Severity:
-        """Map Snort's own priority to an AETHRA-SEC severity.
+        """Map Snort's own priority onto the AETHRA-SEC severity model.
 
         Snort priorities are 1 (highest) through 4+ (lowest). When a sensor
         supplies no priority the alert is recorded as MEDIUM and the missing
         value is visible in the alert detail, rather than being guessed.
+
+        Priority 1 lands on HIGH because HIGH is the top of the model this
+        application presents. That is a normalisation of the *displayed*
+        severity and nothing more: ``snort_alerts.priority`` still stores the 1
+        the sensor sent, ``raw_alert`` still holds the original line verbatim,
+        and both are shown on the alert's detail view. The chain
+        raw alert -> parsed alert -> AETHRA-SEC alert -> incident stays
+        traceable, and nothing the sensor said is overwritten.
         """
         if priority is None:
             return Severity.MEDIUM
-        if priority <= 1:
-            return Severity.CRITICAL
-        if priority == 2:
+        if priority <= 2:
             return Severity.HIGH
         if priority == 3:
             return Severity.MEDIUM

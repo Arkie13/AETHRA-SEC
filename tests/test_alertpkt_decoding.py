@@ -190,3 +190,80 @@ class TestFailureIsReported:
         """
         for cut in (64, 512, 4096, 65_535):
             decode_alertpkt(datagram[:cut])
+
+
+class TestSnortYearInference:
+    """A year-less Snort timestamp must not be dated a year early (§81).
+
+    Snort's alert_fast format omits the year and writes the sensor's local
+    time. Comparing that against a UTC clock made every alert raised inside the
+    UTC offset look like it came from the future, and each was rolled back a
+    full year: all 125 alerts on the development host were stamped 2025 against
+    a 2026 ingest time. That put mean detection latency at 365 days and hid the
+    alerts from every windowed query behind the dashboard counters.
+    """
+
+    def test_a_recent_alert_keeps_the_current_year(self) -> None:
+        from datetime import timedelta
+
+        from aethra_sec.integrations.snort.parser import _parse_fast_timestamp
+        from aethra_sec.utils.timeutil import utcnow
+
+        now = utcnow()
+        local = now.astimezone()
+        stamp = (local - timedelta(minutes=1)).strftime("%m/%d-%H:%M:%S.%f")
+        parsed = _parse_fast_timestamp(stamp)
+        assert parsed is not None
+        assert parsed.year == local.year
+
+    def test_the_measured_lag_is_the_real_lag(self) -> None:
+        """The value the dashboard reports as detection latency."""
+        from datetime import timedelta
+
+        from aethra_sec.integrations.snort.parser import _parse_fast_timestamp
+        from aethra_sec.utils.timeutil import utcnow
+
+        now = utcnow()
+        local = now.astimezone()
+        stamp = (local - timedelta(minutes=90)).strftime("%m/%d-%H:%M:%S.%f")
+        parsed = _parse_fast_timestamp(stamp)
+        lag = (now - parsed).total_seconds()
+        assert 5300 <= lag <= 5500, lag
+
+    def test_a_whole_day_of_local_offsets_stays_in_this_year(self) -> None:
+        """The failure only showed inside the UTC offset, so sweep the day."""
+        from datetime import timedelta
+
+        from aethra_sec.integrations.snort.parser import _parse_fast_timestamp
+        from aethra_sec.utils.timeutil import utcnow
+
+        now = utcnow()
+        local = now.astimezone()
+        for minutes in range(0, 24 * 60, 37):
+            moment = local - timedelta(minutes=minutes)
+            stamp = moment.strftime("%m/%d-%H:%M:%S.%f")
+            parsed = _parse_fast_timestamp(stamp)
+            assert parsed is not None
+            assert (now - parsed).total_seconds() >= -60, stamp
+            assert (now - parsed).total_seconds() < 25 * 3600, stamp
+
+    def test_the_new_year_boundary_still_rolls_back(self) -> None:
+        """The behaviour the inference exists for must survive the fix."""
+        from datetime import datetime, timezone
+
+        from aethra_sec.integrations.snort.parser import _parse_fast_timestamp
+
+        reference = datetime(2026, 1, 2, 0, 30, tzinfo=timezone.utc)
+        parsed = _parse_fast_timestamp("12/31-23:50:00.000000", reference=reference)
+        assert parsed is not None and parsed.year == 2025
+
+    def test_an_explicit_year_is_never_second_guessed(self) -> None:
+        from datetime import datetime, timezone
+
+        from aethra_sec.integrations.snort.parser import _parse_fast_timestamp
+
+        reference = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        parsed = _parse_fast_timestamp(
+            "03/04/24-11:22:33.000000", reference=reference
+        )
+        assert parsed is not None and parsed.year == 2024
