@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080" font-family="Segoe UI, Inter, Arial, sans-serif">
+  <!-- Transparent overlay. Drop straight onto the Fig. 4.1 frame or over
+       b-roll of the laboratory; the scrim keeps it readable over either. -->
+  <defs>
+    <linearGradient id="scrim" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0%"  stop-color="#0B0E14" stop-opacity="0.92"/>
+      <stop offset="60%" stop-color="#0B0E14" stop-opacity="0.68"/>
+      <stop offset="100%" stop-color="#0B0E14" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="828" width="1920" height="252" fill="url(#scrim)"/>
+
+  <!-- accent rule -->
+  <rect x="96" y="900" width="6" height="104" rx="3" fill="#5B8DEF"/>
+
+  <text x="132" y="944" fill="#E8ECF4" font-size="46" font-weight="700" letter-spacing="1.2">
+    CONTROLLED TESTING — ISOLATED LAB NETWORK
+  </text>
+  <text x="132" y="990" fill="#8C97AC" font-size="25">
+    No production or internet-connected systems · Each scenario repeated 5–10 times under identical conditions
+  </text>
+</svg>

@@ -152,6 +152,36 @@ DETECTION_SETTINGS: tuple[SettingSpec, ...] = (
         maximum=86_400,
     ),
     SettingSpec(
+        "detection.episode_gap_seconds",
+        15,
+        "int",
+        "detection",
+        "Seconds without a qualifying observation after which an attack "
+        "episode has ended. The next threshold crossing then opens a new "
+        "episode and a new detection. Applied to AETHRA-SEC's rules, to "
+        "Snort repeats and to attack grouping alike. 15 s is three 5 s rate "
+        "windows: a continuous flood refreshes its episode at least once a "
+        "second (AETHRA-SEC) or every 5 s (Snort threshold rules), so short "
+        "capture stalls do not split it, while separate test runs need only "
+        "a 15 s pause to be counted separately.",
+        minimum=6,
+        maximum=3600,
+    ),
+    SettingSpec(
+        "detection.episode_inactivity_seconds",
+        120,
+        "int",
+        "detection",
+        "How long without a matching observation before an alert's episode "
+        "is reported as Ended rather than Ongoing. Superseded on 15 Oct 2026 "
+        "by detection.episode_gap_seconds, which now decides both when an "
+        "episode ends and how it is reported; kept so existing installations "
+        "read unchanged. Ended means observation stopped, not that the "
+        "activity did.",
+        minimum=1,
+        maximum=86_400,
+    ),
+    SettingSpec(
         "detection.enabled",
         True,
         "bool",
@@ -243,6 +273,30 @@ CAPTURE_SETTINGS: tuple[SettingSpec, ...] = (
         maximum=1_000,
     ),
     SettingSpec(
+        "capture.domain_ttl_seconds",
+        600,
+        "int",
+        "capture",
+        "How long an observed domain may explain later traffic to the same "
+        "address. A name is carried only by a handshake or a DNS answer; "
+        "every frame after it carries an address alone. Past this age the "
+        "mapping is dropped rather than trusted, because addresses are "
+        "reassigned and a stale name is worse than none.",
+        minimum=30,
+        maximum=86_400,
+    ),
+    SettingSpec(
+        "capture.domain_cache_entries",
+        4096,
+        "int",
+        "capture",
+        "How many server addresses the domain correlation remembers before "
+        "evicting the least recently used. Bounds what a long capture can "
+        "cost in memory.",
+        minimum=64,
+        maximum=100_000,
+    ),
+    SettingSpec(
         "capture.persist_packet_metadata",
         True,
         "bool",
@@ -296,6 +350,53 @@ CAPTURE_SETTINGS: tuple[SettingSpec, ...] = (
         "Number of packet-processing worker threads.",
         minimum=1,
         maximum=8,
+    ),
+    # ----------------------------------------------------------------------
+    # Interface roles.
+    #
+    # A machine monitoring a network has two jobs that want different
+    # adapters: one carries the application's own traffic (the database, DNS,
+    # updates), the other receives a copy of somebody else's traffic from a
+    # switch mirror port and should carry nothing of ours.
+    #
+    # These are recorded by the adapter's capture device name - on Windows the
+    # "\Device\NPF_{GUID}" form - because that is stable. The friendly name
+    # ("Ethernet 4") is a user-editable label that Windows renumbers, and
+    # pinning a monitoring role to it is how a sensor silently ends up
+    # watching the wrong adapter after a reboot.
+    # ----------------------------------------------------------------------
+    SettingSpec(
+        "capture.monitoring_interface",
+        "",
+        "str",
+        "capture",
+        "Capture device name of the dedicated monitoring interface - the "
+        "adapter wired to a switch mirror/SPAN destination port or a network "
+        "TAP. Recorded as the stable device name, not the friendly label. "
+        "Empty means no dedicated monitoring interface has been nominated and "
+        "capture uses whichever interface the operator selects.",
+    ),
+    SettingSpec(
+        "capture.management_interface",
+        "",
+        "str",
+        "capture",
+        "Capture device name of the management interface - the adapter "
+        "carrying the application's own traffic. Recorded so the two roles "
+        "can be told apart and reported; AETHRA-SEC never alters routing, "
+        "gateways or adapter configuration to enforce it.",
+    ),
+    SettingSpec(
+        "capture.monitoring_span_declared",
+        False,
+        "bool",
+        "capture",
+        "Whether an operator has stated that the monitoring interface is "
+        "wired to a mirror/SPAN destination or a TAP. This is a declaration "
+        "of intent and is never treated as proof: it can raise the reported "
+        "visibility to 'monitoring interface selected', and only an actually "
+        "captured frame between two other hosts can report transit traffic "
+        "as observed.",
     ),
 )
 
@@ -577,6 +678,17 @@ NOTIFICATION_SETTINGS: tuple[SettingSpec, ...] = (
         "(INFO/LOW/MEDIUM/HIGH/CRITICAL).",
     ),
     SettingSpec(
+        "notifications.snort_popups",
+        False,
+        "bool",
+        "notifications",
+        "Raise popups and sounds for Snort alerts. Off: AETHRA-SEC detections "
+        "are the primary alerts and Snort alerts are supporting evidence - "
+        "still stored, linked to attacks and shown on Attack Statistics and in "
+        "the Alerts screen's Snort evidence view. With it on, one port scan "
+        "raised one popup per probed port (504 in 27 minutes on 15 Oct 2026).",
+    ),
+    SettingSpec(
         "assessment.auto_enabled",
         True,
         "bool",
@@ -616,10 +728,15 @@ NOTIFICATION_SETTINGS: tuple[SettingSpec, ...] = (
         "int",
         "assessment",
         "Largest monitored network, in addresses, automatic assessment will "
-        "accept. A larger network is not a laboratory segment, so automatic "
-        "assessment reports its scope as unavailable instead of scanning it.",
+        "accept. The default suits a laboratory segment; raise it "
+        "deliberately for a campus range you are authorised to assess, and "
+        "expect the queue to take proportionally longer to work through it. "
+        "A network above this is reported as out of scope rather than "
+        "scanned, which is a safety control and not a capacity limit.",
         minimum=4,
-        maximum=65_536,
+        # A /12. Above this an automatic sweep is no longer a decision anyone
+        # made deliberately, so it stays refused.
+        maximum=1_048_576,
     ),
     SettingSpec(
         "assessment.auto_new_hosts",

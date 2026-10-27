@@ -37,6 +37,12 @@ from aethra_sec.integrations.nmap.runner import (
 from aethra_sec.models.mitigation import LOOKUP_FAILED_TEXT
 from aethra_sec.models.scan import PortResult, Scan, ScanHostResult
 from aethra_sec.services.mitigation_service import NO_RECOMMENDATION_TEXT
+from aethra_sec.ui.guide_text import (
+    apply_guide_context,
+    guide_context,
+    placeholder_note,
+    unfilled_placeholders,
+)
 from aethra_sec.ui.base import Screen
 from aethra_sec.ui.detail_panels import (
     port_chips,
@@ -260,8 +266,55 @@ def _finding_evidence(finding: Any) -> str:
     return "\n\n".join(p for p in parts if p)
 
 
+def _mitigation_dialog_sections(
+    recommendation: Any, finding: Any
+) -> list[tuple[str, str]]:
+    """The mitigation dialog's sections, filled from this finding.
+
+    Empty fields are dropped rather than shown as blank headings, so an entry
+    that has no procedure recorded does not appear to have one.
+    """
+    context = guide_context(finding)
+
+    def filled(text: Any) -> str:
+        return apply_guide_context(str(text or ""), context)
+
+    procedure = filled(getattr(recommendation, "procedure_steps", ""))
+    verification = filled(recommendation.verification_steps)
+    rollback = filled(getattr(recommendation, "rollback_steps", ""))
+
+    outstanding: list[str] = []
+    for part in (filled(getattr(recommendation, "enforcement_point", "")),
+                 procedure, verification, rollback):
+        for placeholder in unfilled_placeholders(part):
+            if placeholder not in outstanding:
+                outstanding.append(placeholder)
+    note = placeholder_note(outstanding)
+
+    sections = [
+        ("EXPLANATION", filled(recommendation.explanation)),
+        ("WHY IT MATTERS", filled(recommendation.why_it_matters)),
+        ("EVIDENCE", finding.observation or "-"),
+        ("WHERE TO MAKE THE CHANGE",
+         filled(getattr(recommendation, "enforcement_point", ""))),
+        ("IMMEDIATE RECOMMENDED ACTION", filled(recommendation.immediate_action)),
+        ("STEP-BY-STEP PROCEDURE", procedure + (f"\n\n{note}" if note else "")),
+        ("VERIFICATION STEPS", verification),
+        ("HOW TO UNDO THIS CHANGE", rollback),
+        ("OPERATIONAL RISKS AND WARNINGS",
+         filled(getattr(recommendation, "operational_warnings", ""))),
+        ("LONG-TERM RECOMMENDED ACTION", filled(recommendation.long_term_action)),
+        (
+            "NOTE",
+            "AETHRA-SEC does not apply mitigations automatically. Review the "
+            "guidance and act through your change process.",
+        ),
+    ]
+    return [(label, text) for label, text in sections if str(text or "").strip()]
+
+
 def _mitigation_drawer_section(
-    match: Any, index: int, total: int
+    match: Any, index: int, total: int, finding: Any = None
 ) -> DrawerSection:
     """The mitigation mapped to one confirmed vulnerability (§55).
 
@@ -309,14 +362,39 @@ def _mitigation_drawer_section(
                 + "\n".join(match.mapping_lines())
             ),
         )
+    # Filled from the finding being shown, never from another one.
+    context = guide_context(finding)
+
+    def filled(text: Any) -> str:
+        return apply_guide_context(str(text or ""), context)
+
+    procedure = filled(getattr(entry, "procedure_steps", ""))
+    verification = filled(entry.verification_steps)
+    rollback = filled(getattr(entry, "rollback_steps", ""))
+
+    outstanding: list[str] = []
+    for part in (filled(getattr(entry, "enforcement_point", "")), procedure,
+                 verification, rollback):
+        for placeholder in unfilled_placeholders(part):
+            if placeholder not in outstanding:
+                outstanding.append(placeholder)
+    note = placeholder_note(outstanding)
+
     body = "\n\n".join(
         f"{label}\n{str(text).strip()}"
         for label, text in (
-            ("What was observed", entry.explanation),
-            ("Why it matters", entry.why_it_matters),
-            ("Recommended immediate action", entry.immediate_action),
-            ("Recommended long-term action", entry.long_term_action),
-            ("Verification", entry.verification_steps),
+            ("What was observed", filled(entry.explanation)),
+            ("Why it matters", filled(entry.why_it_matters)),
+            ("Where to make the change",
+             filled(getattr(entry, "enforcement_point", ""))),
+            ("Recommended immediate action", filled(entry.immediate_action)),
+            ("Step-by-step procedure",
+             procedure + (f"\n\n{note}" if note else "")),
+            ("Verification", verification),
+            ("How to undo this change", rollback),
+            ("Operational risks and warnings",
+             filled(getattr(entry, "operational_warnings", ""))),
+            ("Recommended long-term action", filled(entry.long_term_action)),
             ("References", entry.references),
         )
         if str(text or "").strip()
@@ -1183,7 +1261,7 @@ class VulnerabilitiesScreen(Screen):
             # this?" is in the same place as the evidence for it.
             sections.append(
                 _mitigation_drawer_section(
-                    guidance.get(id(finding)), index, len(confirmed)
+                    guidance.get(id(finding)), index, len(confirmed), finding
                 )
             )
         if exposures:
@@ -1394,10 +1472,37 @@ class VulnerabilitiesScreen(Screen):
         self._update_scan_controls()
         self._refresh_automation()
 
-    #: Seconds between automatic-assessment refreshes on the UI tick. The
-    #: inventory changes at scan and discovery speed, not packet speed, so a
-    #: few seconds keeps it live without a query per tick.
+    #: Seconds between automatic-assessment refreshes while the queue is
+    #: working. Short, because that is when the numbers move.
     AUTOMATION_REFRESH_SECONDS = 5.0
+
+    #: Seconds between refreshes when nothing is queued or scanning.
+    #:
+    #: The refresh costs about 366 ms of database work, and mysql-connector
+    #: parses rows in Python, so it holds the GIL for most of that. Fired every
+    #: five seconds alongside a running capture it starved the Tk loop:
+    #: measured at 2,719 ms worst stall and 23 stalls over 30 seconds on this
+    #: screen, against 7 ms on the Dashboard. Suppressing it entirely cut the
+    #: mean lag from 141 ms to 22 ms, which is what identified it.
+    #:
+    #: Idle, there is nothing to see: an inventory with no queued and no
+    #: scanning host changes only when discovery finds something, which is
+    #: minutes apart. So the fast cadence is kept for when it earns its cost
+    #: and the idle one is four times slower. Nothing is hidden - a scan
+    #: starting flips it straight back.
+    AUTOMATION_IDLE_REFRESH_SECONDS = 20.0
+
+    def _automation_interval(self) -> float:
+        """How long to wait before the next refresh, from the last snapshot."""
+        summary = getattr(self._automation, "summary", None)
+        working = bool(
+            getattr(summary, "queued", 0) or getattr(summary, "scanning", 0)
+        )
+        return (
+            self.AUTOMATION_REFRESH_SECONDS
+            if working
+            else self.AUTOMATION_IDLE_REFRESH_SECONDS
+        )
 
     def on_tick(self) -> None:
         """Keep the automation tab current while it is on screen."""
@@ -1407,7 +1512,7 @@ class VulnerabilitiesScreen(Screen):
             return
         if not on_automation_tab or self._automation_loading:
             return
-        if (time.monotonic() - self._automation_refreshed_at) >= self.AUTOMATION_REFRESH_SECONDS:
+        if (time.monotonic() - self._automation_refreshed_at) >= self._automation_interval():
             self._refresh_automation()
 
     def _load_profiles(self) -> None:
@@ -1598,7 +1703,16 @@ class VulnerabilitiesScreen(Screen):
             return
         self.run_async(
             lambda: nmap.stop_scan(session, self._active_scan_id or 0),
-            lambda _r: self.status("Stop requested; the scan ends after the current step."),
+            # Says what actually happens: the runner holds the process handle
+            # and kills it, so the scan stops now. The old wording promised
+            # "after the current step", which was true only of the superseded
+            # python-nmap path that could not be interrupted at all.
+            lambda stopped: self.status(
+                "Scan stopped. Nmap was terminated and the assessment is "
+                "recorded as CANCELLED; partial results are not stored."
+                if stopped else
+                "That scan is no longer running, so there was nothing to stop."
+            ),
             name="scan-stop",
         )
 
@@ -2047,19 +2161,7 @@ class VulnerabilitiesScreen(Screen):
                 ("Severity", str(finding.risk_level)),
                 ("Knowledge base entry", recommendation.code),
             ],
-            sections=[
-                ("EXPLANATION", recommendation.explanation),
-                ("WHY IT MATTERS", recommendation.why_it_matters),
-                ("EVIDENCE", finding.observation or "-"),
-                ("IMMEDIATE RECOMMENDED ACTION", recommendation.immediate_action),
-                ("LONG-TERM RECOMMENDED ACTION", recommendation.long_term_action),
-                ("VERIFICATION STEPS", recommendation.verification_steps),
-                (
-                    "NOTE",
-                    "AETHRA-SEC does not apply mitigations automatically. "
-                    "Review the guidance and act through your change process.",
-                ),
-            ],
+            sections=_mitigation_dialog_sections(recommendation, finding),
             fonts=self.fonts,
         ).show()
 

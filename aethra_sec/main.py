@@ -120,6 +120,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     settings = load_settings()
     configure_logging(settings.log_dir, settings.log_level)
     runtime.install()
+    # A fault in native code (Tk, the database driver) ends the process with
+    # nothing in the log. faulthandler writes the stacks it had to
+    # logs/fatal_errors.log instead. See diagnostics/ui_watchdog.py.
+    from aethra_sec.diagnostics.ui_watchdog import enable_fatal_error_log
+
+    enable_fatal_error_log(settings.log_dir)
     LOGGER.info(
         "%s %s starting (%s).", APP_NAME, APP_VERSION, paths.describe()["mode"]
     )

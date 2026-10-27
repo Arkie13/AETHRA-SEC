@@ -112,7 +112,8 @@ class TestNoWayIntoItRemains:
 
         assert NAV_GROUPS == (
             ("MONITOR", ("dashboard", "traffic")),
-            ("SECURITY", ("alerts", "mitigation")),
+            # Attack Statistics added 15 Oct 2026, beside Alerts.
+            ("SECURITY", ("alerts", "attack_statistics", "mitigation")),
             ("ASSETS", ("hosts", "vulnerabilities")),
             ("REPORTING", ("reports", "logs")),
             ("ADMINISTRATION", ("users", "health", "settings")),

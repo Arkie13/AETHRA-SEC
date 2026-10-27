@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Any
 
@@ -44,7 +45,7 @@ _ALERT_SELECT = (
     "protocol, src_ip, src_port, dst_ip, dst_port, interface, sensor, "
     "transport, raw_alert, src_host_id, dst_host_id, incident_id, status, "
     "evaluation, evaluated_by, evaluated_at, duplicate_count, dedup_key, "
-    "created_at FROM snort_alerts"
+    "last_alert_time, peak_pps, created_at FROM snort_alerts"
 )
 
 _ANOMALY_FILTERABLE = {
@@ -59,7 +60,8 @@ _ANOMALY_SORTABLE = {"created_at", "last_seen", "severity", "src_ip", "id"}
 _ANOMALY_SELECT = (
     "SELECT id, rule_id, category, title, observation, why_it_matters, "
     "what_to_check, severity, confidence, src_ip, dst_ip, dst_port, protocol, "
-    "interface, observed_value, threshold_value, window_seconds, event_count, "
+    "interface, observed_value, latest_value, latest_measured_at, "
+    "threshold_value, window_seconds, event_count, peak_severity, "
     "detected_at, reviewed_at, reviewed_by, first_seen, last_seen, evidence, "
     "host_id, incident_id, evaluation, "
     "source, created_at FROM traffic_anomalies"
@@ -107,6 +109,11 @@ class AlertRepository(Repository):
             evaluated_at=as_dt(row.get("evaluated_at")),
             duplicate_count=as_int(row.get("duplicate_count")) or 1,
             dedup_key=as_text(row.get("dedup_key")),
+            last_alert_time=as_dt(row.get("last_alert_time")),
+            peak_pps=(
+                as_float(row.get("peak_pps"))
+                if row.get("peak_pps") is not None else None
+            ),
             created_at=as_dt(row.get("created_at")),
         )
 
@@ -134,6 +141,15 @@ class AlertRepository(Repository):
             threshold_value=as_float(row.get("threshold_value")) or 0.0,
             window_seconds=as_int(row.get("window_seconds")) or 0,
             event_count=as_int(row.get("event_count")) or 1,
+            latest_value=(
+                float(row["latest_value"])
+                if row.get("latest_value") is not None else None
+            ),
+            latest_measured_at=as_dt(row.get("latest_measured_at")),
+            peak_severity=(
+                Severity.parse(row.get("peak_severity"), Severity.MEDIUM)
+                if row.get("peak_severity") else None
+            ),
             detected_at=as_dt(row.get("detected_at")),
             reviewed_at=as_dt(row.get("reviewed_at")),
             reviewed_by=as_int(row.get("reviewed_by")),
@@ -153,21 +169,36 @@ class AlertRepository(Repository):
     # Snort alerts
     # ------------------------------------------------------------------
     def find_duplicate(
-        self, dedup_key: str, since: datetime
+        self, dedup_key: str, since: datetime, *, event_since: datetime | None = None
     ) -> tuple[int, int] | None:
         """Find a recent alert with the same dedup key.
 
+        Args:
+            since: ingest-time bound (``received_at``), as before.
+            event_since: when given, the alert's own most recent sensor time
+                (``last_alert_time``, else ``alert_time``) must also be at or
+                after it. This is the episode boundary: a repeat only extends
+                an alert whose traffic was seen within the episode gap. Bounded
+                by ingest time alone, every repeat moved ``received_at``
+                forward, so test runs less than two minutes apart folded into
+                one row for ever - Snort row 3707 holds 7,729 "ICMP echo
+                request" repeats.
+
         Returns:
-            ``(alert_id, duplicate_count)`` when one exists inside the
-            suppression window, else ``None``.
+            ``(alert_id, duplicate_count)`` when one exists, else ``None``.
         """
         if not dedup_key:
             return None
+        clause = ""
+        params: list[Any] = [dedup_key[:190], to_db(since)]
+        if event_since is not None:
+            clause = "AND COALESCE(last_alert_time, alert_time, received_at) >= %s "
+            params.append(to_db(event_since))
         row = self.db.query_one(
             "SELECT id, duplicate_count FROM snort_alerts "
-            "WHERE dedup_key = %s AND received_at >= %s "
+            f"WHERE dedup_key = %s AND received_at >= %s {clause}"
             "ORDER BY received_at DESC LIMIT 1",
-            (dedup_key[:190], to_db(since)),
+            tuple(params),
         )
         if not row:
             return None
@@ -199,12 +230,39 @@ class AlertRepository(Repository):
             return None
         return int(row["id"]), int(row["duplicate_count"] or 1)
 
-    def increment_duplicate(self, alert_id: int, observed_at: datetime) -> None:
-        """Record another occurrence of an already-stored alert (§92)."""
+    def increment_duplicate(
+        self,
+        alert_id: int,
+        observed_at: datetime,
+        alert_time: datetime | None = None,
+    ) -> None:
+        """Record another occurrence of an already-stored alert (§92).
+
+        Args:
+            observed_at: when AETHRA-SEC ingested this repeat. Kept in
+                ``received_at``, which is what that column has always meant.
+            alert_time: the Snort timestamp on the repeat itself - when the
+                sensor saw the traffic. Stored in ``last_alert_time``, and
+                advanced only forwards, so re-reading an older alert file
+                cannot drag an episode's last-observed time backwards.
+
+        Before ``last_alert_time`` existed the repeat's own timestamp was
+        dropped here, which left a folded row able to say how often something
+        fired but not when it last fired.
+        """
+        if alert_time is None:
+            self.db.execute(
+                "UPDATE snort_alerts SET duplicate_count = duplicate_count + 1, "
+                "received_at = %s WHERE id = %s",
+                (to_db(observed_at), alert_id),
+            )
+            return
         self.db.execute(
             "UPDATE snort_alerts SET duplicate_count = duplicate_count + 1, "
-            "received_at = %s WHERE id = %s",
-            (to_db(observed_at), alert_id),
+            "received_at = %s, "
+            "last_alert_time = GREATEST(COALESCE(last_alert_time, %s), %s) "
+            "WHERE id = %s",
+            (to_db(observed_at), to_db(alert_time), to_db(alert_time), alert_id),
         )
 
     def insert_alert(self, alert: SnortAlert) -> int:
@@ -214,9 +272,10 @@ class AlertRepository(Repository):
             "generator_id, signature_id, revision, message, classification, "
             "priority, severity, protocol, src_ip, src_port, dst_ip, dst_port, "
             "interface, sensor, transport, raw_alert, src_host_id, dst_host_id, "
-            "status, evaluation, duplicate_count, dedup_key, created_at) "
+            "status, evaluation, duplicate_count, dedup_key, last_alert_time, "
+            "peak_pps, created_at) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-            "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 to_db(alert.alert_time), to_db(alert.received_at or utcnow()),
                 alert.time_source[:16], alert.generator_id, alert.signature_id,
@@ -227,8 +286,35 @@ class AlertRepository(Repository):
                 alert.transport[:16], alert.raw_alert, alert.src_host_id,
                 alert.dst_host_id, str(alert.status), str(alert.evaluation),
                 alert.duplicate_count, alert.dedup_key[:190],
+                # A first sighting's last-observed time is its own timestamp.
+                to_db(alert.last_alert_time or alert.alert_time),
+                (
+                    round(float(alert.peak_pps), 1)
+                    if alert.peak_pps is not None else None
+                ),
                 to_db(alert.created_at or utcnow()),
             ),
+        )
+
+    def raise_alert_grade(
+        self, alert_id: int, packets_per_second: float, severity: "Severity"
+    ) -> None:
+        """Raise a Snort alert's recorded pps and severity, never lowering them.
+
+        A repeat of an alert that is still active is measured again; when its
+        source is now sending faster, both the pps and the severity graded from
+        it on the §3.9.8 legend rise. One statement, so a slower concurrent
+        fold cannot lower either.
+        """
+        ladder = "'INFO','LOW','MEDIUM','HIGH','CRITICAL'"
+        value = str(severity)
+        self.db.execute(
+            "UPDATE snort_alerts SET "
+            "peak_pps = GREATEST(COALESCE(peak_pps, 0), %s), "
+            "severity = IF(FIELD(%s, " + ladder + ") > "
+            "FIELD(COALESCE(severity, %s), " + ladder + "), %s, severity) "
+            "WHERE id = %s",
+            (round(float(packets_per_second), 1), value, value, value, alert_id),
         )
 
     def get_alert(self, alert_id: int) -> SnortAlert | None:
@@ -390,7 +476,8 @@ class AlertRepository(Repository):
         return as_dt(self.db.query_value("SELECT MIN(received_at) FROM snort_alerts"))
 
     def count_detections_by_severity(
-        self, since: datetime | None = None, end: datetime | None = None
+        self, since: datetime | None = None, end: datetime | None = None,
+        *, include_snort: bool = True,
     ) -> dict[str, int]:
         """Severity counts across *both* detection sources.
 
@@ -406,10 +493,9 @@ class AlertRepository(Repository):
         on a dashboard asks about.
         """
         counts: dict[str, int] = {}
-        queries = (
-            ("snort_alerts", "received_at"),
-            ("traffic_anomalies", "created_at"),
-        )
+        queries = [("traffic_anomalies", "created_at")]
+        if include_snort:
+            queries.insert(0, ("snort_alerts", "received_at"))
         for table, column in queries:
             clauses, params = period_bounds(column, since, end)
             rows = self.db.query(
@@ -440,7 +526,8 @@ class AlertRepository(Repository):
         return {as_text(r["severity"]): as_int(r["c"]) or 0 for r in rows}
 
     def detections_per_interval(
-        self, start: datetime | None, end: datetime, minutes: int = 5
+        self, start: datetime | None, end: datetime, minutes: int = 5,
+        *, include_snort: bool = True,
     ) -> list[tuple[datetime, int]]:
         """Detection counts bucketed into fixed intervals for the IDS chart.
 
@@ -451,10 +538,10 @@ class AlertRepository(Repository):
         """
         bucket = max(1, min(int(minutes), 1440)) * 60
         totals: dict[datetime, int] = {}
-        for table, column in (
-            ("snort_alerts", "received_at"),
-            ("traffic_anomalies", "created_at"),
-        ):
+        sources = [("traffic_anomalies", "created_at")]
+        if include_snort:
+            sources.insert(0, ("snort_alerts", "received_at"))
+        for table, column in sources:
             clauses, bounds = period_bounds(column, start, end)
             rows = self.db.query(
                 f"SELECT FROM_UNIXTIME(FLOOR(UNIX_TIMESTAMP({column}) / %s) * %s) "
@@ -548,12 +635,23 @@ class AlertRepository(Repository):
     # Traffic anomalies
     # ------------------------------------------------------------------
     def recent_anomaly(
-        self, dedup_key_parts: tuple[str, str, str, int | None], since: datetime
+        self,
+        dedup_key_parts: tuple[str, str, str, int | None],
+        since: datetime,
+        until: datetime | None = None,
     ) -> TrafficAnomaly | None:
-        """Find a matching anomaly inside the suppression window (§92)."""
+        """Find the episode an observation at ``until`` belongs to (§92).
+
+        ``since`` bounds the episode's last observation from below; ``until``,
+        when given, requires the episode to have started no later than the
+        observation, so an observation is never folded into a LATER episode.
+        """
         rule_id, src_ip, dst_ip, dst_port = dedup_key_parts
         clauses = ["rule_id = %s", "src_ip = %s", "dst_ip = %s", "last_seen >= %s"]
         params: list[Any] = [rule_id, src_ip, dst_ip, to_db(since)]
+        if until is not None:
+            clauses.append("first_seen <= %s")
+            params.append(to_db(until))
         if dst_port is None:
             clauses.append("dst_port IS NULL")
         else:
@@ -566,6 +664,83 @@ class AlertRepository(Repository):
         )
         return self._map_anomaly(row) if row else None
 
+    def merge_scan_evidence(
+        self, anomaly_id: int, target: str, ports: list[Any] | None
+    ) -> None:
+        """Add one target, and the ports its detection saw, to a scan episode.
+
+        A port-scan episode is one scanning source across the targets it
+        probed while active. Each target's detection reports the ports its
+        window saw (``ports_sample``, at most 40); their union is kept as
+        ``ports_observed``. It is a lower bound - the rule reports ports only
+        when it fires - and is labelled so wherever it is shown. Called only
+        from the capture worker, which is the only writer of detection rows.
+        """
+        row = self.db.query_one(
+            "SELECT evidence, dst_ip FROM traffic_anomalies WHERE id = %s", (anomaly_id,)
+        )
+        if not row:
+            return
+        evidence = decode_json(row.get("evidence")) or {}
+        targets = list(evidence.get("scan_targets") or [as_text(row.get("dst_ip"))])
+        if target and target not in targets and len(targets) < 1024:
+            targets.append(target)
+        observed = set(evidence.get("ports_observed") or evidence.get("ports_sample") or [])
+        for port in ports or []:
+            if len(observed) >= 4096:
+                break
+            observed.add(port)
+        evidence["scan_targets"] = targets
+        evidence["scan_target_count"] = len(targets)
+        evidence["ports_observed"] = sorted(observed, key=lambda p: (str(type(p)), p))
+        evidence["ports_observed_note"] = (
+            "Ports reported by this scan's detections; a lower bound on the "
+            "ports probed."
+        )
+        self.db.execute(
+            "UPDATE traffic_anomalies SET evidence = %s WHERE id = %s",
+            (encode_json(evidence), anomaly_id),
+        )
+
+    def anomaly_with_start(
+        self, dedup_key_parts: tuple[str, str, str, int | None], first_seen: datetime
+    ) -> TrafficAnomaly | None:
+        """An episode already stored for exactly this key and packet-clock start.
+
+        Makes recording an episode idempotent: the same detection processed
+        twice finds the row it already wrote instead of writing another.
+        """
+        rule_id, src_ip, dst_ip, dst_port = dedup_key_parts
+        port_clause = "dst_port IS NULL" if dst_port is None else "dst_port = %s"
+        params: list[Any] = [rule_id, src_ip, dst_ip, to_db(first_seen)]
+        if dst_port is not None:
+            params.append(dst_port)
+        row = self.db.query_one(
+            f"{_ANOMALY_SELECT} WHERE rule_id = %s AND src_ip = %s AND dst_ip = %s "
+            f"AND first_seen = %s AND {port_clause} LIMIT 1",
+            tuple(params),
+        )
+        return self._map_anomaly(row) if row else None
+
+    def recent_anomaly_for_source(
+        self, rule_id: str, src_ip: str, since: datetime,
+        until: datetime | None = None,
+    ) -> TrafficAnomaly | None:
+        """The running episode of ``rule_id`` from ``src_ip``, any destination.
+
+        For rules that measure a source across targets (ICMP, TCP SYN), so a
+        measurement whose most recent destination changed still extends the
+        source's episode instead of being lost.
+        """
+        row = self.db.query_one(
+            f"{_ANOMALY_SELECT} WHERE rule_id = %s AND src_ip = %s "
+            "AND last_seen >= %s AND (%s IS NULL OR first_seen <= %s) "
+            "ORDER BY last_seen DESC LIMIT 1",
+            (rule_id, src_ip, to_db(since), to_db(until) if until else None,
+             to_db(until) if until else None),
+        )
+        return self._map_anomaly(row) if row else None
+
     def insert_anomaly(self, anomaly: TrafficAnomaly) -> int:
         """Insert one deterministic traffic anomaly."""
         now = utcnow()
@@ -574,9 +749,10 @@ class AlertRepository(Repository):
             "observation, why_it_matters, what_to_check, severity, confidence, "
             "src_ip, dst_ip, dst_port, protocol, interface, observed_value, "
             "threshold_value, window_seconds, event_count, detected_at, first_seen, "
-            "last_seen, evidence, host_id, evaluation, source, created_at) "
+            "last_seen, evidence, host_id, evaluation, source, created_at, "
+            "latest_value, latest_measured_at, peak_severity) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-            "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 anomaly.rule_id[:48], str(anomaly.category), anomaly.title[:190],
                 anomaly.observation, anomaly.why_it_matters,
@@ -590,18 +766,198 @@ class AlertRepository(Repository):
                 to_db(anomaly.last_seen or now), encode_json(anomaly.evidence),
                 anomaly.host_id, str(anomaly.evaluation), str(anomaly.source),
                 to_db(anomaly.created_at or now),
+                # A first sighting's latest measurement is the one that
+                # raised it, and its peak is the severity it was raised with.
+                round(anomaly.observed_value, 3),
+                # The packet clock: the triggering packet's capture time, as
+                # every later measurement now records too. detected_at is the
+                # analysis clock and stays in its own column.
+                to_db(anomaly.last_seen or anomaly.detected_at or now),
+                str(anomaly.severity),
             ),
         )
 
-    def update_anomaly_occurrence(
-        self, anomaly_id: int, *, last_seen: datetime, observed_value: float
+    def raise_anomaly_pps(self, anomaly_id: int, packets_per_second: float) -> None:
+        """Raise an episode's recorded pps to ``packets_per_second`` if higher.
+
+        A port scan or host sweep is graded on the pps legend from the rate in
+        ``evidence.packets_per_second``. When a repeat observation of the same
+        episode measures faster, its severity rises (see
+        :meth:`update_anomaly_occurrence`) and the recorded pps must rise with
+        it, or the Rate column would show a figure lower than the one the
+        severity was graded on. It never falls, for the same reason the peak
+        severity never falls. A single statement, so concurrent folds cannot
+        lower it.
+        """
+        self.db.execute(
+            "UPDATE traffic_anomalies SET evidence = JSON_SET("
+            "COALESCE(NULLIF(evidence, ''), '{}'), '$.packets_per_second', "
+            "GREATEST(COALESCE(CAST(JSON_VALUE(NULLIF(evidence, ''), "
+            "'$.packets_per_second') AS DECIMAL(14,1)), 0), %s)) "
+            "WHERE id = %s",
+            (round(float(packets_per_second), 1), anomaly_id),
+        )
+
+    def record_episode_measurement(
+        self,
+        anomaly_id: int,
+        measurement: dict[str, Any],
+        rate: float,
     ) -> None:
-        """Fold a repeat observation into an existing anomaly record."""
+        """Store the facts of a repeat measurement inside the episode's evidence.
+
+        ``evidence.latest_measurement`` is always replaced; the same object
+        goes to ``evidence.peak_measurement`` only when ``rate`` exceeds the
+        peak already stored in ``observed_value``. Call it BEFORE
+        :meth:`update_anomaly_occurrence`, which raises that peak.
+
+        Until this existed a repeat measurement updated the rate columns and
+        nothing else: the observation sentence and every evidence field stayed
+        as they were at the instant the threshold was first crossed. Detection
+        2860 therefore showed a latest and peak rate of 1,040.2 pps beside an
+        observation of "600 packets in 5 s (120.0 packets/second) ... Low", and
+        detection 2817 showed 299 / 330.2 pps beside the same 120 pps
+        sentence. The trigger evidence is kept unchanged - it is a true record
+        of the threshold crossing - and the later measurements are stored
+        beside it, each with its own time, counts and capture state.
+
+        One statement, so the peak comparison and the write cannot interleave
+        with another fold. The conditional path keeps the value a JSON object:
+        MariaDB 10.4 turns ``IF(cond, JSON_QUERY(...), ...)`` into a quoted
+        string, whereas choosing the PATH conditionally does not.
+        """
+        document = json.dumps(measurement, default=str)
+        self.db.execute(
+            "UPDATE traffic_anomalies SET evidence = JSON_REMOVE(JSON_SET("
+            "JSON_SET(COALESCE(NULLIF(evidence, ''), '{}'), "
+            "'$.latest_measurement', JSON_QUERY(%s, '$')), "
+            "IF(%s > COALESCE(observed_value, 0), '$.peak_measurement', "
+            "'$.discarded_measurement'), JSON_QUERY(%s, '$')), "
+            "'$.discarded_measurement') "
+            "WHERE id = %s",
+            (document, round(float(rate), 3), document, anomaly_id),
+        )
+
+    def update_anomaly_occurrence(
+        self,
+        anomaly_id: int,
+        *,
+        last_seen: datetime,
+        observed_value: float,
+        severity: "Severity | None" = None,
+        measured_at: datetime | None = None,
+    ) -> None:
+        """Fold a repeat observation into an existing anomaly record.
+
+        Args:
+            observed_value: this observation's measurement. It becomes
+                ``latest_value``, and raises ``observed_value`` only when it
+                exceeds the peak already stored.
+            severity: the classification this measurement produces. When given
+                it raises ``severity`` if it is higher - which is what makes an
+                escalation
+                visible to the table, the counters and the filters at once -
+                and raises ``peak_severity`` only when it is higher than the
+                peak already recorded, so the peak never falls. ``None``
+                leaves both alone, which is correct for a rule whose severity
+                does not come from a packet rate.
+
+        The whole fold is a single statement. Two capture threads folding the
+        same episode cannot interleave a read with a write and lose an
+        observation, and the peak cannot be lowered by a slower thread
+        writing a stale value.
+        """
+        if severity is None:
+            self.db.execute(
+                "UPDATE traffic_anomalies SET event_count = event_count + 1, "
+                "last_seen = %s, latest_value = %s, latest_measured_at = %s, "
+                "observed_value = GREATEST(observed_value, %s) "
+                "WHERE id = %s",
+                (
+                    to_db(last_seen), round(observed_value, 3),
+                    to_db(measured_at or last_seen),
+                    round(observed_value, 3), anomaly_id,
+                ),
+            )
+            return
+        # FIELD() gives the severity ladder a numeric order inside SQL, so both
+        # the severity and the peak are raised in the statement that writes the
+        # current measurement.
+        #
+        # ``severity`` is raised, never lowered. It used to be replaced
+        # outright, which meant an episode that reached 1,733 pps reported LOW
+        # as soon as the rate tailed off below 500 - and this column is what
+        # the IDS badge, the severity counters, the filter, exports, the
+        # dashboard and notification eligibility all read. An attack's
+        # severity is the worst it has validly measured, not whatever it
+        # happened to be doing at the last sample.
+        #
+        # The live rate is still here in full: ``latest_value`` and
+        # ``latest_measured_at`` carry the current measurement, so a falling
+        # rate remains visible without rewriting what the attack reached.
+        ladder = "'INFO','LOW','MEDIUM','HIGH','CRITICAL'"
+        rise = (
+            "IF(FIELD(%s, " + ladder + ") > "
+            "FIELD(COALESCE({column}, %s), " + ladder + "), %s, "
+            "COALESCE({column}, %s))"
+        )
         self.db.execute(
             "UPDATE traffic_anomalies SET event_count = event_count + 1, "
-            "last_seen = %s, observed_value = GREATEST(observed_value, %s) "
+            "last_seen = %s, latest_value = %s, latest_measured_at = %s, "
+            "observed_value = GREATEST(observed_value, %s), "
+            "severity = " + rise.format(column="severity") + ", "
+            "peak_severity = " + rise.format(column="peak_severity") + " "
             "WHERE id = %s",
-            (to_db(last_seen), round(observed_value, 3), anomaly_id),
+            (
+                to_db(last_seen), round(observed_value, 3),
+                to_db(measured_at or last_seen),
+                round(observed_value, 3),
+                # severity: compare, then keep whichever is higher
+                str(severity), "", str(severity), str(severity),
+                # peak_severity: the same, against its own column
+                str(severity), "", str(severity), str(severity),
+                anomaly_id,
+            ),
+        )
+
+    def record_severity_transition(
+        self,
+        anomaly_id: int,
+        *,
+        occurred_at: datetime,
+        previous: "Severity",
+        new: "Severity",
+        observed_value: float | None = None,
+        window_seconds: int | None = None,
+        measured_at: datetime | None = None,
+    ) -> int:
+        """Log one actual change of classification.
+
+        Called only when the classification really changed. A measurement
+        that leaves severity where it was writes nothing, so this table holds
+        transitions rather than observations and cannot be inflated by a
+        steady flood.
+        """
+        return self.db.insert(
+            "INSERT INTO anomaly_severity_transitions (anomaly_id, "
+            "occurred_at, previous_severity, new_severity, observed_value, "
+            "window_seconds, measured_at, created_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                anomaly_id, to_db(occurred_at), str(previous), str(new),
+                None if observed_value is None else round(observed_value, 3),
+                window_seconds, to_db(measured_at), to_db(utcnow()),
+            ),
+        )
+
+    def severity_transitions(self, anomaly_id: int) -> list[dict[str, Any]]:
+        """Every recorded change for one episode, oldest first."""
+        return self.db.query(
+            "SELECT id, occurred_at, previous_severity, new_severity, "
+            "observed_value, window_seconds, measured_at "
+            "FROM anomaly_severity_transitions WHERE anomaly_id = %s "
+            "ORDER BY occurred_at ASC, id ASC",
+            (anomaly_id,),
         )
 
     def get_anomaly(self, anomaly_id: int) -> TrafficAnomaly | None:
@@ -790,6 +1146,87 @@ class AlertRepository(Repository):
                 (to_db(utcnow()), user_id, anomaly_id),
             )
         return bool(changed)
+
+    # ------------------------------------------------------------------
+    # Attack statistics (one GROUP BY per source; never a row scan in Python)
+    # ------------------------------------------------------------------
+    def aethra_episode_statistics(
+        self, start: datetime | None, end: datetime | None, active_since: datetime
+    ) -> list[dict[str, Any]]:
+        """Per AETHRA-SEC rule: episodes started in ``[start, end)``.
+
+        One detection record is one episode (see ATTACK_EPISODE_LIFECYCLE.md),
+        so episodes are counted as rows. ``correlated`` counts episodes whose
+        correlated attack also holds at least one Snort alert - a link the
+        correlation engine established, not a timestamp coincidence.
+        ``revised`` counts rows written under the 15 Oct 2026 episode rules
+        (``measurement_clock: packet``); older rows may hold merged runs or
+        reply-direction duplicates, and the page says so.
+        """
+        clauses, params = period_bounds("a.first_seen", start, end)
+        rows = self.db.query(
+            "SELECT a.rule_id, COUNT(*) AS episodes, "
+            "SUM(a.last_seen >= %s) AS active, "
+            "SUM(a.incident_id IS NOT NULL AND EXISTS (SELECT 1 FROM snort_alerts s "
+            "    WHERE s.incident_id = a.incident_id)) AS correlated, "
+            "SUM(COALESCE(JSON_VALUE(NULLIF(a.evidence, ''), '$.measurement_clock') "
+            "    = 'packet', 0)) AS revised, "
+            "MAX(a.first_seen) AS latest "
+            f"FROM traffic_anomalies a {clauses} GROUP BY a.rule_id",
+            [to_db(active_since), *params],
+        )
+        return [
+            {
+                "rule_id": as_text(r["rule_id"]),
+                "episodes": as_int(r["episodes"]) or 0,
+                "active": as_int(r["active"]) or 0,
+                "correlated": as_int(r["correlated"]) or 0,
+                "revised": as_int(r["revised"]) or 0,
+                "latest": r["latest"],
+            }
+            for r in rows
+        ]
+
+    def snort_signature_statistics(
+        self, start: datetime | None, end: datetime | None
+    ) -> list[dict[str, Any]]:
+        """Per Snort (generator, signature, revision): records and raw alerts.
+
+        ``records`` are stored rows; ``raw_alerts`` adds every repeat folded
+        into them (``duplicate_count``), i.e. the alert lines Snort wrote. A
+        repeat is attributed to its row's start time, so a period boundary
+        that falls inside a long episode counts all its repeats in the period
+        the episode began - stated on the page.
+        """
+        clauses, params = period_bounds("COALESCE(alert_time, received_at)", start, end)
+        rows = self.db.query(
+            "SELECT generator_id, signature_id, revision, COUNT(*) AS records, "
+            "SUM(duplicate_count) AS raw_alerts, "
+            "MAX(COALESCE(last_alert_time, alert_time, received_at)) AS latest "
+            f"FROM snort_alerts {clauses} "
+            "GROUP BY generator_id, signature_id, revision",
+            params,
+        )
+        return [
+            {
+                "generator_id": as_int(r["generator_id"]),
+                "signature_id": as_int(r["signature_id"]),
+                "revision": as_int(r["revision"]),
+                "records": as_int(r["records"]) or 0,
+                "raw_alerts": as_int(r["raw_alerts"]) or 0,
+                "latest": r["latest"],
+            }
+            for r in rows
+        ]
+
+    def snort_evidence_for_incident(self, incident_id: int, limit: int = 200) -> list[SnortAlert]:
+        """Snort alerts linked to one correlated attack, newest first, bounded."""
+        rows = self.db.query(
+            f"{_ALERT_SELECT} WHERE incident_id = %s "
+            "ORDER BY COALESCE(alert_time, received_at) DESC LIMIT %s",
+            (incident_id, max(1, min(int(limit), 1000))),
+        )
+        return self._map_all(rows, self._map_alert)
 
     def count_unreviewed_anomalies(self) -> int:
         """Anomalies no analyst has evaluated yet.

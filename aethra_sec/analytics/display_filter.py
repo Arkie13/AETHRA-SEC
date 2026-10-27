@@ -866,10 +866,10 @@ DIRECTION_PRESETS: tuple[Preset, ...] = (
 PROTOCOL_PRESETS: tuple[Preset, ...] = (
     Preset("HTTP", "HTTP", "http", "No HTTP traffic captured."),
     Preset("HTTPS", "HTTPS/TLS", "tls", "No HTTPS/TLS traffic captured.", encrypted=True),
-    Preset(
-        "WEB", "Web traffic", "http || tls",
-        "No web traffic (HTTP or HTTPS/TLS) captured.", encrypted=True,
-    ),
+    # "WEB" ("http || tls") was removed with its button. HTTP and HTTPS/TLS
+    # remain, and either expression can still be typed into the display filter
+    # box, so nothing became unreachable - only the preset that duplicated two
+    # of its neighbours went.
     # The names this computer connected to or looked up, each from a decoded
     # field: the server name in a TLS handshake (SNI), the Host header of an
     # HTTP request, and the name in a DNS query. DNS responses repeat the

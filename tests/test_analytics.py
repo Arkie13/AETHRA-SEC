@@ -274,7 +274,12 @@ class TestAnomalyRules:
         assert udp[0].evidence["destination_port"] == 53
 
     def test_syn_flood_requires_unanswered_connections(self) -> None:
-        """A high SYN rate that IS being answered is not reported as a flood."""
+        """A high SYN rate whose connections COMPLETE is not reported as a flood.
+
+        Completion is the source's own ACK. A SYN/ACK alone is the server
+        accepting the attempt - the SYN flood case, covered in
+        ``test_alert_recovery.py`` - and no longer counts as an answer.
+        """
         engine = self._engine()
         raised = []
         for index in range(60):
@@ -289,6 +294,10 @@ class TestAnomalyRules:
                         tcp_flags=0x12, offset_seconds=index * 0.01,
                     )
                 )
+            )
+            # And the client's ACK that completes the handshake.
+            raised.extend(
+                engine.evaluate(make_packet(tcp_flags=0x10, offset_seconds=index * 0.01))
             )
         assert not [a for a in raised if a.rule_id == RULE_SYN_FLOOD]
 
@@ -330,15 +339,29 @@ class TestAnomalyRules:
                 captured_at=base.captured_at + timedelta(seconds=index * (5 / 7000)),
             )
             raised.extend(engine.evaluate(packet))
-        syn = [a for a in raised if a.rule_id == RULE_SYN_FLOOD]
+        # Alerts, as distinct from the measurement updates that keep a
+        # running episode's rate current. Only these reach the operator.
+        syn = [
+            a for a in raised
+            if a.rule_id == RULE_SYN_FLOOD and not a.measurement_only
+        ]
         assert syn, "the flood was not detected"
         # Detected early, at the band measured when the threshold was crossed...
         assert syn[0].severity is Severity.LOW
         # ...and reported again as the sustained rate entered each higher band,
         # so the stored severity reflects the rate the flood actually reached.
         assert [a.severity for a in syn] == [Severity.LOW, Severity.MEDIUM, Severity.HIGH]
-        assert syn[-1].observed_value > 1000
+        # 1,000 pps is itself HIGH, so the band is entered AT the floor.
+        assert syn[-1].observed_value >= 1000
         assert "higher severity band" in syn[-1].evidence["severity_band"]
+
+        # The measurement stream keeps the rate current without alerting.
+        updates = [
+            a for a in raised
+            if a.rule_id == RULE_SYN_FLOOD and a.measurement_only
+        ]
+        assert updates, "a running flood must keep being measured"
+        assert max(a.observed_value for a in updates) >= 1000
 
     def test_a_steady_flood_is_not_re_reported_without_escalation(self) -> None:
         from aethra_sec.analytics.anomaly_rules import DetectionThresholds
@@ -354,7 +377,16 @@ class TestAnomalyRules:
                 base, captured_at=base.captured_at + timedelta(seconds=index * 0.004)
             )
             raised.extend(engine.evaluate(packet))
-        assert len([a for a in raised if a.rule_id == RULE_SYN_FLOOD]) == 1
+        syn = [a for a in raised if a.rule_id == RULE_SYN_FLOOD]
+        # One ALERT: the band never rose, so the operator is told once.
+        assert len([a for a in syn if not a.measurement_only]) == 1
+        # Measurement updates continue, but at the cadence rather than per
+        # packet: 5,000 packets across 20 seconds must not mean 5,000 writes.
+        updates = [a for a in syn if a.measurement_only]
+        assert 0 < len(updates) <= 25, (
+            f"{len(updates)} measurement updates for 20 seconds of traffic; "
+            "the cadence gate is not limiting database writes"
+        )
 
     def test_http_responses_are_not_counted_as_requests(self) -> None:
         """§3.9.8 is 600 requests per minute; responses are not requests."""
@@ -374,7 +406,12 @@ class TestAnomalyRules:
         assert not [a for a in raised if a.rule_id == RULE_HTTP_FLOOD]
 
     def test_suppression_window_prevents_flooding(self) -> None:
-        """A repeat detection inside the suppression window does not re-fire."""
+        """A repeat detection inside the suppression window does not re-fire.
+
+        Since 19 Oct 2026 a running scan sends measurement-only updates, as
+        the flood rules do (see the SYN tests above), so the record reaches
+        the scan's real extent. An update is not a new alert.
+        """
         engine = self._engine()
         first = []
         for port in range(1, 12):
@@ -382,8 +419,10 @@ class TestAnomalyRules:
         second = []
         for port in range(20, 40):
             second.extend(engine.evaluate(make_packet(dst_port=port)))
-        assert [a for a in first if a.rule_id == RULE_PORT_SCAN]
-        assert not [a for a in second if a.rule_id == RULE_PORT_SCAN]
+        assert [a for a in first if a.rule_id == RULE_PORT_SCAN and not a.measurement_only]
+        repeats = [a for a in second if a.rule_id == RULE_PORT_SCAN]
+        assert not [a for a in repeats if not a.measurement_only]
+        assert all(not a.starts_episode for a in repeats)
 
     def test_disabled_engine_raises_nothing(self) -> None:
         """The master switch stops every rule."""

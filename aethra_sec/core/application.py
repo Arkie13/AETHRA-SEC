@@ -346,6 +346,9 @@ class ApplicationContext:
             self.audit, self.access, self.settings.snort, self.settings.tools,
             self.risk_engine,
         )
+        # New Snort alerts are graded on the §3.9.8 pps legend from the live
+        # capture rate of their source, the same bands as a flood.
+        self.snort.set_rate_probe(self.capture.rules.source_rate)
         self.mitigation = MitigationService(
             mitigation_repo, self.audit, self.access, incident_repo
         )
@@ -437,6 +440,17 @@ class ApplicationContext:
                 nmap=self.nmap.availability,
                 tshark=self.capture.availability,
                 capture_status=self.capture.statistics,
+                # Traffic that approached or crossed a rule and raised no
+                # detection, so an empty Alerts table can be told apart from
+                # traffic that never came close.
+                detection_near_misses=lambda: self.capture.rules.near_misses(),
+                # What the capture point can SEE, counted from real frames.
+                # Separate from capture_status on purpose: that reports whether
+                # the sensor is running, this reports how much of the network
+                # reaches it, and a healthy sensor on an ordinary switched port
+                # still cannot observe traffic between two other machines.
+                capture_visibility=lambda: self.capture.view.visibility.report(),
+                interface_roles=self._interface_roles,
                 snort_status=self.snort.status,
                 snort_executable=self.snort.executable_status,
                 correlation_stats=lambda: self.correlation.statistics
@@ -526,6 +540,36 @@ class ApplicationContext:
             self.authentication.apply_policy(self._authentication_policy())
         if self.recovery is not None:
             self.recovery.apply_policy(self._recovery_policy())
+
+    def _interface_roles(self) -> Any:
+        """Resolve the configured interface roles against the adapters present.
+
+        Roles are recorded by stable capture device name, so an adapter that
+        Windows has renamed or renumbered still resolves. A configured device
+        that is absent is reported as missing rather than quietly falling back
+        to another adapter - falling back is how a sensor ends up monitoring
+        the wrong segment while still reporting success.
+        """
+        from aethra_sec.analytics.interface_roles import (
+            SETTING_MANAGEMENT,
+            SETTING_MONITORING,
+            SETTING_SPAN_DECLARED,
+            resolve,
+        )
+
+        settings = self.settings_service
+        monitoring = management = ""
+        declared = False
+        if settings is not None:
+            monitoring = settings.get(SETTING_MONITORING, "") or ""
+            management = settings.get(SETTING_MANAGEMENT, "") or ""
+            declared = settings.get_bool(SETTING_SPAN_DECLARED, False)
+        return resolve(
+            self.capture.list_interfaces(),
+            monitoring_device=str(monitoring),
+            management_device=str(management),
+            span_declared=declared,
+        )
 
     def _register_jobs(self) -> None:
         """Register the periodic background jobs."""

@@ -70,7 +70,9 @@ def _statements(path: Path) -> str:
 def _method(name: str) -> str:
     """One screen method's statements."""
     code = _statements(SCREEN)
-    start = code.index(f"def {name}")
+    # The trailing parenthesis matters: without it a lookup for _apply
+    # matches a longer name such as _apply_guide_context.
+    start = code.index(f"def {name}(")
     rest = code[start + 4 :]
     end = rest.index("\n    def ") if "\n    def " in rest else len(rest)
     return code[start : start + 4 + end]

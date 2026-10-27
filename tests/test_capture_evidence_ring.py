@@ -186,7 +186,7 @@ class TestRotationIsFollowed:
         from aethra_sec.integrations.pyshark_capture import field_reader
 
         body = inspect.getsource(field_reader.FieldCaptureReader._run)
-        assert "if self._ring_files:" in body
+        assert "if self._ring_active:" in body
 
 
 # ---------------------------------------------------------------------------
@@ -241,3 +241,72 @@ class TestThePipelineIsUnchanged:
         body = inspect.getsource(field_reader.FieldCaptureReader.start)
         assert "if self.is_running:" in body
         assert "return" in body
+
+
+# ---------------------------------------------------------------------------
+# The first ring file, before any rotation has happened
+# ---------------------------------------------------------------------------
+class TestTheFirstRingFileIsFound:
+    """Regression: every packet before the first rotation had a dead path.
+
+    ``-w`` alone writes the base path, so the reader seeded ``pcap_path`` with
+    it. ``-b`` does not: TShark writes ``<base>_00001_<timestamp>.pcapng`` and
+    never creates the base at all. Rotation was followed correctly, but nothing
+    resolved the *first* file, so every packet captured before the first
+    rotation - the first 64 MB, by default - carried a path that had never
+    existed. Opening one said "the capture file is no longer present" while the
+    capture was still running.
+
+    The tests above missed it because they each assigned ``_pcap_text`` by hand
+    before exercising rotation, which is precisely the state that was broken.
+    """
+
+    def test_a_ring_reader_does_not_start_on_the_base_path(self, tmp_path) -> None:  # noqa: ANN001
+        base = tmp_path / "evidence.pcapng"
+        reader = _reader(output_file=base, ring_filesize_kb=64, ring_files=3)
+        assert reader._pcap_text != str(base), (
+            "the base path is never created under -b, so every packet before "
+            "the first rotation would point at a file that cannot exist"
+        )
+
+    def test_the_first_packet_resolves_the_first_ring_file(self, tmp_path) -> None:  # noqa: ANN001
+        base = tmp_path / "evidence.pcapng"
+        (tmp_path / "evidence_00001_x.pcapng").write_bytes(b"")
+        reader = _reader(output_file=base, ring_filesize_kb=64, ring_files=3)
+
+        packet = _packet(1)
+        reader._follow_rotation(packet)
+
+        assert packet.pcap_path.endswith("evidence_00001_x.pcapng")
+        assert Path(packet.pcap_path).exists()
+
+    def test_resolution_is_retried_until_the_file_appears(self, tmp_path) -> None:  # noqa: ANN001
+        """A capture may see the directory before TShark has created the file."""
+        base = tmp_path / "evidence.pcapng"
+        reader = _reader(output_file=base, ring_filesize_kb=64, ring_files=3)
+
+        early = _packet(1)
+        reader._follow_rotation(early)
+        assert early.pcap_path == "", "a path was invented before one existed"
+
+        (tmp_path / "evidence_00001_x.pcapng").write_bytes(b"")
+        later = _packet(2)
+        reader._follow_rotation(later)
+        assert later.pcap_path.endswith("evidence_00001_x.pcapng")
+
+    def test_a_single_file_capture_still_uses_the_base_path(self, tmp_path) -> None:  # noqa: ANN001
+        """Without a ring, -w writes exactly the base path and it is correct."""
+        base = tmp_path / "evidence.pcapng"
+        reader = _reader(output_file=base)
+        assert reader._pcap_text == str(base)
+
+    def test_one_bound_alone_is_not_a_ring(self, tmp_path) -> None:  # noqa: ANN001
+        """_command() needs both bounds; the reader must agree, or it would
+        hunt for rotated files the command never asked TShark to write."""
+        base = tmp_path / "evidence.pcapng"
+        for kwargs in ({"ring_filesize_kb": 64}, {"ring_files": 3}):
+            reader = _reader(output_file=base, **kwargs)
+            assert "-b" not in reader._command()
+            assert reader._pcap_text == str(base), (
+                "no ring was requested, so the base path is the real file"
+            )

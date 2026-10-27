@@ -1,0 +1,11 @@
+# HOME_NET for AETHRA-SEC network monitoring mode (snort.monitor.conf).
+#
+# Copy to C:\Snort-wsl\home_net.monitor.conf and set it to the authorised
+# laboratory segment the switch is mirroring to the monitoring NIC.
+#
+# This must be the range you are authorised to monitor, and only that range.
+# It is NOT this host's address - that is what home_net.conf holds, and the
+# Windows-side updater rewrites that file automatically.
+#
+# Example for the laboratory segment used in the project documentation:
+ipvar HOME_NET 192.168.100.0/24

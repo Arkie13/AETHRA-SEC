@@ -93,6 +93,19 @@ FIELDS: tuple[str, ...] = (
     # instance label would have written a rotating identifier into the
     # inventory as though it were a device's name.
     "dns.srv.target",
+    # The address a DNS answer resolved its name to. Without these two the
+    # name a lookup produced can never be joined to the traffic that follows
+    # it, because that traffic carries only addresses: measured on this
+    # machine, a domain appears in about 1.4% of frames and an address in all
+    # of them. They were dropped when dns.srv.target was added for mDNS
+    # naming, which silently removed the only basis for that join.
+    #
+    # occurrence=f gives the first record of a multi-answer response, so a
+    # name resolving to several addresses is learned for one of them. The
+    # rest stay unattributed, which is the honest outcome: the alternative is
+    # naming an address the capture never tied to the name.
+    "dns.a",
+    "dns.aaaa",
     "http.request.method",
     "http.request.uri",
     "http.host",
@@ -324,6 +337,11 @@ def parse_line(line: str, interface: str, pcap_path: str = "") -> CapturedPacket
         dns_query=_text(parts, "dns.qry.name"),
         dns_response=_flag(parts, "dns.flags.response"),
         dns_srv_target=_text(parts, "dns.srv.target"),
+        # A over AAAA: both are recorded by the dissector when a response
+        # carries both, and either alone is enough to join the name to a flow.
+        dns_answer_address=(
+            _address(parts, "dns.a") or _address(parts, "dns.aaaa")
+        ),
         icmp_type=icmp_type,
         icmp_code=icmp_code,
         arp_opcode=_number(parts, "arp.opcode"),
@@ -369,14 +387,32 @@ class FieldCaptureReader:
         self._queue = queue
         self._tshark_path = tshark_path
         self._output_file = output_file
-        #: Recorded on every packet so the inspector can find its frame again.
-        self._pcap_text = str(output_file) if output_file is not None else ""
         #: Ring-buffer bounds for the evidence pcap. Zero means one
         #: unbounded file, which is what this used to be: measured at
         #: 31.8 MB in 150 seconds on this machine's Wi-Fi, or roughly
         #: 18 GB a day, with nothing to stop it filling the disk.
         self._ring_filesize_kb = max(0, int(ring_filesize_kb))
         self._ring_files = max(0, int(ring_files))
+        #: A ring needs both bounds. One alone leaves TShark writing the
+        #: single file at ``-w``, so every site that asks "is this a ring?"
+        #: has to agree, or the reader looks for rotated files that the
+        #: command never asked for.
+        self._ring_active = bool(self._ring_filesize_kb and self._ring_files)
+        #: Recorded on every packet so the inspector can find its frame again.
+        #:
+        #: With ``-b`` TShark never creates the base path: it writes
+        #: ``<base>_00001_<timestamp>.pcapng`` and so on. Seeding this with the
+        #: base path would hand every packet captured before the first
+        #: rotation - the first ``filesize`` kilobytes, 64 MB by default - a
+        #: path that does not exist and never will, and their detail would
+        #: read "the capture file is no longer present" while the capture was
+        #: still running. So under a ring it starts unknown and
+        #: :meth:`_follow_rotation` resolves it from the directory.
+        self._pcap_text = (
+            ""
+            if output_file is None or self._ring_active
+            else str(output_file)
+        )
         #: Last frame number seen, to notice a rotation.
         self._last_frame_number: int | None = None
         self._on_error = on_error
@@ -416,7 +452,7 @@ class FieldCaptureReader:
             # decode any one of them later. The live path reads fields; the
             # evidence path keeps the packet.
             command += ["-w", str(self._output_file)]
-            if self._ring_filesize_kb and self._ring_files:
+            if self._ring_active:
                 # A ring, so a long session cannot fill the disk. Total on
                 # disk is bounded by filesize x files; TShark deletes the
                 # oldest itself. Frame numbers restart per file, and
@@ -563,6 +599,19 @@ class FieldCaptureReader:
             except OSError:
                 pass
 
+    @property
+    def pid(self) -> int | None:
+        """The TShark child's process id while it is running, else None.
+
+        Read from the process object rather than remembered, so a capture that
+        has already ended reports nothing instead of a stale number that still
+        looks alive.
+        """
+        process = self._process
+        if process is None or process.poll() is not None:
+            return None
+        return process.pid
+
     # ------------------------------------------------------------------
     # Reader thread
     # ------------------------------------------------------------------
@@ -590,7 +639,14 @@ class FieldCaptureReader:
         number = packet.number
         if number is None:
             return
-        if self._last_frame_number is not None and number < self._last_frame_number:
+        if not self._pcap_text:
+            # Not resolved yet. The first file exists by the time its first
+            # packet reaches us, but a capture that starts on a silent
+            # interface can see the directory before TShark creates it, so
+            # this retries per packet only while unresolved - never once a
+            # path is known.
+            self._resolve_current_ring_file()
+        elif self._last_frame_number is not None and number < self._last_frame_number:
             self._resolve_current_ring_file()
         self._last_frame_number = number
         packet.pcap_path = self._pcap_text
@@ -632,7 +688,7 @@ class FieldCaptureReader:
                     with self.counters._lock:  # noqa: SLF001
                         self.counters.decode_errors += 1
                     continue
-                if self._ring_files:
+                if self._ring_active:
                     self._follow_rotation(packet)
                 with self.counters._lock:  # noqa: SLF001
                     self.counters.captured += 1

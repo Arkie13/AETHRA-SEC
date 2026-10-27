@@ -73,6 +73,21 @@ class DashboardService:
         #: (key, monotonic_stamp, result) for the top-sources panel.
         self._overview_cache: tuple[Any, float, dict[str, Any]] | None = None
 
+    def measured_source_rate(
+        self,
+        src_ip: str,
+        start: datetime,
+        end: datetime,
+        *,
+        dst_ip: str | None = None,
+    ) -> float | None:
+        """Packets/second a source sent in a window, from captured traffic.
+
+        Gives the Alerts screen a real pps for detections that do not store one.
+        ``None`` when nothing was retained.
+        """
+        return self._traffic.measured_rate_for(src_ip, start, end, dst_ip=dst_ip)
+
     def snapshot(
         self,
         session: Session,
@@ -109,12 +124,26 @@ class DashboardService:
             period_detail=window.detail,
         )
 
+        unreadable: list[str] = []
+
         def attempt(name: str, action: Any) -> Any:
-            """Run one query, logging and swallowing its failure."""
+            """Run one query; on failure record that this figure is unknown.
+
+            One failing query must not blank the page, which is why the
+            exception is swallowed. But the caller applies ``or 0`` to the
+            None that comes back, so without recording the name the dashboard
+            would state that it observed zero when it could not look at all.
+            Logged at WARNING: a dashboard query that cannot run is an
+            operational fault, not a debugging detail.
+            """
             try:
                 return action()
             except Exception:  # noqa: BLE001
-                LOGGER.debug("Dashboard query '%s' failed.", name, exc_info=True)
+                unreadable.append(name)
+                LOGGER.warning(
+                    "Dashboard query '%s' failed; the figure will be reported "
+                    "as unavailable rather than zero.", name, exc_info=True,
+                )
                 return None
 
         # ------------------------------------------------------------------
@@ -147,14 +176,17 @@ class DashboardService:
             lambda: self._hosts.count_first_seen_in_period(start, end),
         ) or 0
 
-        # Both sources, on the period's own bounds, so this agrees with the IDS
-        # Alerts screen filtered to the same period rather than reporting
-        # Snort's share of it. The headline total is the sum of these parts and
-        # not a second query, which is what makes the tile and the donut
-        # incapable of disagreeing.
+        # AETHRA-SEC detections only, on the period's own bounds, so this agrees
+        # with the Alerts screen - which lists AETHRA-SEC's detections - for
+        # the same period. Snort alerts are supporting evidence and are counted
+        # separately (snort_alerts_in_period, Attack Statistics); adding them
+        # here counted every port-scan probe as a detection. The headline total
+        # is the sum of these parts, so the tile and the donut cannot disagree.
         severity = attempt(
             "detections_by_severity",
-            lambda: self._alerts.count_detections_by_severity(start, end),
+            lambda: self._alerts.count_detections_by_severity(
+                start, end, include_snort=False
+            ),
         ) or {}
         snapshot.high_alerts = int(severity.get("HIGH", 0))
         snapshot.medium_alerts = int(severity.get("MEDIUM", 0))
@@ -221,7 +253,8 @@ class DashboardService:
             attempt(
                 "alert_series",
                 lambda: self._alerts.detections_per_interval(
-                    start, end, minutes=snapshot.alert_bucket_minutes
+                    start, end, minutes=snapshot.alert_bucket_minutes,
+                    include_snort=False,
                 ),
             )
             or ()
@@ -259,6 +292,14 @@ class DashboardService:
                 lambda: self._alerts.search_alerts(start=start, end=end, limit=30),
             ) or ()
         )
+        # Set last, so it covers every query above including the trends.
+        snapshot.unreadable = tuple(unreadable)
+        if unreadable:
+            LOGGER.warning(
+                "Dashboard built with %d unreadable figure(s): %s",
+                len(unreadable), ", ".join(unreadable),
+            )
+
         return snapshot
 
     # ------------------------------------------------------------------
@@ -328,7 +369,7 @@ class DashboardService:
                     int(v)
                     for v in (
                         self._alerts.count_detections_by_severity(
-                            previous.start, previous.end
+                            previous.start, previous.end, include_snort=False
                         )
                         or {}
                     ).values()

@@ -1,5 +1,5 @@
 -- ===========================================================================
--- AETHRA-SEC 1.0.0 - complete database schema
+-- AETHRA-SEC 1.1.0 - complete database schema
 --
 -- AETHRA-SEC must only be operated against networks, hosts and interfaces
 -- that the operator is explicitly authorised to monitor or assess. It
@@ -18,7 +18,7 @@
 -- To use a different schema name, change it in the two statements below and
 -- set AETHRA_DB_NAME in your .env to match.
 --
--- Contains: 34 tables plus the reference rows a working installation needs
+-- Contains: 35 tables plus the reference rows a working installation needs
 --           (roles, permissions, settings, mitigation knowledge base).
 -- Contains NO user accounts and NO security records: hosts, packets, scans,
 -- findings, alerts, anomalies and incidents are created empty and fill only
@@ -52,7 +52,7 @@ SET FOREIGN_KEY_CHECKS = 1;
 
 
 -- --------------------------------------------------------------------------
--- 2. Tables (34), in dependency order
+-- 2. Tables (35), in dependency order
 -- --------------------------------------------------------------------------
 
 -- Ordering matters: incidents and mitigation_recommendations are
@@ -121,6 +121,12 @@ CREATE TABLE IF NOT EXISTS users (
     must_change_password TINYINT(1)  NOT NULL DEFAULT 0,
     created_at          DATETIME(6)  NOT NULL,
     updated_at          DATETIME(6)  NOT NULL,
+    -- When an administrator last changed this account's identity or
+    -- configuration. Deliberately NOT updated_at: that column also moves on
+    -- sign-in and on a failed-login count, so it cannot answer "when was this
+    -- account last edited". NULL means never edited since creation, which is
+    -- shown as a dash rather than guessed at.
+    date_modified       DATETIME(6)  NULL DEFAULT NULL,
     created_by          INT UNSIGNED NULL,
     PRIMARY KEY (id),
     UNIQUE KEY uq_users_username (username),
@@ -500,6 +506,17 @@ CREATE TABLE IF NOT EXISTS mitigation_recommendations (
     long_term_action    TEXT         NULL,
     verification_steps  TEXT         NULL,
     reference_notes     TEXT         NULL,
+    -- Where the change belongs (host firewall, network edge, web layer).
+    -- An endpoint rule and a gateway rule are not interchangeable, and a
+    -- recommendation that does not say which it means is not actionable.
+    enforcement_point   TEXT         NULL,
+    -- The ordered procedure, one step per line. Kept apart from
+    -- immediate_action, which stays the short "do this first" summary.
+    procedure_steps     TEXT         NULL,
+    -- How to undo exactly the rule the procedure created.
+    rollback_steps      TEXT         NULL,
+    -- What the change may legitimately break.
+    operational_warnings TEXT        NULL,
     is_active           TINYINT(1)   NOT NULL DEFAULT 1,
     is_builtin          TINYINT(1)   NOT NULL DEFAULT 0,
     created_by          INT UNSIGNED NULL,
@@ -611,9 +628,12 @@ CREATE TABLE IF NOT EXISTS snort_alerts (
     evaluated_at        DATETIME(6)  NULL,
     duplicate_count     INT UNSIGNED NOT NULL DEFAULT 1,
     dedup_key           VARCHAR(190) NOT NULL DEFAULT '',
+    last_alert_time     DATETIME(6)  NULL,
+    peak_pps            DECIMAL(14,1) NULL,
     created_at          DATETIME(6)  NOT NULL,
     PRIMARY KEY (id),
     KEY ix_alerts_time (alert_time),
+    KEY ix_alerts_last_alert (last_alert_time),
     KEY ix_alerts_received (received_at),
     KEY ix_alerts_signature (signature_id),
     KEY ix_alerts_severity (severity),
@@ -653,6 +673,14 @@ CREATE TABLE IF NOT EXISTS traffic_anomalies (
     threshold_value     DECIMAL(16,3) NOT NULL DEFAULT 0,
     window_seconds      INT UNSIGNED NOT NULL DEFAULT 0,
     event_count         INT UNSIGNED NOT NULL DEFAULT 1,
+    -- observed_value is the PEAK measurement across the episode (kept with
+    -- GREATEST on every fold). latest_value is the most recent one, which is
+    -- what current severity is classified from.
+    latest_value        DECIMAL(16,3) NULL,
+    latest_measured_at  DATETIME(6)  NULL,
+    -- severity above is the CURRENT classification. peak_severity is the
+    -- highest the episode ever reached, and never falls.
+    peak_severity       VARCHAR(16)  NULL,
     first_seen          DATETIME(6)  NOT NULL,
     last_seen           DATETIME(6)  NOT NULL,
     evidence            TEXT         NULL,
@@ -673,6 +701,24 @@ CREATE TABLE IF NOT EXISTS traffic_anomalies (
         FOREIGN KEY (host_id) REFERENCES hosts (id) ON DELETE SET NULL,
     CONSTRAINT fk_anomalies_incident
         FOREIGN KEY (incident_id) REFERENCES incidents (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- anomaly_severity_transitions
+CREATE TABLE IF NOT EXISTS anomaly_severity_transitions (
+    id                  BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    anomaly_id          BIGINT UNSIGNED NOT NULL,
+    occurred_at         DATETIME(6)  NOT NULL,
+    previous_severity   VARCHAR(16)  NOT NULL,
+    new_severity        VARCHAR(16)  NOT NULL,
+    observed_value      DECIMAL(16,3) NULL,
+    window_seconds      INT UNSIGNED NULL,
+    measured_at         DATETIME(6)  NULL,
+    created_at          DATETIME(6)  NOT NULL,
+    PRIMARY KEY (id),
+    KEY ix_transitions_anomaly (anomaly_id, occurred_at),
+    CONSTRAINT fk_transitions_anomaly
+        FOREIGN KEY (anomaly_id) REFERENCES traffic_anomalies (id)
+        ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- incident_events
@@ -984,7 +1030,7 @@ WHERE r.name = 'USER'
 ON DUPLICATE KEY UPDATE granted_at = role_permissions.granted_at;
 
 -- --------------------------------------------------------------------------
--- 4. Tunable settings (70)
+-- 4. Tunable settings (78)
 -- --------------------------------------------------------------------------
 
 -- Detection thresholds, correlation, capture, retention, interface,
@@ -1004,6 +1050,8 @@ INSERT INTO system_settings (setting_key, setting_value, value_type, category, d
     ('detection.host_sweep_window_seconds', '10', 'int', 'detection', 'Sliding window, in seconds, used by the host-sweep rule.', UTC_TIMESTAMP(6)),
     ('detection.rate_window_seconds', '5', 'int', 'detection', 'Sliding window, in seconds, used by the packet-rate flood rules.', UTC_TIMESTAMP(6)),
     ('detection.suppression_window_seconds', '120', 'int', 'detection', 'Minimum interval between two identical traffic anomalies for the same source before a new record is written (false-positive control).', UTC_TIMESTAMP(6)),
+    ('detection.episode_gap_seconds', '15', 'int', 'detection', 'Seconds without a qualifying observation after which an attack episode has ended. The next threshold crossing then opens a new episode and a new detection. Applied to AETHRA-SEC''s rules, to Snort repeats and to attack grouping alike. 15 s is three 5 s rate windows: a continuous flood refreshes its episode at least once a second (AETHRA-SEC) or every 5 s (Snort threshold rules), so short capture stalls do not split it, while separate test runs need only a 15 s pause to be counted separately.', UTC_TIMESTAMP(6)),
+    ('detection.episode_inactivity_seconds', '120', 'int', 'detection', 'How long without a matching observation before an alert''s episode is reported as Ended rather than Ongoing. Superseded on 15 Oct 2026 by detection.episode_gap_seconds, which now decides both when an episode ends and how it is reported; kept so existing installations read unchanged. Ended means observation stopped, not that the activity did.', UTC_TIMESTAMP(6)),
     ('detection.enabled', 'true', 'bool', 'detection', 'Master switch for deterministic traffic-analysis rules. Snort alert ingest is unaffected by this setting.', UTC_TIMESTAMP(6)),
     ('correlation.window_seconds', '300', 'int', 'correlation', 'Events sharing a correlation key inside this window are attached to the same incident instead of creating a new one.', UTC_TIMESTAMP(6)),
     ('correlation.reopen_resolved', 'false', 'bool', 'correlation', 'When enabled, new evidence re-opens a RESOLVED incident instead of creating a follow-up incident.', UTC_TIMESTAMP(6)),
@@ -1012,12 +1060,17 @@ INSERT INTO system_settings (setting_key, setting_value, value_type, category, d
     ('capture.queue_size', '20000', 'int', 'capture', 'Maximum number of decoded packets buffered between the capture reader and the processing worker. Excess packets are dropped and counted rather than growing memory without bound.', UTC_TIMESTAMP(6)),
     ('capture.pcap_ring_mb', '64', 'int', 'capture', 'Size of each capture file in the evidence ring, in megabytes. The session''s packets are written to a series of files of this size and TShark deletes the oldest, so a long capture cannot fill the disk. Total on disk is this multiplied by the file count. Set either to 0 for a single file that grows without limit.', UTC_TIMESTAMP(6)),
     ('capture.pcap_ring_files', '8', 'int', 'capture', 'How many capture files the evidence ring keeps. Once full, the oldest is deleted as a new one begins. A packet whose file has been recycled can no longer be inspected in detail, and the inspector says so rather than showing something else.', UTC_TIMESTAMP(6)),
+    ('capture.domain_ttl_seconds', '600', 'int', 'capture', 'How long an observed domain may explain later traffic to the same address. A name is carried only by a handshake or a DNS answer; every frame after it carries an address alone. Past this age the mapping is dropped rather than trusted, because addresses are reassigned and a stale name is worse than none.', UTC_TIMESTAMP(6)),
+    ('capture.domain_cache_entries', '4096', 'int', 'capture', 'How many server addresses the domain correlation remembers before evicting the least recently used. Bounds what a long capture can cost in memory.', UTC_TIMESTAMP(6)),
     ('capture.persist_packet_metadata', 'true', 'bool', 'capture', 'Persist per-packet metadata to traffic_records. Aggregates are stored regardless of this setting.', UTC_TIMESTAMP(6)),
     ('capture.persist_batch_size', '200', 'int', 'capture', 'Number of packet metadata rows written per batched INSERT.', UTC_TIMESTAMP(6)),
     ('capture.persist_flush_seconds', '2', 'int', 'capture', 'Maximum age of a partially filled packet batch before it is flushed.', UTC_TIMESTAMP(6)),
     ('capture.max_packet_rows_per_minute', '6000', 'int', 'capture', 'Upper bound on packet metadata rows written per minute. Beyond this rate packets are still analysed and aggregated, but only sampled for row-level storage; the sampling ratio is reported in the UI.', UTC_TIMESTAMP(6)),
     ('capture.aggregate_interval_seconds', '10', 'int', 'capture', 'Interval at which traffic aggregates are computed and persisted.', UTC_TIMESTAMP(6)),
     ('capture.decode_workers', '1', 'int', 'capture', 'Number of packet-processing worker threads.', UTC_TIMESTAMP(6)),
+    ('capture.monitoring_interface', '', 'str', 'capture', 'Capture device name of the dedicated monitoring interface - the adapter wired to a switch mirror/SPAN destination port or a network TAP. Recorded as the stable device name, not the friendly label. Empty means no dedicated monitoring interface has been nominated and capture uses whichever interface the operator selects.', UTC_TIMESTAMP(6)),
+    ('capture.management_interface', '', 'str', 'capture', 'Capture device name of the management interface - the adapter carrying the application''s own traffic. Recorded so the two roles can be told apart and reported; AETHRA-SEC never alters routing, gateways or adapter configuration to enforce it.', UTC_TIMESTAMP(6)),
+    ('capture.monitoring_span_declared', 'false', 'bool', 'capture', 'Whether an operator has stated that the monitoring interface is wired to a mirror/SPAN destination or a TAP. This is a declaration of intent and is never treated as proof: it can raise the reported visibility to ''monitoring interface selected'', and only an actually captured frame between two other hosts can report transit traffic as observed.', UTC_TIMESTAMP(6)),
     ('retention.traffic_records_hours', '24', 'int', 'retention', 'Hours of per-packet metadata kept before pruning. 0 disables pruning (not recommended on a live network).', UTC_TIMESTAMP(6)),
     ('retention.traffic_aggregates_days', '30', 'int', 'retention', 'Days of traffic aggregates kept before pruning.', UTC_TIMESTAMP(6)),
     ('retention.snort_alerts_days', '90', 'int', 'retention', 'Days of Snort alerts kept before pruning.', UTC_TIMESTAMP(6)),
@@ -1044,10 +1097,11 @@ INSERT INTO system_settings (setting_key, setting_value, value_type, category, d
     ('security.audit_hash_chain', 'true', 'bool', 'security', 'Maintain chained SHA-256 integrity hashes over audit records.', UTC_TIMESTAMP(6)),
     ('notifications.enabled', 'true', 'bool', 'notifications', 'Raise in-application notifications for genuine system events.', UTC_TIMESTAMP(6)),
     ('notifications.min_severity', 'MEDIUM', 'str', 'notifications', 'Lowest security severity that raises a notification (INFO/LOW/MEDIUM/HIGH/CRITICAL).', UTC_TIMESTAMP(6)),
+    ('notifications.snort_popups', 'false', 'bool', 'notifications', 'Raise popups and sounds for Snort alerts. Off: AETHRA-SEC detections are the primary alerts and Snort alerts are supporting evidence - still stored, linked to attacks and shown on Attack Statistics and in the Alerts screen''s Snort evidence view. With it on, one port scan raised one popup per probed port (504 in 27 minutes on 15 Oct 2026).', UTC_TIMESTAMP(6)),
     ('assessment.auto_enabled', 'true', 'bool', 'assessment', 'Automatically assess hosts observed on the monitored authorised network. When on, a host the capture pipeline observes on the subnet of the monitored interface, inside AETHRA_AUTHORIZED_NETWORKS, is assessed with real Nmap once and then only after the reassessment interval. When that network cannot be determined, automatic assessment stops and says so. It can be switched off from the Vulnerability Assessment screen.', UTC_TIMESTAMP(6)),
     ('assessment.retry_base_minutes', '5', 'int', 'assessment', 'Minutes before a failed or timed-out assessment is retried. The delay doubles with each consecutive failure and never exceeds the reassessment interval.', UTC_TIMESTAMP(6)),
     ('assessment.scan_timeout_seconds', '1800', 'int', 'assessment', 'Wall-clock limit for one Nmap run. When it passes, Nmap is stopped and the assessment is recorded as TIMEOUT - never as completed.', UTC_TIMESTAMP(6)),
-    ('assessment.max_scope_addresses', '1024', 'int', 'assessment', 'Largest monitored network, in addresses, automatic assessment will accept. A larger network is not a laboratory segment, so automatic assessment reports its scope as unavailable instead of scanning it.', UTC_TIMESTAMP(6)),
+    ('assessment.max_scope_addresses', '1024', 'int', 'assessment', 'Largest monitored network, in addresses, automatic assessment will accept. The default suits a laboratory segment; raise it deliberately for a campus range you are authorised to assess, and expect the queue to take proportionally longer to work through it. A network above this is reported as out of scope rather than scanned, which is a safety control and not a capacity limit.', UTC_TIMESTAMP(6)),
     ('assessment.auto_new_hosts', 'true', 'bool', 'assessment', 'Assess a newly discovered host the first time it is seen, rather than waiting for the reassessment interval.', UTC_TIMESTAMP(6)),
     ('assessment.reassess_hours', '6', 'int', 'assessment', 'Hours before an already-assessed host is due again. A host is not rescanned inside this window however much traffic it sends.', UTC_TIMESTAMP(6)),
     ('assessment.max_concurrent', '2', 'int', 'assessment', 'Nmap assessments that may run at once. A burst of newly discovered hosts becomes a queue rather than a process per host.', UTC_TIMESTAMP(6)),
@@ -1427,8 +1481,15 @@ INSERT INTO schema_migrations (version, name, applied_at) VALUES
     (18, 'no_response_assessment_state', UTC_TIMESTAMP(6)),
     (19, 'supersede_stale_findings', UTC_TIMESTAMP(6)),
     (20, 'identity_provenance', UTC_TIMESTAMP(6)),
-    (21, 'host_hostname_source', UTC_TIMESTAMP(6))
+    (21, 'host_hostname_source', UTC_TIMESTAMP(6)),
+    (22, 'user_date_modified', UTC_TIMESTAMP(6)),
+    (23, 'alert_last_observed', UTC_TIMESTAMP(6)),
+    (24, 'dynamic_severity', UTC_TIMESTAMP(6)),
+    (25, 'actionable_mitigation', UTC_TIMESTAMP(6)),
+    (26, 'peak_not_below_severity', UTC_TIMESTAMP(6)),
+    (27, 'severity_matches_peak_rate', UTC_TIMESTAMP(6)),
+    (28, 'snort_alert_peak_pps', UTC_TIMESTAMP(6))
 ON DUPLICATE KEY UPDATE name = VALUES(name);
 
--- Schema version 21. After applying this file, create the
+-- Schema version 28. After applying this file, create the
 -- first administrator with:  python scripts/create_admin.py

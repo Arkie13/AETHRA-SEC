@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from aethra_sec.ui.screens.about import AboutScreen, HelpScreen
 from aethra_sec.ui.screens.alerts import AlertsScreen
+from aethra_sec.ui.screens.attack_statistics import AttackStatisticsScreen
 from aethra_sec.ui.screens.dashboard import DashboardScreen
 from aethra_sec.ui.screens.health import HealthScreen
 from aethra_sec.ui.screens.hosts import HostsScreen
@@ -16,7 +17,8 @@ from aethra_sec.ui.screens.users import UsersScreen
 from aethra_sec.ui.screens.vulnerabilities import VulnerabilitiesScreen
 
 __all__ = [
-    "AboutScreen", "AlertsScreen", "DashboardScreen", "HealthScreen",
+    "AboutScreen", "AlertsScreen", "AttackStatisticsScreen", "DashboardScreen",
+    "HealthScreen",
     "HelpScreen", "HostsScreen", "LogsScreen",
     "MitigationScreen", "ReportsScreen", "SettingsScreen", "TrafficScreen",
     "UsersScreen", "VulnerabilitiesScreen",

@@ -39,6 +39,55 @@ from aethra_sec.version import APP_VERSION
 LOGGER = get_logger("services.health")
 
 
+def describe_near_miss(entry: dict[str, Any]) -> str:
+    """One line for one near miss, from the measured values only."""
+    rule = str(entry.get("rule", "?"))
+    source = str(entry.get("source", "?"))
+    peak = float(entry.get("peak_rate", 0.0))
+    threshold = float(entry.get("threshold", 0.0))
+    unit = str(entry.get("unit", "packets/second"))
+    share = f" ({peak / threshold:.0%} of trigger)" if threshold > 0 else ""
+    line = (
+        f"{rule} from {source}: peak {peak:,.1f} {unit} vs trigger "
+        f"{threshold:,.1f}{share}"
+    )
+    reason = entry.get("reason")
+    return f"{line} - set aside: {reason}" if reason else f"{line} - below trigger"
+
+
+def near_miss_summary(near_misses: list[dict[str, Any]]) -> str:
+    """A sentence for the capture status, empty when nothing came close.
+
+    Running with zero detections is only a clean result when no traffic
+    approached a rule. When some did, the status says so and names the rules,
+    so an empty Alerts table is never read as "nothing happened".
+    """
+    if not near_misses:
+        return ""
+    rules = sorted({str(entry.get("rule", "?")) for entry in near_misses})
+    return (
+        f" Detection: {len(near_misses)} source/rule pair(s) measured near or "
+        f"above a trigger in the last 15 min with NO detection raised "
+        f"({', '.join(rules)}) - see Runtime > NEAR MISSES."
+    )
+
+
+class _NoEvidence:
+    """Zero counters, for when no visibility provider is wired.
+
+    Produces UNKNOWN from derive(), which is the honest answer: nothing has
+    been measured, so nothing can be concluded.
+    """
+
+    frames = 0
+    peer_frames = 0
+    peer_hosts = 0
+    group_only_hosts = 0
+
+
+_NO_EVIDENCE = _NoEvidence()
+
+
 @dataclass
 class SubsystemProbes:
     """Callables the health service uses to interrogate live subsystems.
@@ -50,6 +99,21 @@ class SubsystemProbes:
     nmap: Callable[[], Any] | None = None
     tshark: Callable[[], Any] | None = None
     capture_status: Callable[[], Any] | None = None
+    #: Returns the rule engine's recent near misses: traffic that approached
+    #: or crossed a detection rule and raised nothing. Lets the capture probe
+    #: say "running, and these attacks were measured but not detected" rather
+    #: than letting zero detections read as a clean result.
+    detection_near_misses: Callable[[], list[dict[str, Any]]] | None = None
+    #: Returns the live PeerVisibilityTracker report, so the capture probe can
+    #: say what the capture point can SEE as well as whether it is running.
+    #: Those are different questions: a healthy capture on an ordinary switched
+    #: port still cannot observe traffic between two other machines.
+    capture_visibility: Callable[[], Any] | None = None
+    #: Returns the resolved interface roles. Supplies the operator's
+    #: DECLARATION that the monitoring interface is wired to a mirror/SPAN
+    #: destination - which is an intention, never evidence, and can never on
+    #: its own make the sensor report transit traffic as observed.
+    interface_roles: Callable[[], Any] | None = None
     snort_status: Callable[[], Any] | None = None
     snort_executable: Callable[[], tuple[bool, str]] | None = None
     correlation_stats: Callable[[], Any] | None = None
@@ -255,12 +319,17 @@ class HealthService:
             )
         stats = self._probes.capture_status()
         if getattr(stats, "is_running", False):
+            visibility = self._capture_visibility()
+            near_misses = self._near_misses()
             return ServiceStatus(
                 name="capture",
                 state=ServiceState.CAPTURING,
                 detail=(
                     f"Capturing on '{stats.interface}' - {stats.total_packets:,} "
-                    f"packet(s), {stats.dropped:,} dropped"
+                    f"packet(s), {stats.dropped:,} dropped. "
+                    f"Visibility: {visibility.state.label}. "
+                    f"Transit traffic: {visibility.transit_text}."
+                    + near_miss_summary(near_misses)
                 ),
                 last_checked=now,
                 last_success=now,
@@ -270,6 +339,17 @@ class HealthService:
                     "dropped": stats.dropped,
                     "queue_depth": stats.queue_depth,
                     "last_packet_at": stats.last_packet_at,
+                    # Visibility is reported separately from capture state on
+                    # purpose: RUNNING says the sensor works, and says nothing
+                    # about how much of the network it can see.
+                    "visibility": visibility.state.value,
+                    "visibility_label": visibility.state.label,
+                    "visibility_detail": visibility.detail,
+                    "transit_observed": visibility.transit_observed,
+                    "peer_frames": visibility.peer_frames,
+                    "peer_hosts": visibility.peer_hosts,
+                    "silent_peers": visibility.silent_peers,
+                    "near_misses": len(near_misses),
                 },
             )
         error = getattr(stats, "last_error", "")
@@ -280,6 +360,47 @@ class HealthService:
             last_checked=now,
             last_error=error,
             metadata={"interface": getattr(stats, "interface", "")},
+        )
+
+    def _near_misses(self) -> list[dict[str, Any]]:
+        """The rule engine's recent near misses, or none when unavailable."""
+        if self._probes.detection_near_misses is None:
+            return []
+        try:
+            return list(self._probes.detection_near_misses() or [])
+        except Exception:  # noqa: BLE001 - a diagnostic must not break the probe
+            LOGGER.debug("Could not read detection near misses.", exc_info=True)
+            return []
+
+    def _capture_visibility(self) -> Any:
+        """Derive what the capture point can see, from captured frames only.
+
+        Returns UNKNOWN rather than guessing when no evidence provider is
+        wired, because "we have not measured it" and "it is local only" are
+        different answers and only one of them is honest here.
+        """
+        from aethra_sec.analytics.capture_visibility import derive
+
+        report = None
+        if self._probes.capture_visibility is not None:
+            try:
+                report = self._probes.capture_visibility()
+            except Exception:  # noqa: BLE001 - visibility must not break health
+                LOGGER.exception("The capture visibility report could not be read.")
+                report = None
+        declared = False
+        if self._probes.interface_roles is not None:
+            try:
+                roles = self._probes.interface_roles()
+                declared = bool(
+                    getattr(roles, "span_declared", False)
+                    and getattr(roles, "has_dedicated_monitoring", False)
+                )
+            except Exception:  # noqa: BLE001 - roles must not break health
+                LOGGER.exception("The interface roles could not be read.")
+        return derive(
+            report if report is not None else _NO_EVIDENCE,
+            monitoring_declared=declared,
         )
 
     def _probe_snort(self) -> ServiceStatus:
@@ -747,6 +868,8 @@ class HealthService:
                 "queue_depth": stats.queue_depth,
                 "last_packet_at": stats.last_packet_at,
             }
+        if self._probes.detection_near_misses is not None:
+            details["near_misses"] = self._near_misses()
         if self._probes.snort_status:
             status = self._probes.snort_status()
             details["snort"] = {

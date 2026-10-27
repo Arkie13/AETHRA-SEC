@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import re
 from pathlib import Path
 
 import pytest
@@ -58,7 +59,9 @@ def _code_only(path: Path) -> str:
 
 def _method(path: Path, name: str) -> str:
     code = _code_only(path)
-    start = code.index(f"def {name}")
+    # The trailing parenthesis matters: without it a lookup for _apply
+    # matches a longer name such as _apply_guide_context.
+    start = code.index(f"def {name}(")
     rest = code[start + 4 :]
     end = rest.index("\n    def ") if "\n    def " in rest else len(rest)
     return code[start : start + 4 + end]
@@ -202,10 +205,13 @@ class TestOneAuthoritativeSet:
         self,
     ) -> None:
         refresh = _method(SCREEN, "refresh")
-        assert "detection_totals(" in refresh
-        assert "alert_filters=counted" in refresh, (
+        # Since 15 Oct 2026 each view counts only the source it lists, over
+        # the same filters as its rows: AETHRA-SEC detections by default,
+        # Snort alerts in the evidence view.
+        assert "aethra_detection_totals(session, counted_anomaly)" in refresh, (
             "the totals are counted over a different predicate from the rows"
         )
+        assert "snort_evidence_totals(session, counted)" in refresh
 
     def test_the_row_limit_is_excluded_from_the_count(self) -> None:
         """Counting with the limit applied is how the bug worked."""
@@ -220,7 +226,12 @@ class TestOneAuthoritativeSet:
 
     def test_the_rows_come_from_the_same_two_lists(self) -> None:
         apply = _method(SCREEN, "_apply")
-        assert "_alert_rows(alerts)" in apply and "_anomaly_rows(anomalies)" in apply
+        # The table must be built from the very lists the summary was counted
+        # over, so each builder's FIRST argument is pinned to that list. A
+        # further argument (the measured pps for the Rate column) is allowed;
+        # building rows from any other list is not.
+        assert re.search(r"_alert_rows\(\s*alerts\s*[,)]", apply)
+        assert re.search(r"_anomaly_rows\(\s*anomalies\s*[,)]", apply)
 
 
 class TestTheDashboardCountsTheSameThing:

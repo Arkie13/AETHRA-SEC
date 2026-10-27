@@ -13,6 +13,7 @@ from typing import Any
 from aethra_sec.core.events import Event, EventType
 from aethra_sec.models.enums import CheckResult
 from aethra_sec.models.system import DiagnosticsReport, ServiceStatus
+from aethra_sec.services.health_service import describe_near_miss
 from aethra_sec.ui.base import Screen
 from aethra_sec.ui.theme import PALETTE, configure_text_widget, state_colour
 from aethra_sec.ui.widgets import (
@@ -220,6 +221,19 @@ class HealthScreen(Screen):
             lines.extend(["", "PACKET CAPTURE", ""])
             for key, value in capture.items():
                 lines.append(f"  {key:<22}: {value}")
+
+        if "near_misses" in details:
+            near_misses = details["near_misses"]
+            lines.extend(["", "NEAR MISSES (measured, no detection raised)", ""])
+            if near_misses:
+                for entry in near_misses:
+                    lines.append(f"  {describe_near_miss(entry)}")
+                lines.append(
+                    "  These are NOT detections. Compare each peak with the "
+                    "rate actually sent before changing any threshold."
+                )
+            else:
+                lines.append("  none in the last 15 minutes")
 
         snort = details.get("snort", {})
         if snort:

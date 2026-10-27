@@ -68,7 +68,10 @@ from aethra_sec.models.scan import Scan, ScanHostResult
 from aethra_sec.security.audit import AuditAction, AuditCategory, AuditService
 from aethra_sec.security.rbac import AccessControl
 from aethra_sec.utils.logging import get_logger
-from aethra_sec.utils.net import unauthorized_addresses
+from aethra_sec.utils.net import (
+    network_within_authorization,
+    unauthorized_addresses,
+)
 from aethra_sec.utils.timeutil import utcnow
 from aethra_sec.utils.validation import ValidationError, validate_target
 
@@ -194,6 +197,32 @@ class NmapService:
                     ),
                 )
             addresses = resolved
+
+        # A network above the cheap-enumeration size carries no address list,
+        # so it is authorised by containment: one comparison per configured
+        # network instead of one per address. The per-address path below still
+        # runs for single addresses, hostnames, ranges and small networks, so
+        # nothing about those changes.
+        if spec.network is not None and not spec.enumerated:
+            if not network_within_authorization(spec.network, self._authorization):
+                allowed = ", ".join(
+                    str(n) for n in self._authorization.parsed_networks
+                )
+                raise AuthorizationBoundaryError(
+                    f"Target network {spec.network} is not contained in an "
+                    f"authorised network.",
+                    user_message=(
+                        "Assessment refused. The network "
+                        f"{spec.network} ({spec.network.num_addresses:,} "
+                        "addresses) is not wholly inside a network this "
+                        f"installation is authorised to assess ({allowed}). "
+                        "Assess a subnet that lies inside the authorised "
+                        "range, or widen AETHRA_AUTHORIZED_NETWORKS in the "
+                        "configuration file only if you are authorised to "
+                        "assess the additional range."
+                    ),
+                )
+            return spec.raw, spec.kind, addresses
 
         outside = unauthorized_addresses(addresses, self._authorization)
         if outside:
@@ -383,11 +412,16 @@ class NmapService:
         return scan_id
 
     def stop_scan(self, session: Session, scan_id: int) -> bool:
-        """Request cancellation of a running scan.
+        """Stop a running scan now.
 
-        Nmap runs as a synchronous child process, so cancellation takes effect
-        when the current invocation returns; the scan is then marked CANCELLED
-        and its partial results are discarded rather than stored as if complete.
+        The runner owns the Nmap process and keeps its handle, so cancelling
+        kills that process immediately rather than waiting for it to finish on
+        its own - which, for a scan stalled on an unresponsive host, could be
+        never. The scan is then marked CANCELLED and its partial results are
+        discarded rather than stored as if the assessment had completed.
+
+        Only this scan's own process is signalled, by handle and not by name,
+        so an Nmap another tool started is never touched.
         """
         live = self._access.require(session, Permission.SCAN_STOP, target=str(scan_id))
         with self._lock:

@@ -19,7 +19,6 @@ from pathlib import Path
 
 from aethra_sec.analytics.anomaly_rules import (
     FLOOD_BAND_HIGH_FLOOR,
-    FLOOD_BAND_LOW_FLOOR,
     FLOOD_BAND_MEDIUM_FLOOR,
     FLOOD_BANDS,
     flood_band,
@@ -38,38 +37,38 @@ class TestTheBandsAreTheManuscripts:
     def test_the_three_bands_are_defined(self) -> None:
         assert [b.label for b in FLOOD_BANDS] == ["HIGH", "MEDIUM", "LOW"]
 
-    def test_low_is_100_to_500(self) -> None:
+    def test_low_is_below_500(self) -> None:
         band = flood_band(Severity.LOW)
         assert band is not None
-        assert (band.min_pps, band.max_pps) == (100, 500)
-        assert band.range_text == "100-500 pps"
+        assert (band.min_pps, band.max_pps) == (0, 499)
+        assert band.range_text == "< 500 pps"
         assert band.description == (
             "Traffic above the normal baseline but of limited volume."
         )
 
-    def test_medium_is_501_to_1000(self) -> None:
+    def test_medium_is_500_to_999(self) -> None:
         band = flood_band(Severity.MEDIUM)
         assert band is not None
-        assert (band.min_pps, band.max_pps) == (501, 1000)
-        assert band.range_text == "501-1,000 pps"
+        assert (band.min_pps, band.max_pps) == (500, 999)
+        assert band.range_text == "500-999 pps"
         assert band.description == (
             "Sustained abnormal traffic consistent with an active flood."
         )
 
-    def test_high_is_above_1000(self) -> None:
+    def test_high_is_1000_and_above(self) -> None:
         band = flood_band(Severity.HIGH)
         assert band is not None
-        assert band.min_pps == 1001
+        assert band.min_pps == 1000, "the HIGH floor is inclusive"
         assert band.max_pps is None, "HIGH is unbounded above"
-        assert band.range_text == "> 1,000 pps"
+        assert band.range_text == "1,000 pps and above"
         assert band.description == (
             "High-volume flooding consistent with a denial-of-service condition."
         )
 
     def test_the_prose_threshold_matches_the_numbers(self) -> None:
-        assert flood_band(Severity.HIGH).threshold_text == "Greater than 1,000 pps"
-        assert flood_band(Severity.MEDIUM).threshold_text == "501 to 1,000 pps"
-        assert flood_band(Severity.LOW).threshold_text == "100 to 500 pps"
+        assert flood_band(Severity.HIGH).threshold_text == "Greater than 999 pps"
+        assert flood_band(Severity.MEDIUM).threshold_text == "500 to 999 pps"
+        assert flood_band(Severity.LOW).threshold_text == "Below 500 pps"
 
     def test_a_review_state_has_no_band(self) -> None:
         """UNREVIEWED is not a traffic rate, so it must not acquire a threshold."""
@@ -86,17 +85,29 @@ class TestTheBandsAreTheManuscripts:
 class TestTheClassifierAndTheLabelsAgree:
     """One definition, so a displayed range cannot drift from the applied one."""
 
-    def test_the_floors_are_unchanged(self) -> None:
-        assert (FLOOD_BAND_LOW_FLOOR, FLOOD_BAND_MEDIUM_FLOOR,
-                FLOOD_BAND_HIGH_FLOOR) == (100.0, 500.0, 1000.0)
+    def test_the_floors_are_the_operative_thresholds(self) -> None:
+        assert (FLOOD_BAND_MEDIUM_FLOOR, FLOOD_BAND_HIGH_FLOOR) == (500.0, 1000.0)
 
-    def test_classification_still_follows_section_3_9_8(self) -> None:
-        """Unchanged by this feature - the boundaries behave as before."""
-        assert flood_severity(100)[0] is Severity.LOW
-        assert flood_severity(500)[0] is Severity.LOW
-        assert flood_severity(500.5)[0] is Severity.MEDIUM
-        assert flood_severity(1000)[0] is Severity.MEDIUM
-        assert flood_severity(1000.5)[0] is Severity.HIGH
+    def test_the_required_boundaries(self) -> None:
+        """The five boundary cases the fix was specified against.
+
+        Both floors are inclusive and belong to the band above them: a
+        measured 500 pps is MEDIUM, not LOW, and a measured 1,000 pps is
+        HIGH, not MEDIUM.
+        """
+        assert flood_severity(499)[0] is Severity.LOW
+        assert flood_severity(500)[0] is Severity.MEDIUM
+        assert flood_severity(750)[0] is Severity.MEDIUM
+        assert flood_severity(999)[0] is Severity.MEDIUM
+        assert flood_severity(1000)[0] is Severity.HIGH
+        assert flood_severity(1001)[0] is Severity.HIGH
+
+    def test_the_boundaries_are_exact_not_approximate(self) -> None:
+        """A hair under a floor stays in the band below it."""
+        assert flood_severity(499.9)[0] is Severity.LOW
+        assert flood_severity(500.0)[0] is Severity.MEDIUM
+        assert flood_severity(999.9)[0] is Severity.MEDIUM
+        assert flood_severity(1000.0)[0] is Severity.HIGH
 
     def test_each_band_description_comes_from_the_shared_definition(self) -> None:
         for rate, band in ((1500, FLOOD_BANDS[0]), (700, FLOOD_BANDS[1]),
@@ -106,26 +117,38 @@ class TestTheClassifierAndTheLabelsAgree:
     def test_the_classifier_does_not_repeat_the_ranges(self) -> None:
         """A second copy of "501-1,000" is how the two drift apart."""
         source = inspect.getsource(flood_severity)
-        for literal in ("> 1,000 pps", "501-1,000 pps", "100-500 pps"):
+        for literal in ("1,000 pps and above", "500-999 pps", "< 500 pps"):
             assert literal not in source, (
                 f"{literal!r} is written out in the classifier as well as in "
                 "FLOOD_BANDS; there must be one definition"
             )
 
-    def test_below_the_low_floor_is_still_reported_and_says_so(self) -> None:
-        """The manuscript defines no band under 100 pps, so none is invented."""
+    def test_a_low_rate_detection_is_inside_the_low_band(self) -> None:
+        """Low is open at the bottom, so a slow flood is simply Low.
+
+        Reachable in normal operation: the HTTP flood threshold is 10
+        requests per second, far under the old 100 pps floor.
+        """
         severity, band = flood_severity(40)
         assert severity is Severity.LOW
-        assert "below" in band, (
-            "a rate under the Low floor must say it was under it, not be "
-            "presented as if it sat inside the band"
+        assert band == flood_band(Severity.LOW).summary()
+        assert "below" not in band.lower(), (
+            "40 pps is inside the Low band now, so its description must not "
+            "say it fell beneath a floor"
         )
 
-    def test_no_band_claims_to_cover_0_to_99(self) -> None:
-        for band in FLOOD_BANDS:
-            assert band.min_pps >= 100, (
-                "a band was extended below the manuscript's 100 pps Low floor"
-            )
+    def test_the_bands_are_contiguous_and_leave_no_gap(self) -> None:
+        """Every rate from 0 upward falls in exactly one band.
+
+        The old bands started Low at 100 pps, so 0-99 belonged to no band at
+        all. Low is now open at the bottom, and this checks the three bands
+        still meet exactly - no gap, no overlap.
+        """
+        low, medium, high = FLOOD_BANDS[2], FLOOD_BANDS[1], FLOOD_BANDS[0]
+        assert low.min_pps == 0, "the lowest band must be open at the bottom"
+        assert low.max_pps + 1 == medium.min_pps, "gap or overlap at Low/Medium"
+        assert medium.max_pps + 1 == high.min_pps, "gap or overlap at Medium/High"
+        assert high.max_pps is None, "the highest band must be open at the top"
 
 
 class TestTheSummaryStripStatesItsThresholds:
@@ -141,7 +164,7 @@ class TestTheSummaryStripStatesItsThresholds:
         assert "flood_band(" in source, (
             "the summary no longer reads the manuscript bands"
         )
-        for literal in ("> 1,000 pps", "501-1,000 pps", "100-500 pps"):
+        for literal in ("1,000 pps and above", "500-999 pps", "< 500 pps"):
             assert literal not in source, (
                 f"{literal!r} is hardcoded in the screen instead of being read "
                 "from FLOOD_BANDS"
@@ -167,8 +190,8 @@ class TestTheSummaryStripStatesItsThresholds:
             and getattr(node.args[0], "value", None) == "unreviewed"
         )
         rendered = ast.unparse(cell)
-        for rate in ("pps", "threshold", "Threshold", "100-500", "501-",
-                     "> 1,000", "flood_band"):
+        for rate in ("pps", "threshold", "Threshold", "< 500", "500-",
+                     "1,000 pps and above", "flood_band"):
             assert rate not in rendered, (
                 f"UNREVIEWED carries {rate!r}; it is a review state, not a "
                 "traffic rate"
@@ -205,7 +228,7 @@ class TestTheTooltipSaysWhatTheManuscriptSays:
 
     def test_the_high_tooltip_is_the_manuscript_wording(self) -> None:
         text = flood_band(Severity.HIGH).explain()
-        assert "Greater than 1,000 pps" in text
+        assert "Greater than 999 pps" in text
         assert "denial-of-service condition" in text
 
     def test_the_tooltip_uses_the_existing_component(self) -> None:
@@ -231,7 +254,8 @@ class TestTheCountsAreUntouched:
         )
         assert mapper, "_summary_cells is gone"
         # The counting path must not have learned about rate bands at all.
-        for literal in ("> 1,000", "501-1,000", "100-500", "pps", "flood_band"):
+        for literal in ("1,000 pps and above", "500-999", "< 500", "pps",
+                        "flood_band"):
             assert literal not in mapper, (
                 "the threshold feature has reached the counting path"
             )

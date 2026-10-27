@@ -27,7 +27,7 @@ from aethra_sec.ui.theme import (
     status_colour,
 )
 from aethra_sec.ui.widgets.cards import ControlBar
-from aethra_sec.ui.widgets.tooltip import attach_tooltip
+from aethra_sec.ui.widgets.tooltip import CellTooltip, attach_tooltip
 
 
 @dataclass(frozen=True)
@@ -124,6 +124,9 @@ class DataTable(ttk.Frame):
         self._actions = list(actions)
         self._empty_text = empty_text
         self._hovered: str = ""
+        #: Per-column hover detail: column key -> provider(row) -> text.
+        self._cell_tip_providers: dict[str, Callable[[dict[str, Any]], str]] = {}
+        self._cell_tip: CellTooltip | None = None
         #: Rows the operator has marked. Held by row id rather than position,
         #: so a mark survives sorting, filtering and later arrivals - the row
         #: keeps its mark wherever it moves to.
@@ -433,6 +436,7 @@ class DataTable(ttk.Frame):
             those make a row's position depend on its content, so there is no
             stable position to patch.
         """
+        self._hide_cell_tip()
         incoming = [dict(row) for row in rows]
         if (
             self._sort_key
@@ -751,6 +755,9 @@ class DataTable(ttk.Frame):
 
     def _render(self) -> None:
         """Redraw the visible rows."""
+        # The record under a hover box may have changed or gone; the next
+        # pointer move rebuilds it from the new row.
+        self._hide_cell_tip()
         selected = set(self.tree.selection())
         for item in self.tree.get_children():
             self.tree.delete(item)
@@ -1008,8 +1015,9 @@ class DataTable(ttk.Frame):
     # Pointer and keyboard interaction
     # ------------------------------------------------------------------
     def _handle_motion(self, event: tk.Event) -> None:
-        """Highlight the row under the pointer."""
+        """Highlight the row under the pointer, and explain the cell if asked."""
         row_id = self.tree.identify_row(event.y)
+        self._update_cell_tip(event, row_id)
         if row_id == self._hovered:
             return
         self._set_hover(self._hovered, False)
@@ -1020,6 +1028,66 @@ class DataTable(ttk.Frame):
         """Clear the hover highlight."""
         self._set_hover(self._hovered, False)
         self._hovered = ""
+        self._hide_cell_tip()
+
+    # ------------------------------------------------------------------
+    # Cell hover details
+    # ------------------------------------------------------------------
+    def set_cell_tooltip(
+        self, column_key: str, provider: Callable[[dict[str, Any]], str]
+    ) -> None:
+        """Explain one column's cells on hover.
+
+        ``provider`` receives the row dict of the cell under the pointer - the
+        same record the cell was drawn from - and returns the text, or "" for
+        nothing. It must not query: it runs on every move onto a new cell.
+        """
+        self._cell_tip_providers[column_key] = provider
+        if self._cell_tip is None:
+            self._cell_tip = CellTooltip(self.tree)
+            # A click, a scroll or a key leaves the cell the box described.
+            for sequence in ("<ButtonPress>", "<MouseWheel>", "<KeyPress>"):
+                self.tree.bind(sequence, self._hide_cell_tip, add="+")
+
+    def cell_column_at(self, x: int) -> str:
+        """The column key at an x position, honouring hidden columns."""
+        column_ref = self.tree.identify_column(x)  # "#1", "#2", ... of displayed
+        try:
+            index = int(column_ref.lstrip("#")) - 1
+        except ValueError:
+            return ""
+        displayed = list(self._visible_keys)
+        if 0 <= index < len(displayed):
+            return displayed[index]
+        return ""
+
+    def cell_tooltip_text(self, row_id: str, column_key: str) -> str:
+        """The hover text for one cell, from the row it was drawn from."""
+        provider = self._cell_tip_providers.get(column_key)
+        row = self._rows.get(row_id)
+        if provider is None or row is None:
+            return ""
+        try:
+            return provider(row) or ""
+        except Exception:  # noqa: BLE001 - a tooltip must never break the table
+            return ""
+
+    def _update_cell_tip(self, event: tk.Event, row_id: str) -> None:
+        tip = getattr(self, "_cell_tip", None)
+        if tip is None:
+            return
+        # Only a data cell, never the heading or the empty space below rows.
+        if not row_id or self.tree.identify_region(event.x, event.y) != "cell":
+            tip.hide()
+            return
+        column_key = self.cell_column_at(event.x)
+        text = self.cell_tooltip_text(row_id, column_key)
+        tip.point_at(row_id, column_key, text, event.x_root, event.y_root)
+
+    def _hide_cell_tip(self, _event: tk.Event | None = None) -> None:
+        tip = getattr(self, "_cell_tip", None)
+        if tip is not None:
+            tip.hide()
 
     def _set_hover(self, row_id: str, hovered: bool) -> None:
         """Add or remove the hover tag without disturbing the other tags."""

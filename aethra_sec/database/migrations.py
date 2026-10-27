@@ -22,6 +22,10 @@ from aethra_sec.database.connection import (
     DatabaseManager,
 )
 from aethra_sec.database.schema import CREATE_TABLE_STATEMENTS, REQUIRED_TABLES
+
+#: The create statements by table name, so a migration can create one
+#: table without re-running the whole schema.
+CREATE_TABLE_STATEMENTS_BY_NAME = dict(CREATE_TABLE_STATEMENTS)
 from aethra_sec.utils.logging import get_logger
 from aethra_sec.utils.timeutil import to_db, utcnow
 
@@ -806,6 +810,316 @@ def _apply_host_hostname_source(db: DatabaseManager) -> None:
         )
 
 
+def _apply_user_date_modified(db: DatabaseManager) -> None:
+    """Record when an administrator last changed an account's identity.
+
+    ``updated_at`` already existed and looks like the right column, but it is
+    not: six paths write it, and three of them are sign-in bookkeeping -
+    ``register_successful_login``, ``register_failed_login`` and the automatic
+    lockout in ``set_locked``. Read against this installation, the ``admin``
+    account's ``updated_at`` was today's sign-in rather than any edit. Showing
+    it as "Date Modified" would move the column every time somebody logged in,
+    which is precisely what it must not do.
+
+    So this is a separate column with a narrower meaning: an administrator
+    changed the account's identity or configuration. It is NULL by default and
+    stays NULL for every existing row. Whether any of those accounts was ever
+    edited, and when, is not recorded anywhere - and back-filling it from
+    ``created_at`` or ``updated_at`` would manufacture an edit history that
+    never existed. A dash is the honest answer.
+    """
+    if not _column_exists(db, "users", "date_modified"):
+        db.execute(
+            "ALTER TABLE users ADD COLUMN date_modified DATETIME(6) NULL "
+            "DEFAULT NULL AFTER updated_at"
+        )
+
+
+
+def _apply_alert_last_observed(db: DatabaseManager) -> None:
+    """Keep the Snort timestamp of the most recent folded occurrence.
+
+    When a repeat alert folded into an existing row, the fold recorded that it
+    had happened - ``duplicate_count`` went up and ``received_at`` moved - but
+    the repeat's own ``alert_time`` was discarded. ``received_at`` is when
+    AETHRA-SEC ingested the line, not when the sensor saw the traffic, so a
+    folded row could say how many times something fired and when it was first
+    seen, and could not say when it last fired. An operator watching a flood
+    could not tell a single event from one that had been recurring for twenty
+    minutes.
+
+    ``last_alert_time`` holds that timestamp. Existing rows keep NULL, which
+    is the truth: the value was never recorded for them, and back-filling it
+    from ``received_at`` or ``alert_time`` would manufacture evidence about
+    when past attacks ended. Those rows report their last-observed time as
+    unknown until they fold again.
+    """
+    if not _column_exists(db, "snort_alerts", "last_alert_time"):
+        db.execute(
+            "ALTER TABLE snort_alerts "
+            "ADD COLUMN last_alert_time DATETIME(6) NULL AFTER dedup_key"
+        )
+        db.execute(
+            "ALTER TABLE snort_alerts "
+            "ADD KEY ix_alerts_last_alert (last_alert_time)"
+        )
+
+    # Outside the column guard on purpose, and idempotent through the
+    # IS NULL predicate: an installation that gained the column from an
+    # earlier partial run still gets the back-fill, and running it twice
+    # changes nothing.
+    if _column_exists(db, "snort_alerts", "last_alert_time"):
+        # One back-fill, and only one: a row that folded nothing was observed
+        # exactly once, so its last observation IS its only observation. That
+        # is a restatement of what the row already says, not an inference
+        # about an attack nobody timed.
+        #
+        # Rows with duplicate_count > 1 are deliberately left NULL. Their
+        # repeats were counted but never timestamped, so the honest answer is
+        # that the last-observed time is unknown. Copying received_at into it
+        # would turn an ingestion time into a detection time and invent the
+        # end of an attack.
+        db.execute(
+            "UPDATE snort_alerts SET last_alert_time = alert_time "
+            "WHERE duplicate_count = 1 AND alert_time IS NOT NULL "
+            "AND last_alert_time IS NULL"
+        )
+
+
+
+def _apply_dynamic_severity(db: DatabaseManager) -> None:
+    """Let an episode's severity follow the attack instead of freezing it.
+
+    ``severity`` was written once, when the anomaly was first inserted, and no
+    code path ever updated it. A flood detected at 500 pps stayed MEDIUM for
+    the life of the record even after the same episode reached four figures -
+    seven stored records on the development database carry a peak of 1,000.2
+    pps and a stored severity of LOW.
+
+    Three columns and one table fix that:
+
+    ``latest_value`` / ``latest_measured_at``
+        The most recent measurement and when it was taken. ``observed_value``
+        is a running maximum, so before this there was nowhere for the latest
+        rate to live and current severity had no input.
+    ``peak_severity``
+        The highest classification the episode reached. It never falls, so a
+        flood that touched HIGH is still reported as having done so after the
+        rate drops back.
+    ``anomaly_severity_transitions``
+        One row per actual change, with the rate and window that justified it.
+
+    Back-fill, and its limits. ``severity`` on existing rows is left exactly
+    as recorded - it is what the detection was raised with, and rewriting it
+    would change historical records by arithmetic. ``peak_severity`` is
+    derived from each row's own stored ``observed_value``, which already is
+    that episode's peak, and only for the four flood rules whose severity
+    comes from a packet rate; for every other rule ``observed_value`` counts
+    ports or hosts, not packets per second, so no rate classification applies
+    and the column stays NULL. ``latest_value`` stays NULL on every existing
+    row: the latest measurement was never recorded and cannot be recovered
+    from a maximum. No transition history is invented for past episodes.
+    """
+    if not _column_exists(db, "traffic_anomalies", "latest_value"):
+        db.execute(
+            "ALTER TABLE traffic_anomalies "
+            "ADD COLUMN latest_value DECIMAL(16,3) NULL AFTER observed_value, "
+            "ADD COLUMN latest_measured_at DATETIME(6) NULL AFTER latest_value, "
+            "ADD COLUMN peak_severity VARCHAR(16) NULL AFTER severity"
+        )
+
+    db.execute(CREATE_TABLE_STATEMENTS_BY_NAME["anomaly_severity_transitions"])
+
+    # Idempotent through IS NULL, and outside the column guard so a partially
+    # applied upgrade still completes.
+    if _column_exists(db, "traffic_anomalies", "peak_severity"):
+        from aethra_sec.analytics.anomaly_rules import FLOOD_RULES
+
+        placeholders = ", ".join(["%s"] * len(FLOOD_RULES))
+        rows = db.query(
+            "SELECT id, observed_value FROM traffic_anomalies "
+            f"WHERE peak_severity IS NULL AND rule_id IN ({placeholders}) "
+            "AND observed_value IS NOT NULL",
+            tuple(sorted(FLOOD_RULES)),
+        )
+        if rows:
+            from aethra_sec.analytics.anomaly_rules import flood_severity
+
+            for row in rows:
+                severity, _band = flood_severity(float(row["observed_value"]))
+                db.execute(
+                    "UPDATE traffic_anomalies SET peak_severity = %s "
+                    "WHERE id = %s AND peak_severity IS NULL",
+                    (str(severity), int(row["id"])),
+                )
+            LOGGER.info(
+                "Derived peak severity for %d flood detection(s) from the "
+                "peak rate each already stored.", len(rows)
+            )
+
+
+
+def _apply_actionable_mitigation(db: DatabaseManager) -> None:
+    """Give a recommendation somewhere to put the actual procedure.
+
+    The table held five prose fields - explanation, why_it_matters,
+    immediate_action, long_term_action, verification_steps - and the stored
+    guidance averaged a couple of hundred characters each. That is strategy
+    ("close or firewall ports that have no business requirement"), not a
+    procedure an operator can follow: it says nothing about which firewall,
+    which rule, what to type, how to confirm the rule is live, or how to undo
+    it when it breaks something.
+
+    Four nullable columns, so every existing row and id survives untouched and
+    an installation that has customised its recommendations keeps them:
+
+    ``enforcement_point``
+        Host firewall, network edge, or web layer. An endpoint rule and a
+        gateway rule are not interchangeable and the distinction decides
+        whether the advice can work at all.
+    ``procedure_steps``
+        The ordered steps, one per line.
+    ``rollback_steps``
+        How to remove exactly the rule the procedure created.
+    ``operational_warnings``
+        What the change may legitimately break.
+
+    Nothing is written into them here. The content is seeded separately, so a
+    failed content update cannot leave the schema half-applied.
+    """
+    columns = {
+        "enforcement_point": "TEXT NULL",
+        "procedure_steps": "TEXT NULL",
+        "rollback_steps": "TEXT NULL",
+        "operational_warnings": "TEXT NULL",
+    }
+    missing = {
+        name: ddl for name, ddl in columns.items()
+        if not _column_exists(db, "mitigation_recommendations", name)
+    }
+    if not missing:
+        return
+    clauses = ", ".join(f"ADD COLUMN {name} {ddl}" for name, ddl in missing.items())
+    db.execute(f"ALTER TABLE mitigation_recommendations {clauses}")
+    LOGGER.info(
+        "Added %d actionable-mitigation column(s): %s",
+        len(missing), ", ".join(sorted(missing)),
+    )
+
+
+def _apply_peak_not_below_severity(db: "DatabaseManager") -> None:
+    """Raise a peak that sits below the severity it is supposed to cap.
+
+    ``peak_severity`` is the worst classification an episode has reached, so
+    it can never rank below ``severity``. 140 rows violated that when this
+    was written, because migration 24 derived the peak from
+    ``observed_value`` under the current rate bands while the stored severity
+    had been assigned under an earlier scheme with different thresholds.
+
+    Only the peak is raised. ``severity`` is left untouched: the measurement
+    history that would be needed to recompute it was never stored for those
+    rows, and inventing one would be worse than leaving an honest record of
+    what the system concluded at the time.
+    """
+    ladder = "'INFO','LOW','MEDIUM','HIGH','CRITICAL'"
+    affected = db.query_value(
+        "SELECT COUNT(*) FROM traffic_anomalies WHERE peak_severity IS NOT NULL "
+        f"AND FIELD(peak_severity, {ladder}) < FIELD(severity, {ladder})"
+    )
+    if not affected:
+        LOGGER.info("Every stored peak already caps its severity; nothing to do.")
+        return
+    db.execute(
+        "UPDATE traffic_anomalies SET peak_severity = severity "
+        "WHERE peak_severity IS NOT NULL "
+        f"AND FIELD(peak_severity, {ladder}) < FIELD(severity, {ladder})"
+    )
+    LOGGER.info(
+        "Raised peak_severity to the stored severity on %s row(s) where the "
+        "peak ranked below it. No severity value was changed.", affected,
+    )
+
+
+def _apply_snort_alert_peak_pps(db: "DatabaseManager") -> None:
+    """Record the pps a Snort alert's source was measured sending.
+
+    New Snort alerts are graded on the same §3.9.8 pps legend as the flood
+    rules, from the live capture rate of their source. ``peak_pps`` keeps that
+    figure, so the Rate column shows the very number the severity was graded
+    on.
+
+    Existing rows keep NULL, which is the truth: no capture rate was recorded
+    for them, and they keep the severity Snort's priority gave them. Nothing
+    is back-filled or regraded - the researchers chose pps grading for new
+    detections only.
+    """
+    if not _column_exists(db, "snort_alerts", "peak_pps"):
+        db.execute(
+            "ALTER TABLE snort_alerts "
+            "ADD COLUMN peak_pps DECIMAL(14,1) NULL AFTER last_alert_time"
+        )
+
+
+def _apply_severity_matches_peak_rate(db: "DatabaseManager") -> None:
+    """Raise a flood episode's severity to the band its peak rate implies.
+
+    ``update_anomaly_occurrence`` used to replace ``severity`` with every new
+    measurement, so an episode that reached 1,733 pps reported LOW once the
+    rate tailed off below 500 - and that column drives the IDS badge, the
+    severity counters, the filter, exports, the dashboard and notification
+    eligibility. The statement no longer lowers severity, but rows written
+    before that change still carry the lowered value.
+
+    The replacement value is derived from ``observed_value``, the peak rate
+    this episode actually recorded, using the same floors the detection rules
+    classify with. Severity is only ever raised.
+
+    Rows whose peak rate was never stored are left exactly as they are: there
+    is nothing to recompute them from, and a guess would be worse than an
+    honest record of what the system concluded at the time.
+    """
+    from aethra_sec.analytics.anomaly_rules import (
+        FLOOD_BAND_HIGH_FLOOR,
+        FLOOD_BAND_MEDIUM_FLOOR,
+        FLOOD_RULES,
+    )
+
+    ladder = "'INFO','LOW','MEDIUM','HIGH','CRITICAL'"
+    rules = tuple(sorted(FLOOD_RULES))
+    placeholders = ", ".join(["%s"] * len(rules))
+    # The band its own recorded peak rate falls into.
+    band = (
+        "CASE WHEN observed_value >= %s THEN 'HIGH' "
+        "WHEN observed_value >= %s THEN 'MEDIUM' ELSE 'LOW' END"
+    )
+    floors = (FLOOD_BAND_HIGH_FLOOR, FLOOD_BAND_MEDIUM_FLOOR)
+    where = (
+        f"rule_id IN ({placeholders}) AND observed_value IS NOT NULL "
+        f"AND observed_value > 0 "
+        f"AND FIELD({band}, {ladder}) > FIELD(severity, {ladder})"
+    )
+
+    affected = db.query_value(
+        f"SELECT COUNT(*) FROM traffic_anomalies WHERE {where}",
+        (*rules, *floors),
+    )
+    if not affected:
+        LOGGER.info(
+            "Every flood episode's severity already matches its recorded "
+            "peak rate; nothing to do."
+        )
+        return
+    db.execute(
+        f"UPDATE traffic_anomalies SET severity = {band} WHERE {where}",
+        (*floors, *rules, *floors),
+    )
+    LOGGER.info(
+        "Raised the stored severity on %s flood episode(s) to the band their "
+        "recorded peak rate classifies into. No rate, peak, review state or "
+        "timestamp was changed.", affected,
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial_schema", _apply_initial_schema),
     Migration(2, "password_recovery_requests", _apply_password_recovery),
@@ -830,6 +1144,13 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(19, "supersede_stale_findings", _apply_supersede_stale_findings),
     Migration(20, "identity_provenance", _apply_identity_provenance),
     Migration(21, "host_hostname_source", _apply_host_hostname_source),
+    Migration(22, "user_date_modified", _apply_user_date_modified),
+    Migration(23, "alert_last_observed", _apply_alert_last_observed),
+    Migration(24, "dynamic_severity", _apply_dynamic_severity),
+    Migration(25, "actionable_mitigation", _apply_actionable_mitigation),
+    Migration(26, "peak_not_below_severity", _apply_peak_not_below_severity),
+    Migration(27, "severity_matches_peak_rate", _apply_severity_matches_peak_rate),
+    Migration(28, "snort_alert_peak_pps", _apply_snort_alert_peak_pps),
 )
 
 LATEST_VERSION: int = max(m.version for m in MIGRATIONS)

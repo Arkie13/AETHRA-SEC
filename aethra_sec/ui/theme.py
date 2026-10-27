@@ -486,6 +486,7 @@ ICONS: dict[str, str] = {
     "hosts": "▣",          # square with fill
     "alerts": "⚠",         # warning sign
     "mitigation": "⚕",     # staff of Aesculapius - remedy
+    "attack_statistics": "▥",  # square with vertical fill - a bar chart
     "reports": "☰",        # trigram - stacked lines
     "evaluation": "⏱",     # stopwatch - measured detection time
     "logs": "≡",           # identical to - log lines

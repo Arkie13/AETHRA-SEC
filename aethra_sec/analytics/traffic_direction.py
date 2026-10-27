@@ -45,6 +45,7 @@ from enum import Enum
 from typing import Any, Callable
 
 from aethra_sec.utils.logging import get_logger
+from aethra_sec.utils.net import adapter_tables
 
 LOGGER = get_logger("analytics.direction")
 
@@ -219,9 +220,10 @@ def os_interfaces() -> dict[str, OsInterface]:
         import psutil
     except ImportError:  # pragma: no cover - psutil is a declared dependency
         return {}
-    try:
-        table = psutil.net_if_addrs()
-    except Exception:  # noqa: BLE001 - never break capture over this
+    # Through the shared cache: the enumeration does not release the GIL, and
+    # this runs on the capture path. See ADAPTER_CACHE_SECONDS.
+    table, _stats = adapter_tables()
+    if not table:
         return {}
 
     link_family = getattr(psutil, "AF_LINK", None)

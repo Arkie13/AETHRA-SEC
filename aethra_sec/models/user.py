@@ -45,6 +45,11 @@ class User:
     must_change_password: bool = False
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    #: When an administrator last edited this account's identity or
+    #: configuration. None means it has not been edited since it was created;
+    #: the Users table shows that as a dash rather than repeating the created
+    #: date, which would claim an edit that never happened.
+    date_modified: datetime | None = None
     created_by: int | None = None
     permissions: PermissionSet = field(
         default_factory=lambda: PermissionSet(frozenset())

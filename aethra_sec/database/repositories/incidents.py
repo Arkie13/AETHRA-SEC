@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from aethra_sec.database.repositories.base import (
@@ -296,6 +296,76 @@ class IncidentRepository(Repository):
             f"{_SELECT} WHERE i.correlation_key = %s {status_clause}"
             "AND i.last_seen >= %s ORDER BY i.last_seen DESC LIMIT 1",
             (correlation_key[:190], to_db(since)),
+        )
+        return self._map(row) if row else None
+
+    def find_open_episode(
+        self,
+        correlation_key: str,
+        at: datetime,
+        gap_seconds: int,
+        *,
+        exclude_anomaly: tuple[str, str, str | None] | None = None,
+        exclude_alert_dedup: str | None = None,
+        include_resolved: bool = False,
+    ) -> Incident | None:
+        """The attack this flood evidence belongs to, decided by activity.
+
+        An incident under ``correlation_key`` matches only if evidence already
+        linked to it was ACTIVE within ``gap_seconds`` of ``at``: a linked
+        detection whose first..last observation span reaches ``at``, or a
+        linked Snort alert last seen inside the gap. Both are read live, so a
+        flood that is still running keeps its attack open and a finished one
+        does not capture the next run.
+
+        ``exclude_anomaly`` (rule, source, destination) and
+        ``exclude_alert_dedup`` skip incidents that already hold a record from
+        the same detector stream: two detections from one stream are two
+        episodes by the detector's own boundary, so they are two attacks.
+
+        The flat ``correlation.window_seconds`` (300 s) used for this before
+        grouped back-to-back test runs of one attack type into one result.
+        """
+        lower = to_db(at - timedelta(seconds=gap_seconds))
+        upper = to_db(at + timedelta(seconds=gap_seconds))
+        status_clause = (
+            "" if include_resolved
+            else "AND i.status IN ('NEW','INVESTIGATING','ACKNOWLEDGED') "
+        )
+        clauses = [
+            "(EXISTS (SELECT 1 FROM traffic_anomalies a WHERE a.incident_id = i.id "
+            "AND a.last_seen >= %s AND a.first_seen <= %s) "
+            "OR EXISTS (SELECT 1 FROM snort_alerts s WHERE s.incident_id = i.id "
+            "AND COALESCE(s.last_alert_time, s.alert_time, s.received_at) >= %s "
+            "AND COALESCE(s.alert_time, s.received_at) <= %s))"
+        ]
+        params: list[Any] = [correlation_key[:190], lower, upper, lower, upper]
+        if exclude_anomaly is not None:
+            rule_id, src_ip, dst_ip = exclude_anomaly
+            if dst_ip is None:
+                # Source-level streams (a port scan is one episode per source).
+                clauses.append(
+                    "NOT EXISTS (SELECT 1 FROM traffic_anomalies x WHERE "
+                    "x.incident_id = i.id AND x.rule_id = %s AND x.src_ip = %s)"
+                )
+                params += [rule_id, src_ip]
+            else:
+                clauses.append(
+                    "NOT EXISTS (SELECT 1 FROM traffic_anomalies x WHERE "
+                    "x.incident_id = i.id AND x.rule_id = %s AND x.src_ip = %s "
+                    "AND x.dst_ip = %s)"
+                )
+                params += [rule_id, src_ip, dst_ip]
+        if exclude_alert_dedup:
+            clauses.append(
+                "NOT EXISTS (SELECT 1 FROM snort_alerts y WHERE "
+                "y.incident_id = i.id AND y.dedup_key = %s)"
+            )
+            params.append(exclude_alert_dedup[:190])
+        row = self.db.query_one(
+            f"{_SELECT} WHERE i.correlation_key = %s {status_clause}"
+            f"AND {' AND '.join(clauses)} ORDER BY i.last_seen DESC LIMIT 1",
+            tuple(params),
         )
         return self._map(row) if row else None
 

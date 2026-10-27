@@ -95,7 +95,7 @@ ROLLOVER_GUARD_MS = 1_000
 #: read as "the backlog cleared overnight".
 PERIOD_KPIS: dict[str, str] = {
     "packets": "Packets",
-    "alerts": "Detections",
+    "alerts": "AETHRA-SEC detections",
     "findings_new": "Findings discovered",
     "hosts_seen": "Hosts observed",
 }
@@ -560,7 +560,7 @@ class DashboardScreen(Screen):
                 "stored traffic aggregates. Click to open Live Monitoring.",
             ),
             (
-                "alerts", "Detections", PALETTE.high, "alerts",
+                "alerts", "AETHRA-SEC detections", PALETTE.high, "alerts",
                 "Detections raised inside the reporting period, from both "
                 "engines - Snort alerts and AETHRA-SEC's own traffic rules. "
                 "The severity split beneath is the same query grouped, so it "
@@ -893,10 +893,24 @@ class DashboardScreen(Screen):
         self._update_indicators()
         self._update_charts(snapshot, overview)
         self._update_lists(snapshot)
+        # A figure whose query failed holds its default of zero, which on a
+        # security console would otherwise read as a quiet network. Say so
+        # instead: an unobserved zero must never pass for an observation.
+        if snapshot.unreadable:
+            count = len(snapshot.unreadable)
+            note = (
+                f" - {count} figure(s) could not be read and are shown as "
+                f"zero: {', '.join(snapshot.unreadable[:4])}"
+                + (" and others" if count > 4 else "")
+                + ". These are not measurements; see the Logs screen."
+            )
+        elif not snapshot.has_any_data:
+            note = " - no security records yet."
+        else:
+            note = ""
         self.status(
             f"Dashboard updated {format_local(snapshot.generated_at, '%H:%M:%S')}"
-            f" · {snapshot.period_detail}"
-            + ("" if snapshot.has_any_data else " - no security records yet.")
+            f" · {snapshot.period_detail}" + note
         )
 
     def _update_assessment_stats(self, snapshot: DashboardSnapshot) -> None:
@@ -981,7 +995,10 @@ class DashboardScreen(Screen):
                 f"{snapshot.medium_alerts} medium · {period.lower()}"
                 if snapshot.detections_in_period
                 else f"No detections · {period.lower()}"
-            ),
+            )
+            # Snort alerts are evidence, counted on their own and never added
+            # to the detection figure above.
+            + f" · Snort alerts {format_count(snapshot.snort_alerts_in_period)}",
             accent=PALETTE.high if snapshot.high_alerts else PALETTE.medium,
         )
         self._stat_cards["findings_new"].update_value(

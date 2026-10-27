@@ -171,7 +171,6 @@ class LoginWindow(tk.Toplevel):
         for key, label in (
             ("database", "Database"),
             ("schema", "Schema"),
-            ("smtp", "Email alerts"),
         ):
             row = ttk.Frame(self._subsystem_frame, style="AuthBrand.TFrame")
             row.pack(anchor="w", fill="x", pady=3)
@@ -403,15 +402,6 @@ class LoginWindow(tk.Toplevel):
             self._set_subsystem(
                 "schema", report.schema_detail or "not verified", PALETTE.critical
             )
-
-        # Email is a notification channel, never a sign-in step. Saying so
-        # here keeps an operator from reading "not configured" as a reason
-        # they cannot get in: they can, with a username and a password.
-        smtp = self.context.settings.smtp
-        self._set_subsystem(
-            "smtp", smtp.status_text(),
-            PALETTE.ok if smtp.is_configured else PALETTE.text_dim,
-        )
 
         blockers: list[str] = []
         if not (report.database_connected and report.schema_ok):

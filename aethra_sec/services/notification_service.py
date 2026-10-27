@@ -9,11 +9,11 @@ if no event happened, the notification list stays empty.
 from __future__ import annotations
 
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from aethra_sec.core.event_bus import EventBus
-from aethra_sec.core.events import Event, EventType
+from aethra_sec.core.events import Event, EventType, NotificationPayload
 from aethra_sec.core.session import Session
 from aethra_sec.database.repositories.settings import (
     _REFERENCE_MARKER,
@@ -31,6 +31,39 @@ LOGGER = get_logger("services.notifications")
 
 #: ``reference_type`` for alerts a security service raises directly.
 SECURITY_ALERT_REFERENCE = "security_alert"
+
+#: ``reference_type`` for a detection raised by AETHRA-SEC's own rules, kept
+#: distinct from "alert" (which is Snort's) so the two engines stay countable
+#: apart in the notification history.
+ANOMALY_REFERENCE = "anomaly"
+
+
+#: How a detection severity becomes a notification level.
+#:
+#: These are two different vocabularies and the mapping between them used to
+#: be lossy: everything below HIGH became INFO, so a MEDIUM detection could
+#: never satisfy a ``sound_min_level`` of WARNING and a real attack at 500-999
+#: pps popped up silently. The audio service ranks levels
+#: INFO < SUCCESS < WARNING < ERROR < CRITICAL, so mapping each severity to a
+#: distinct level is what makes the setting configurable: WARNING sounds for
+#: MEDIUM and above, ERROR for HIGH and above.
+SEVERITY_LEVELS: dict[str, NotificationLevel] = {
+    "CRITICAL": NotificationLevel.CRITICAL,
+    "HIGH": NotificationLevel.ERROR,
+    "MEDIUM": NotificationLevel.WARNING,
+    "LOW": NotificationLevel.INFO,
+    "INFO": NotificationLevel.INFO,
+}
+
+
+def level_for_severity(severity: Any) -> NotificationLevel:
+    """The notification level that matches this detection severity.
+
+    An unrecognised severity returns WARNING rather than INFO: failing
+    towards audible is the safer direction for a security detection, and it
+    is logged by the caller that produced the odd value.
+    """
+    return SEVERITY_LEVELS.get(str(severity).upper(), NotificationLevel.WARNING)
 
 
 class NotificationService:
@@ -50,11 +83,18 @@ class NotificationService:
         self._bus = event_bus
         self._lock = threading.Lock()
         self._raised = 0
+        #: Snort alerts that raised no popup because of the evidence-only policy.
+        self.snort_evidence_only = 0
         self._subscription = event_bus.subscribe(
             (
                 EventType.NOTIFICATION_RAISED,
                 EventType.REPORT_GENERATED,
                 EventType.SNORT_ALERT_RECEIVED,
+                # Detections from AETHRA-SEC's own rules. Absent here, the
+                # handler below was unreachable for them: the service was
+                # never delivered the event, so a port scan, host sweep or
+                # flood produced an alerts-table row and no notification.
+                EventType.TRAFFIC_ANOMALY_DETECTED,
                 EventType.NMAP_SCAN_COMPLETED,
                 EventType.NMAP_SCAN_FAILED,
                 EventType.CAPTURE_STOPPED,
@@ -89,6 +129,7 @@ class NotificationService:
                 EventType.NOTIFICATION_RAISED: self._from_payload,
                 EventType.REPORT_GENERATED: self._from_payload,
                 EventType.SNORT_ALERT_RECEIVED: self._from_alert,
+                EventType.TRAFFIC_ANOMALY_DETECTED: self._from_anomaly,
                 EventType.NMAP_SCAN_COMPLETED: self._from_scan_completed,
                 EventType.NMAP_SCAN_FAILED: self._from_scan_failed,
                 EventType.CAPTURE_STOPPED: self._from_capture_stopped,
@@ -118,33 +159,178 @@ class NotificationService:
         )
 
     def _from_alert(self, payload: Any) -> None:
-        """Notify on a new Snort alert at or above the configured severity."""
+        """Notify on a new Snort alert at or above the configured severity.
+
+        Only when ``notifications.snort_popups`` is on (off by default). The
+        primary alerts are AETHRA-SEC's own detections; a Snort alert is
+        supporting evidence and does not raise a popup or sound of its own.
+        It is still stored, correlated into its attack, and counted on Attack
+        Statistics. Measured before this: 504 Snort notifications - each a
+        popup - in 27 minutes of one test session, against 6 for AETHRA-SEC.
+        """
         alert = getattr(payload, "alert", None)
         if alert is None:
+            return
+        if not self._settings.get_bool("notifications.snort_popups", False):
+            with self._lock:
+                self.snort_evidence_only += 1
+            LOGGER.debug(
+                "[NOTIFY] Snort alert %s recorded as supporting evidence; Snort "
+                "alerts raise no popup (notifications.snort_popups is off).",
+                alert.id,
+            )
             return
         minimum = Severity.parse(
             self._settings.get_str("notifications.min_severity", "MEDIUM"),
             Severity.MEDIUM,
         )
         if not alert.severity.at_least(minimum):
+            LOGGER.debug(
+                "[NOTIFY] Snort alert %s is %s, below the minimum %s; no "
+                "notification raised.", alert.id, alert.severity, minimum,
+            )
             return
-        # No CRITICAL branch: a detection cannot reach that severity, so
-        # the mapping starts at HIGH. HIGH keeps the level it always had.
-        level = (
-            NotificationLevel.WARNING
-            if alert.severity is Severity.HIGH
-            else NotificationLevel.INFO
+        # Keyed on the alert AND its severity, the same rule detections use:
+        # a Snort alert first graded at the start of a flood and upgraded as
+        # the measured rate rose announces again at the higher severity, but
+        # never twice at the same one.
+        reference = f"{alert.id}:{alert.severity}"
+        since = utcnow() - timedelta(seconds=self.ANOMALY_DEDUP_SECONDS)
+        if alert.id is not None and self._reference_exists("alert", reference, since):
+            LOGGER.debug(
+                "[NOTIFY] Snort alert %s already announced at %s.",
+                alert.id, alert.severity,
+            )
+            return
+        level = level_for_severity(alert.severity)
+        LOGGER.info(
+            "[NOTIFY] Snort alert %s (%s) is eligible at minimum %s; raising "
+            "a %s notification.", alert.id, alert.severity, minimum, level,
         )
         self._store(
             Notification(
                 level=level,
                 title=f"{alert.severity} IDS alert",
-                message=alert.summary[:512],
+                message=f"{alert.summary}{_REFERENCE_MARKER}{reference}"[:512],
                 category="alert",
                 reference_type="alert",
                 reference_id=alert.id,
+                severity=str(alert.severity),
             )
         )
+
+    #: How long one detection's notification stands for its own severity.
+    #: Matched to the detection suppression window, which is already the
+    #: period inside which a repeat observation folds into the existing
+    #: episode rather than becoming a new detection - so inside it there is
+    #: nothing new to announce.
+    ANOMALY_DEDUP_SECONDS = 120
+
+    def _from_anomaly(self, payload: Any) -> None:
+        """Notify on a detection raised by AETHRA-SEC's own rules.
+
+        These never reached this service at all: the handler map routed
+        ``SNORT_ALERT_RECEIVED`` and not ``TRAFFIC_ANOMALY_DETECTED``, so a
+        port scan, a host sweep or a flood produced an alerts-table row and
+        nothing else. On an installation where most detections come from
+        AETHRA-SEC's own rules - which is the normal case when Snort is not
+        the primary sensor - that is every notification the operator never
+        got.
+
+        Eligibility is the same test the Snort path applies, by severity
+        RANK rather than by string, so MEDIUM and HIGH are compared on the
+        order the model defines and not alphabetically.
+
+        The correlation key carries the severity as well as the detection id.
+        That is what lets an escalation through: a flood already announced at
+        MEDIUM announces again when it reaches HIGH, because the key changed,
+        while a repeat at the same severity inside the window does not. The
+        capture service only republishes this event on a genuine escalation,
+        so this is a second guard rather than the only one.
+        """
+        anomaly = getattr(payload, "anomaly", None)
+        if anomaly is None:
+            return
+        anomaly_id = getattr(anomaly, "id", None)
+        if anomaly_id is None:
+            # Not persisted, so there is nothing for the operator to open.
+            LOGGER.debug("Detection without an id raised no notification.")
+            return
+
+        severity = getattr(anomaly, "severity", None)
+        if not isinstance(severity, Severity):
+            LOGGER.warning(
+                "Detection %s carried no usable severity (%r); no "
+                "notification was raised.", anomaly_id, severity,
+            )
+            return
+
+        minimum = Severity.parse(
+            self._settings.get_str("notifications.min_severity", "MEDIUM"),
+            Severity.MEDIUM,
+        )
+        if not severity.at_least(minimum):
+            LOGGER.debug(
+                "Detection %s is %s, below the configured minimum of %s; "
+                "no notification raised.", anomaly_id, severity, minimum,
+            )
+            return
+
+        reference = f"{anomaly_id}:{severity}"
+        since = utcnow() - timedelta(seconds=self.ANOMALY_DEDUP_SECONDS)
+        if self._reference_exists(ANOMALY_REFERENCE, reference, since):
+            LOGGER.debug(
+                "Detection %s already announced at %s inside the window.",
+                anomaly_id, severity,
+            )
+            return
+
+        # The same mapping the Snort path uses, so one severity means one
+        # level across both engines.
+        level = level_for_severity(severity)
+        rule = str(getattr(anomaly, "rule_id", "") or "detection")
+        title = str(getattr(anomaly, "title", "") or rule)
+        source = str(getattr(anomaly, "src_ip", "") or "")
+        destination = str(getattr(anomaly, "dst_ip", "") or "")
+        where = source or "source not recorded"
+        if destination:
+            where = f"{where} -> {destination}"
+        message = f"{rule} · {where} · {title}"
+
+        LOGGER.info(
+            "[NOTIFY] Detection %s (%s, %s) is eligible at minimum %s; "
+            "raising a %s notification.",
+            anomaly_id, rule, severity, minimum, level,
+        )
+        self._store(
+            Notification(
+                level=level,
+                title=f"{severity} detection",
+                message=f"{message}{_REFERENCE_MARKER}{reference}"[:512],
+                category="alert",
+                reference_type=ANOMALY_REFERENCE,
+                reference_id=anomaly_id,
+                severity=str(severity),
+            )
+        )
+
+    def _reference_exists(
+        self, reference_type: str, reference: str, since: datetime
+    ) -> bool:
+        """True when a notification with this key already stands.
+
+        A database failure reports True, so a broken lookup cannot turn into
+        a flood of duplicate notifications during an attack.
+        """
+        try:
+            return self._repository.exists_since(
+                reference_type, reference, since
+            )
+        except Exception:  # noqa: BLE001
+            LOGGER.debug(
+                "Could not check for an existing notification.", exc_info=True
+            )
+            return True
 
     def _from_scan_completed(self, payload: Any) -> None:
         """Notify that an assessment finished, with its real counts."""
@@ -294,9 +480,23 @@ class NotificationService:
             return True
 
     def _store(self, notification: Notification) -> None:
-        """Persist a notification and trim the retained list."""
+        """Persist a notification, then announce that it exists.
+
+        The announcement is the point. Storing a row is what makes the badge
+        count rise, but nothing was ever published afterwards, so the interface
+        never learned that a notification had appeared and the alert sound -
+        which is driven by that event - never played. 101 real alert
+        notifications were sitting in this installation's database, including
+        SYN floods from the operator's own testing, every one of them silent.
+
+        It is published *after* a successful insert and carries the real row
+        id, so three things follow for free: a notification that failed to
+        persist cannot sound, the sound and the badge are driven by the same
+        record rather than by two guesses at it, and the audio service has an
+        immutable identifier to fold repeats against.
+        """
         try:
-            self._repository.create(notification)
+            notification_id = self._repository.create(notification)
             with self._lock:
                 self._raised += 1
             keep = self._settings.get_int("notifications.max_retained", 500)
@@ -304,6 +504,33 @@ class NotificationService:
                 self._repository.prune_excess(keep)
         except Exception:  # noqa: BLE001
             LOGGER.debug("Could not store a notification.", exc_info=True)
+            return
+
+        LOGGER.info(
+            "[NOTIFY] Stored: id=%s level=%s category=%s ref=%s:%s",
+            notification_id,
+            notification.level,
+            notification.category,
+            notification.reference_type or "-",
+            notification.reference_id if notification.reference_id else "-",
+        )
+        try:
+            self._bus.publish(
+                EventType.NOTIFICATION_STORED,
+                NotificationPayload(
+                    title=notification.title,
+                    message=notification.message,
+                    level=notification.level,
+                    category=notification.category,
+                    reference_type=notification.reference_type,
+                    reference_id=notification.reference_id,
+                    notification_id=notification_id,
+                    severity=notification.severity,
+                ),
+            )
+        except Exception:  # noqa: BLE001 - a failed announcement must not
+            # undo a stored notification, nor break the producer's work.
+            LOGGER.exception("Could not announce notification %s", notification_id)
 
     # ------------------------------------------------------------------
     # Reads

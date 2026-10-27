@@ -317,17 +317,36 @@ class TestOnlyManuscriptSupportedSeverities:
         defined = [s for s in SeveritySource if s.is_manuscript_defined]
         assert defined == [SeveritySource.MANUSCRIPT_FLOOD_BAND]
 
-    def test_the_flood_bands_match_section_3_9_8(self) -> None:
+    def test_the_flood_bands_diverge_from_section_3_9_8_deliberately(self) -> None:
+        """The operative bands are NOT §3.9.8 as written, and that is intended.
+
+        §3.9.8 of manuscript revision 9 reads "Low 100-500, Medium 501-1,000,
+        High above 1,000". The application now classifies a measured 500 pps
+        as MEDIUM, a measured 1,000 pps as HIGH, and has no lower floor on
+        Low. This test pins the three points of divergence so they stay
+        deliberate: if §3.9.8 is later rewritten to match the application,
+        this test is the place that records it was the manuscript that moved.
+        """
         from aethra_sec.analytics.anomaly_rules import flood_severity
 
-        assert flood_severity(100)[0] is Severity.LOW
-        assert flood_severity(500)[0] is Severity.LOW
-        assert flood_severity(500.5)[0] is Severity.MEDIUM
-        assert flood_severity(1000)[0] is Severity.MEDIUM
-        assert flood_severity(1000.5)[0] is Severity.HIGH
-        # Below the Low floor is still reported, and says so.
+        # Divergence 1: the Medium floor is inclusive, so 500 is MEDIUM.
+        assert flood_severity(499)[0] is Severity.LOW
+        assert flood_severity(500)[0] is Severity.MEDIUM
+
+        # Divergence 2: the High floor is inclusive, so 1,000 is HIGH.
+        assert flood_severity(999)[0] is Severity.MEDIUM
+        assert flood_severity(1000)[0] is Severity.HIGH
+
+        # Divergence 3: Low is open at the bottom, so a detection under the
+        # old 100 pps floor is simply Low and no longer says it fell beneath
+        # a band. The HTTP flood threshold of 10 req/s reaches this.
         severity, band = flood_severity(40)
-        assert severity is Severity.LOW and "below" in band
+        assert severity is Severity.LOW
+        assert "below" not in band.lower()
+
+        # Unchanged from §3.9.8.
+        assert flood_severity(750)[0] is Severity.MEDIUM
+        assert flood_severity(1001)[0] is Severity.HIGH
 
     def test_the_default_thresholds_are_the_manuscripts(self) -> None:
         from aethra_sec.analytics.anomaly_rules import (

@@ -278,7 +278,7 @@ FILTERS - TWO KINDS, NEVER CONFUSED
   captured. It never restarts capture and never changes what is analysed or
   stored. CAPTURED keeps counting; DISPLAYED says how many packets match.
     Presets     All Traffic, Incoming, Outgoing, Transit; HTTP, HTTPS/TLS,
-                Web, Sites, TCP, UDP, ICMP, DNS, ARP. A direction and a
+                Sites, TCP, UDP, ICMP, DNS, ARP. A direction and a
                 protocol combine. Pressing the active protocol again clears it.
     IP, Port    searched against captured packets as source, destination or
                 either. Searching for an address never creates a host.

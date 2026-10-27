@@ -551,7 +551,9 @@ class TestOneSharedDetailView:
         source = self._source()
         for name in ("_render_alert_detail", "_render_anomaly_detail"):
             body = _method_source(source, name)
-            assert "_mitigation_section(match)" in body, (
+            # The block is shared; it now also takes the detection whose
+            # addresses fill the procedure placeholders.
+            assert "_mitigation_section(match" in body, (
                 f"{name} builds its own mitigation block"
             )
 

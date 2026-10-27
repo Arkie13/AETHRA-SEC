@@ -282,7 +282,7 @@ before capture; changing it restarts capture), **Start capture** /
 Display filter bar (never restarts capture):
 
 * presets **All Traffic, Incoming, Outgoing, Transit** and **HTTP, HTTPS/TLS,
-  Web, Sites, TCP, UDP, ICMP, DNS, ARP** (a direction and a protocol combine;
+  Sites, TCP, UDP, ICMP, DNS, ARP** (a direction and a protocol combine;
   pressing the active protocol again clears it), and **Clear Filter**.
   **Sites** lists the names this computer connected to or looked up - HTTPS
   server names (SNI), HTTP Host headers and DNS queries - never page content;

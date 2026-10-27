@@ -243,6 +243,7 @@ class SettingsScreen(Screen):
             SOUND_ON_LABEL, self._toggle_alert_sound
         )
         toolbar.add_button("Test security sound", self._test_alert_sound)
+        toolbar.add_button("Test IDS siren", self._test_ids_siren)
         toolbar.add_button("Mark all notifications read", self._mark_all_read)
         self._paint_sound_button()
 
@@ -354,6 +355,43 @@ class SettingsScreen(Screen):
         self.status(
             f"Played the security alert sound. {detail} No notification or "
             "security record was created."
+        )
+
+    def _test_ids_siren(self) -> None:
+        """Preview the IDS detection siren - a sound test, creating nothing.
+
+        Writes no notification, alert or detection, so no fabricated record
+        exists afterwards. It respects the sound switch, and says so rather
+        than playing anyway. "Requested" is reported, not "heard": software
+        cannot tell whether the speakers were on.
+        """
+        title = "Test IDS siren"
+        audio = getattr(self.context, "audio_alerts", None)
+        if audio is None:
+            show_message(self, title, "The audio alert service is not running.",
+                         fonts=self.fonts)
+            return
+        usable, detail = audio.siren_status()
+        if not usable:
+            show_message(
+                self, title, "The IDS siren cannot be played.",
+                detail=(f"{detail}\n\nDetections are still raised and shown; "
+                        "they will use the system sound instead."),
+                fonts=self.fonts,
+            )
+            return
+        if not self._sound_is_on():
+            show_message(
+                self, title, "Alert sound is currently OFF.",
+                detail=(f"{detail}\n\nTurn the sound on with the switch "
+                        "beside this button to hear detections."),
+                fonts=self.fonts,
+            )
+            return
+        audio.test_sound("ERROR", detection=True)
+        self.status(
+            f"SOUND TEST: IDS siren playback requested. {detail} No "
+            "notification, alert or detection was created."
         )
 
     def _mark_all_read(self) -> None:

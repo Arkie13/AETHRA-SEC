@@ -62,8 +62,60 @@ class SnortAlert:
     evaluated_at: datetime | None = None
     duplicate_count: int = 1
     dedup_key: str = ""
+    #: Snort's timestamp on the most recent occurrence folded into this
+    #: row. ``None`` on rows written before the column existed, and on
+    #: rows whose repeats carried no timestamp - never back-filled.
+    last_alert_time: datetime | None = None
+    #: Highest pps the alert's source was measured sending while the alert was
+    #: active, from the live capture. Severity is graded on it with the §3.9.8
+    #: legend. ``None`` when no capture rate was available - the severity then
+    #: falls back to Snort's own priority, and the record says so by this gap.
+    peak_pps: float | None = None
     source: EvidenceSource = EvidenceSource.SNORT
     created_at: datetime | None = None
+
+
+    # ------------------------------------------------------------------
+    # Observed episode
+    # ------------------------------------------------------------------
+    @property
+    def first_observed(self) -> datetime | None:
+        """When matching activity was first seen."""
+        return self.alert_time or self.received_at
+
+    @property
+    def last_observed(self) -> datetime | None:
+        """When matching activity was last seen.
+
+        ``None`` means it was never recorded, not that it never happened.
+        """
+        return self.last_alert_time
+
+    @property
+    def occurrences(self) -> int:
+        """How many matching events this record stands for."""
+        return max(1, int(self.duplicate_count or 1))
+
+    def episode(self, *, inactivity_seconds: int | None = None,
+                now: datetime | None = None):
+        """Summarise the observed episode.
+
+        Computed on read from the stored timestamps, never stored, so a
+        record that survives a restart is re-judged against the clock rather
+        than keeping a stale verdict.
+        """
+        from aethra_sec.analytics.episodes import (
+            DEFAULT_INACTIVITY_SECONDS, describe,
+        )
+
+        return describe(
+            self.first_observed, self.last_observed, self.occurrences,
+            inactivity_seconds=(
+                DEFAULT_INACTIVITY_SECONDS if inactivity_seconds is None
+                else inactivity_seconds
+            ),
+            now=now,
+        )
 
     @property
     def signature_text(self) -> str:

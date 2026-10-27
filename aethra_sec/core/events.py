@@ -58,7 +58,14 @@ class EventType:
     # Platform
     DATABASE_STATUS_CHANGED = "database.status_changed"
     SERVICE_STATUS_CHANGED = "service.status_changed"
+    #: A request for a notification. Publishing it asks NotificationService to
+    #: create one; it does not mean one exists yet.
     NOTIFICATION_RAISED = "notification.raised"
+    #: A notification that has been written to the database, carrying its real
+    #: row id. This is the announcement, and the only event that should drive a
+    #: toast or a sound: a notification that failed to persist never reaches
+    #: it, and nothing can sound for an alert that was not recorded.
+    NOTIFICATION_STORED = "notification.stored"
     REPORT_GENERATED = "report.generated"
     SYSTEM_ERROR = "system.error"
     HOST_OBSERVED = "host.observed"
@@ -72,6 +79,7 @@ class EventType:
         NMAP_SCAN_FAILED,
         INCIDENT_CREATED, INCIDENT_UPDATED, MITIGATION_GENERATED,
         DATABASE_STATUS_CHANGED, SERVICE_STATUS_CHANGED, NOTIFICATION_RAISED,
+        NOTIFICATION_STORED,
         REPORT_GENERATED, SYSTEM_ERROR, HOST_OBSERVED,
     )
 
@@ -223,6 +231,13 @@ class NotificationPayload:
     category: str = "system"
     reference_type: str = ""
     reference_id: int | None = None
+    #: The notifications row id, set only once the record has been written.
+    #: Present on NOTIFICATION_STORED and absent on NOTIFICATION_RAISED, which
+    #: is a request rather than a record.
+    notification_id: int | None = None
+    #: The detection's own severity for an alert notification; empty
+    #: otherwise. Never the notification ``level``.
+    severity: str = ""
 
 
 @dataclass(frozen=True)

@@ -8,13 +8,17 @@ connected the screen says so, using the transport's own status text.
 from __future__ import annotations
 
 import tkinter as tk
-from datetime import datetime
+from datetime import datetime, timedelta
 from tkinter import ttk
 from typing import Any, Sequence
 
 from aethra_sec.core.events import Event, EventType
 from aethra_sec.models.alert import SnortAlert
 from aethra_sec.analytics.anomaly_rules import flood_band
+from aethra_sec.analytics.episodes import (
+    DEFAULT_INACTIVITY_SECONDS,
+    EpisodeStatus,
+)
 from aethra_sec.models.enums import AlertStatus, EvaluationLabel, Severity
 from aethra_sec.models.periods import (
     CUSTOM_RANGE,
@@ -28,6 +32,12 @@ from aethra_sec.models.mitigation import LOOKUP_FAILED_TEXT, MitigationMatch
 from aethra_sec.models.severity_source import DETECTION_SEVERITIES
 from aethra_sec.models.threat import TrafficAnomaly
 from aethra_sec.services.mitigation_service import NO_RECOMMENDATION_TEXT
+from aethra_sec.ui.guide_text import (
+    apply_guide_context,
+    guide_context,
+    placeholder_note,
+    unfilled_placeholders,
+)
 from aethra_sec.ui.base import Screen
 from aethra_sec.ui.theme import PALETTE, configure_text_widget, state_colour
 from aethra_sec.core.permissions import Permission
@@ -78,6 +88,16 @@ ALERT_COLUMNS = (
     # which engine said so before acting on it.
     Column("origin", "Detected by", width=105),
     Column("severity", "Severity", width=100, colour_by="severity", glyph=True),
+    # What the traffic is doing NOW, beside what the attack reached.
+    # ``severity`` is the worst rate validly measured and does not fall, so a
+    # flood that has tailed off still reads HIGH there - correct, but it hides
+    # the live state. This column carries the band of the most recent
+    # measurement, and is blank when there is no rate to classify.
+    Column("now", "Now", width=78, colour_by="severity", glyph=True),
+    # The number the severity was decided on. Without it the badge is an
+    # assertion the operator cannot check, and a cumulative packet count
+    # elsewhere on screen reads like a rate and contradicts it.
+    Column("rate", "Rate (pps)", width=100, anchor="e"),
     Column("priority", "Prio", width=48, anchor="e"),
     Column("signature", "Signature", width=125),
     Column("message", "Message", width=300, stretch=True),
@@ -85,6 +105,12 @@ ALERT_COLUMNS = (
     Column("source", "Source", width=150),
     Column("destination", "Destination", width=150),
     Column("count", "Seen", width=52, anchor="e"),
+    # The episode. "Time" above is the FIRST observation; without these three
+    # a recurring attack is indistinguishable from a single event, which is
+    # exactly what an operator needs to tell apart.
+    Column("last_seen", "Last seen", width=120),
+    Column("duration", "Observed for", width=130),
+    Column("episode", "Episode", width=96, anchor="center"),
     Column("status", "Status", width=95, colour_by="status"),
     Column("evaluation", "Evaluation", width=120),
 )
@@ -119,6 +145,658 @@ def _stamp(moment: Any, *, precise: bool = False) -> str:
     if not moment:
         return "Not recorded"
     return format_local_ms(moment) if precise else format_local(moment)
+
+
+# ----------------------------------------------------------------------
+# Detection detail - one record, one set of facts
+# ----------------------------------------------------------------------
+#: Protocols that have no transport ports, so "Not available" would wrongly
+#: suggest a port exists and was not captured.
+_PORTLESS_PROTOCOLS = ("ICMP", "ICMPV6", "IGMP", "ARP")
+
+
+def measurement_count(anomaly: Any) -> tuple[int | None, str]:
+    """See :meth:`TrafficAnomaly.observation_count` - one definition everywhere."""
+    counter = getattr(anomaly, "observation_count", None)
+    if callable(counter):
+        return counter()
+    return None, "unrecoverable"
+
+
+def _parse_stamp(value: Any) -> Any:
+    """A datetime from the stored evidence, which keeps ISO strings."""
+    if isinstance(value, datetime) or not value:
+        return value
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+def _is_flood(anomaly: Any) -> bool:
+    from aethra_sec.analytics.anomaly_rules import FLOOD_RULES
+
+    return str(getattr(anomaly, "rule_id", "")) in FLOOD_RULES
+
+
+def _rate_unit(anomaly: Any) -> str:
+    """The unit of this rule's threshold, observed and latest values.
+
+    A port scan stores distinct ports and a host sweep distinct hosts. Labelling
+    those "pps" made a sweep read "threshold of 15 pps ... crossed with 15
+    pps" - an alert apparently raised by trivially low traffic. Their packet
+    rate is the Rate column, which is a separate stored measurement.
+    """
+    rule = str(getattr(anomaly, "rule_id", ""))
+    if rule.endswith("HTTP-RATE"):
+        return "req/s"
+    if rule.endswith("HOST-SWEEP"):
+        return "hosts"
+    if rule.endswith("PORT-SCAN"):
+        return "ports"
+    return "pps"
+
+
+def _num(value: Any) -> str:
+    """A measured number as stored: no rounding beyond what was recorded."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return _value(value, "Not recorded")
+    return f"{number:,.0f}" if number.is_integer() else f"{number:,.1f}"
+
+
+def _band_text(rate: Any) -> str:
+    from aethra_sec.analytics.anomaly_rules import flood_severity
+
+    try:
+        measured = float(rate)
+    except (TypeError, ValueError):
+        return "Not classified"
+    if measured <= 0:
+        return "Not classified"
+    _severity, summary = flood_severity(measured)
+    return summary
+
+
+def _trigger_measurement(anomaly: Any) -> dict[str, Any]:
+    """The measurement recorded at the instant the threshold was first crossed.
+
+    It is the evidence stored with the record at insert, which is never
+    overwritten - so it is the trigger, not "the observation" of the episode.
+    """
+    evidence = getattr(anomaly, "evidence", None) or {}
+    count = None
+    for name in (
+        "icmp_packets_in_window", "udp_packets_in_window",
+        "syn_packets_in_window", "http_requests_in_window",
+    ):
+        if name in evidence:
+            count = evidence[name]
+            break
+    window = evidence.get("window_seconds", getattr(anomaly, "window_seconds", None))
+    # The rule stores first_seen as the triggering packet's capture time minus
+    # the window, so the packet time is recovered exactly. detected_at is when
+    # the analysis reached that packet - a different clock, kept separately.
+    first_seen = getattr(anomaly, "first_seen", None)
+    at = None
+    if first_seen is not None and window:
+        try:
+            at = first_seen + timedelta(seconds=float(window))
+        except (TypeError, ValueError):
+            at = None
+    return {
+        "rate": evidence.get("observed_rate_pps"),
+        "count": count,
+        "window": window,
+        "band": evidence.get("severity_band"),
+        "at": at,
+        "analysed_at": getattr(anomaly, "detected_at", None),
+    }
+
+
+def _capture_statement(snapshot: dict[str, Any] | None) -> str:
+    """What the capture counters recorded with one measurement say - and do not.
+
+    The counters are cumulative from the moment capture started, not for this
+    episode alone, and they can only see packets that reached this computer.
+    A loss of zero used to be presented as "a complete measurement", which the
+    counters cannot establish.
+    """
+    if not snapshot:
+        return "Capture state not recorded with this measurement"
+    completeness = snapshot.get("capture_completeness")
+    offered = snapshot.get("adapter_packets_since_capture_start")
+    if completeness is not None:
+        try:
+            share = float(completeness)
+        except (TypeError, ValueError):
+            share = None
+        if share is not None:
+            shown = min(share, 1.0)
+            since = (
+                f"of the {int(offered):,} packets the adapter counted since capture "
+                "began" if offered is not None else "of the packets the adapter counted"
+            )
+            if share < 0.95:
+                return (
+                    f"INCOMPLETE - only {shown:.1%} {since} reached the analysis "
+                    "(cumulative since capture start, not for this episode alone). "
+                    "The measured rate is a lower bound, not the attack rate."
+                )
+            return (
+                f"{shown:.1%} {since} reached the analysis (cumulative). No loss "
+                "inside this computer is shown; traffic that never reached the "
+                "adapter cannot be counted, so this does not prove every packet "
+                "on the network was seen."
+            )
+    loss = snapshot.get("capture_loss_rate")
+    if loss is not None:
+        try:
+            lost = float(loss)
+        except (TypeError, ValueError):
+            lost = None
+        if lost == 0:
+            return (
+                "The capture reported 0 dropped packets (cumulative). Packets "
+                "that never reached the adapter cannot be counted, so this is "
+                "not proof that every packet on the network was seen."
+            )
+        if lost is not None:
+            return (
+                f"INCOMPLETE - the capture dropped {lost:.1%} of the packets "
+                "offered to it (cumulative); the measured rate is a lower bound."
+            )
+    return "Capture state not recorded with this measurement"
+
+
+def _episode_capture(trigger: dict[str, Any], latest: dict[str, Any] | None) -> str:
+    """Capture completeness over the episode itself, from two real snapshots."""
+    if not latest:
+        return "Needs a second measurement - not available for this episode"
+    try:
+        seen = int(latest["capture_packets_seen"]) - int(trigger["capture_packets_seen"])
+        offered = (
+            int(latest["adapter_packets_since_capture_start"])
+            - int(trigger["adapter_packets_since_capture_start"])
+        )
+    except (KeyError, TypeError, ValueError):
+        return "Not recorded for this episode"
+    if offered <= 0:
+        return "Not computable - the adapter counter did not advance"
+    share = seen / offered
+    note = (
+        " (above 100% because the two counters are sampled a moment apart)"
+        if share > 1 else ""
+    )
+    verdict = "INCOMPLETE - the rates are lower bounds. " if share < 0.95 else ""
+    return (
+        f"{verdict}Between the trigger and the latest measurement the adapter "
+        f"counted {offered:,} packets and {seen:,} ({share:.1%}) reached the "
+        f"analysis{note}."
+    )
+
+
+def _measurement_line(
+    rate: Any, count: Any, window: Any, at: Any, unit: str
+) -> str:
+    parts = [f"{_num(rate)} {unit}"]
+    if count is not None and window:
+        parts.append(f"= {int(count):,} counted in {window} s")
+    if at:
+        parts.append(f"at {_stamp(_parse_stamp(at), precise=True)}")
+    return " ".join(parts)
+
+
+def _episode_narrative(anomaly: Any) -> str:
+    """The observation, generated from this record's own measurements.
+
+    The stored ``observation`` sentence is written once, when the threshold is
+    first crossed - at which instant the count is necessarily AT the threshold
+    (600 ICMP packets in 5 s is exactly 120 pps). It was shown as "the
+    observation" of the whole episode, so a flood measured at 1,040.2 pps read
+    as "120 packets/second ... Low". It is still shown, labelled as what it is.
+    """
+    unit = _rate_unit(anomaly)
+    source = _value(getattr(anomaly, "src_ip", ""), "an unrecorded source")
+    target = getattr(anomaly, "dst_ip", "") or ""
+    evidence = getattr(anomaly, "evidence", None) or {}
+    trigger = _trigger_measurement(anomaly)
+    latest = evidence.get("latest_measurement") or {}
+    peak = evidence.get("peak_measurement") or {}
+    window = getattr(anomaly, "window_seconds", None) or trigger["window"]
+    threshold = getattr(anomaly, "threshold_value", None)
+    lines = [
+        f"{source}{' -> ' + target if target else ''}: the alert threshold of "
+        f"{_num(threshold)} {unit} over {window} s was crossed "
+        f"{('at ' + _stamp(trigger['at'], precise=True)) if trigger['at'] else ''}"
+        f"{' with ' + _num(trigger['rate']) + ' ' + unit if trigger['rate'] is not None else ''}."
+        " Crossing it makes traffic a detection; it does not set the severity.",
+    ]
+    if getattr(anomaly, "latest_value", None) is not None:
+        lines.append(
+            f"Latest measurement: "
+            + _measurement_line(
+                anomaly.latest_value, latest.get("packets_in_window"), window,
+                latest.get("measured_at") or getattr(anomaly, "latest_measured_at", None),
+                unit,
+            )
+            + (f" - severity band {_band_text(anomaly.latest_value)}." if _is_flood(anomaly) else ".")
+        )
+    else:
+        lines.append("No later measurement was folded into this episode; the "
+                     "trigger measurement is the only one.")
+    lines.append(
+        f"Peak measurement: "
+        + _measurement_line(
+            anomaly.observed_value, peak.get("packets_in_window"), window,
+            peak.get("measured_at"), unit,
+        )
+        + (f" - severity band {_band_text(anomaly.observed_value)}." if _is_flood(anomaly) else ".")
+    )
+    return "\n".join(lines)
+
+
+def _anomaly_detail_sections(
+    anomaly: Any, when: Any, episode: Any
+) -> list["DetailSection"]:
+    """Detection information, episode, network and evidence for ONE record.
+
+    Every value is read from ``anomaly`` - its columns and its own evidence -
+    and nothing else. Where the record does not hold a value, the row says so.
+    """
+    from aethra_sec.analytics.anomaly_rules import FLOOD_BANDS
+
+    evidence = getattr(anomaly, "evidence", None) or {}
+    flood = _is_flood(anomaly)
+    unit = _rate_unit(anomaly)
+    trigger = _trigger_measurement(anomaly)
+    latest = evidence.get("latest_measurement") or None
+    peak = evidence.get("peak_measurement") or None
+    protocol = (anomaly.protocol or "").upper()
+    portless = protocol in _PORTLESS_PROTOCOLS
+    not_applicable = f"Not applicable - {protocol or 'this protocol'} has no ports"
+    has_latest = anomaly.latest_value is not None
+    # Which engine recorded this row decides what its numbers mean. Rows from
+    # before the 15 Oct 2026 revision carry no ``measurement_scope``: their
+    # ICMP count could include echo replies, and their latest measurement time
+    # is the analysis clock. They are described as they were recorded.
+    revised = "measurement_scope" in evidence
+    if not flood:
+        direction = "As recorded by the rule"
+    elif revised or protocol not in ("ICMP", "ICMPV6"):
+        direction = (
+            "Source -> destination only. Echo replies answering the "
+            "destination's own requests are not counted."
+            if protocol in ("ICMP", "ICMPV6") else "Source -> destination only"
+        )
+    else:
+        direction = (
+            "Packets sent by the source. Recorded before the 15 Oct 2026 revision, when "
+            "echo replies were still counted: if this source was the TARGET of "
+            "a ping flood, these are its replies, not an attack."
+        )
+    latest_at = (latest or {}).get("measured_at")
+    latest_clock = "" if latest_at or evidence.get("measurement_clock") == "packet" else (
+        " (analysis time - recorded before measurement times used the packet clock)"
+        if anomaly.latest_measured_at else ""
+    )
+
+    count, basis = measurement_count(anomaly)
+    if basis == "counted":
+        measurements_text = (
+            f"{count:,} - observations folded into this record (the first "
+            "detection plus each later measurement). Not a packet count and "
+            "not a count of attacks."
+        )
+    elif basis == "derived":
+        measurements_text = (
+            f"{count:,} - derived exactly from the stored count "
+            f"{anomaly.event_count:,}, which on records before the 15 Oct 2026 "
+            "revision started at the trigger rate instead of 1. Not a packet count."
+        )
+    else:
+        measurements_text = (
+            f"Not recoverable - the stored count {anomaly.event_count:,} started "
+            "at the rule's measured value on records before the 15 Oct 2026 "
+            "revision, and that value is not stored for this rule."
+        )
+
+    if flood and has_latest:
+        current = (
+            f"{anomaly.current_severity} - from the latest measurement, "
+            f"{_num(anomaly.latest_value)} {unit}"
+        )
+    elif flood:
+        current = f"{anomaly.current_severity} - only the trigger measurement exists"
+    else:
+        current = (
+            f"{anomaly.current_severity} - graded on the rule's own measure, "
+            "not a latest rate"
+        )
+
+    return [
+        DetailSection(
+            "DETECTION INFORMATION",
+            rows=[
+                ("Detection ID", _value(anomaly.id)),
+                ("Title", _value(anomaly.title)),
+                ("Rule", _value(anomaly.rule_id)),
+                ("Category", _value(anomaly.category)),
+                ("Protocol", _value(anomaly.protocol)),
+                ("Detected by", "AETHRA-SEC traffic rules"),
+                ("Evidence source", _value(anomaly.source)),
+                ("First detected", _stamp(when, precise=True)),
+                ("Current severity", current),
+                (
+                    "Peak severity",
+                    f"{anomaly.highest_severity} - from the peak, "
+                    f"{_num(anomaly.observed_value)} {unit}"
+                    if flood else str(anomaly.highest_severity),
+                ),
+                (
+                    "Episode severity",
+                    f"{anomaly.episode_severity} - the worst this episode reached; "
+                    "it never falls. The badge, counters, filters and "
+                    "notifications use this value.",
+                ),
+                (
+                    "Alert trigger",
+                    f"{_num(anomaly.threshold_value)} {unit} sustained over "
+                    f"{anomaly.window_seconds} s. Reaching it raises the "
+                    "detection; it does not decide the severity."
+                    if flood else
+                    f"{_num(anomaly.threshold_value)} over {anomaly.window_seconds} s",
+                ),
+                (
+                    "Severity bands",
+                    "; ".join(band.summary() for band in FLOOD_BANDS)
+                    + " - applied to the measured rate"
+                    if flood else "Not a rate rule - see the observation",
+                ),
+                (
+                    "Confidence",
+                    f"{anomaly.confidence}%" if anomaly.confidence else "Not recorded",
+                ),
+            ],
+        ),
+        DetailSection(
+            "OBSERVED EPISODE",
+            rows=[
+                ("First seen", _stamp(anomaly.first_observed, precise=True)),
+                ("Last seen", _stamp(anomaly.last_observed, precise=True)),
+                ("Observed duration", episode.duration_text),
+                ("Episode status", episode.status.label),
+                ("What that means", episode.status.explanation),
+                ("Measurements in episode", measurements_text),
+                (
+                    "Latest measurement",
+                    _measurement_line(
+                        anomaly.latest_value,
+                        (latest or {}).get("packets_in_window"),
+                        anomaly.window_seconds,
+                        (latest or {}).get("measured_at") or anomaly.latest_measured_at,
+                        unit,
+                    ) + latest_clock if has_latest else "Only the trigger measurement exists",
+                ),
+                (
+                    "Peak measurement",
+                    _measurement_line(
+                        anomaly.observed_value,
+                        (peak or {}).get("packets_in_window"),
+                        anomaly.window_seconds,
+                        (peak or {}).get("measured_at"), unit,
+                    ),
+                ),
+                (
+                    "Trigger measurement",
+                    _measurement_line(
+                        trigger["rate"], trigger["count"], trigger["window"],
+                        trigger["at"], unit,
+                    ) if trigger["rate"] is not None else "Not recorded",
+                ),
+                (
+                    "Average rate",
+                    "Not calculated - the record stores individual window "
+                    "measurements, not the episode's total packet count",
+                ),
+                (
+                    "Total packets in episode",
+                    "Not recorded - each measurement counts one "
+                    f"{anomaly.window_seconds} s window only",
+                ),
+                (
+                    "Analysis lag at latest measurement",
+                    f"{float(latest['analysis_lag_seconds']):.1f} s between the "
+                    "packets' capture time and their analysis"
+                    if latest and latest.get("analysis_lag_seconds") is not None
+                    else "Not recorded",
+                ),
+                (
+                    "Note",
+                    "The duration is the span between the first and last "
+                    "observation. It does not assert that traffic was "
+                    "continuously present throughout, and a gap in "
+                    "observations is not evidence the activity stopped. "
+                    "This is not detection time (section 3.9.2), which "
+                    "needs a separately recorded attack-initiation "
+                    "timestamp.",
+                ),
+            ],
+        ),
+        DetailSection(
+            "NETWORK DETAILS",
+            rows=[
+                ("Protocol", _value(anomaly.protocol)),
+                ("Source IP", _value(anomaly.src_ip)),
+                ("Destination IP", _value(anomaly.dst_ip)),
+                (
+                    "Source port",
+                    not_applicable if portless
+                    else "Not recorded - the rule tracks the source address",
+                ),
+                (
+                    "Destination port",
+                    not_applicable if portless
+                    else _value(anomaly.dst_port, "Not recorded"),
+                ),
+                ("Interface", _value(anomaly.interface)),
+                ("Direction measured", direction),
+                (
+                    "Measurement scope",
+                    _value(evidence.get("rate_scope"),
+                           "Scope not recorded for this detection"),
+                ),
+                (
+                    "Correlated attack",
+                    f"#{int(anomaly.incident_id)} - detections of the same "
+                    "attack are grouped under this number ('One row per "
+                    "attack' view)"
+                    if anomaly.incident_id else "Not yet correlated",
+                ),
+            ],
+        ),
+        DetailSection(
+            "EVIDENCE",
+            rows=[
+                ("Evidence source", _value(anomaly.source)),
+                ("Evidence record", f"traffic_anomalies #{_value(anomaly.id)}"),
+                ("Measurement window", f"{_value(anomaly.window_seconds)} s"),
+                ("Capture at trigger", _capture_statement(evidence)),
+                (
+                    "Capture at latest measurement",
+                    _capture_statement(latest) if latest
+                    else "Not recorded for this measurement",
+                ),
+                ("Capture over this episode", _episode_capture(evidence, latest)),
+                (
+                    "Severity input",
+                    f"Current: latest rate {_num(anomaly.latest_value)} {unit}; "
+                    f"peak: {_num(anomaly.observed_value)} {unit}"
+                    if flood and has_latest
+                    else f"Trigger/peak rate {_num(anomaly.observed_value)} {unit}"
+                    if flood else "The rule's own measure (see the observation)",
+                ),
+            ],
+            body="\n\n".join(
+                f"{label}\n{_value(text, 'Not recorded')}"
+                for label, text in (
+                    ("Observation", _episode_narrative(anomaly)),
+                    (
+                        "Trigger observation (recorded when the threshold was "
+                        "first crossed; not updated afterwards)",
+                        anomaly.observation,
+                    ),
+                    ("Why it matters", anomaly.why_it_matters),
+                    ("What to check", anomaly.what_to_check),
+                )
+            ),
+        ),
+    ]
+
+
+#: The Alerts view choices. "Each detection" is every raw sensor record, as
+#: before; "One row per attack" collapses detections the correlation engine
+#: bound to one attack into a single primary row.
+#: Which records the table lists. AETHRA-SEC's own detections are the primary
+#: alerts; Snort's are supporting evidence, kept and inspectable on their own.
+SOURCE_AETHRA = "AETHRA-SEC detections"
+SOURCE_SNORT = "Snort evidence (raw alerts)"
+
+VIEW_EACH_DETECTION = "Each detection"
+VIEW_ONE_PER_ATTACK = "One row per attack"
+
+
+def _row_rank(row: dict[str, Any]) -> tuple[int, int, Any]:
+    """Primary-row preference inside one attack.
+
+    AETHRA-SEC's own detection first - it carries the measured rate and the
+    episode - then the highest severity, then the newest.
+    """
+    try:
+        rank = Severity(str(row.get("severity", "")).upper()).rank
+    except ValueError:
+        rank = -1
+    return (1 if row.get("_origin") == ORIGIN_AETHRA else 0, rank, row.get("_sort"))
+
+
+def one_row_per_attack(
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[tuple[str, Any], list[dict[str, Any]]]]:
+    """Collapse rows that belong to the same correlated attack.
+
+    Rows carry ``_attack`` - the correlation record the engine bound them to,
+    which already requires the same protocol family, source and destination
+    inside the correlation window. Rows with no ``_attack`` have not been
+    correlated yet and stay as rows of their own; nothing is merged on title
+    or signature similarity.
+
+    Returns the primary rows, and for each primary ``(origin, id)`` every
+    row of its attack (primary included) so the detail view can list the
+    supporting evidence. No row is dropped from the data - only from the
+    table in this view.
+    """
+    groups: dict[Any, list[dict[str, Any]]] = {}
+    singles: list[dict[str, Any]] = []
+    for row in rows:
+        attack = row.get("_attack")
+        if attack is None:
+            singles.append(row)
+        else:
+            groups.setdefault(attack, []).append(row)
+
+    primaries: list[dict[str, Any]] = list(singles)
+    members: dict[tuple[str, Any], list[dict[str, Any]]] = {}
+    for group in groups.values():
+        primary = max(group, key=_row_rank)
+        others = [row for row in group if row is not primary]
+        shown = dict(primary)
+        if others:
+            snort = sum(1 for row in others if row.get("_origin") != ORIGIN_AETHRA)
+            aethra = len(others) - snort
+            parts = []
+            if aethra:
+                parts.append(f"{aethra} AETHRA-SEC")
+            if snort:
+                parts.append(f"{snort} Snort")
+            shown["message"] = (
+                f"{primary.get('message', '-')} · +{len(others)} related "
+                f"({', '.join(parts)})"
+            )
+        primaries.append(shown)
+        members[(primary.get("_origin"), primary.get("_id"))] = group
+    primaries.sort(key=lambda row: row["_sort"], reverse=True)
+    return primaries, members
+
+
+def _related_section(group: list[dict[str, Any]] | None, origin: str, ident: Any):
+    """The other detections of the same attack, as supporting evidence."""
+    if not group or len(group) < 2:
+        return None
+    lines = []
+    for row in sorted(group, key=lambda r: r["_sort"]):
+        if row.get("_origin") == origin and row.get("_id") == ident:
+            continue
+        lines.append(
+            f"{row.get('time', '-')}  {row.get('origin', '-'):<10} "
+            f"{row.get('severity', '-'):<6} {row.get('signature', '-')}  "
+            f"{row.get('message', '-')}  {row.get('source', '-')} -> "
+            f"{row.get('destination', '-')}  seen {row.get('count', '-')}"
+        )
+    return DetailSection(
+        "SAME ATTACK - SUPPORTING EVIDENCE",
+        body=(
+            f"{len(lines)} other detection(s) were correlated with this one as "
+            "a single attack (same protocol family, source and destination, "
+            "inside the correlation window). Each is still a separate record "
+            "with its own evidence; open it from 'Each detection' view.\n\n"
+            + "\n".join(lines)
+        ),
+    )
+
+
+def snort_evidence_section(anomaly: Any, evidence: Any) -> "DetailSection":
+    """Snort alerts linked to this detection's attack, summarised then listed.
+
+    Linked by the correlation engine (same protocol family, source and target,
+    active within the episode gap) - never by a timestamp coincidence. Records
+    are stored rows; raw alerts include every repeat Snort folded into them.
+    """
+    heading = "SNORT SUPPORTING EVIDENCE"
+    if isinstance(evidence, Exception):
+        return DetailSection(heading, body=f"Could not load the Snort evidence: {evidence}")
+    if not anomaly.incident_id:
+        return DetailSection(
+            heading,
+            body="Not yet correlated - the correlation engine runs every few "
+            "seconds; reopen this detection to see linked Snort alerts.",
+        )
+    alerts = list(evidence or [])
+    if not alerts:
+        return DetailSection(
+            heading,
+            body="No Snort alert is linked to this attack. AETHRA-SEC detected it "
+            "on its own; Snort either had no matching rule or raised nothing.",
+        )
+    raw = sum(int(getattr(a, "duplicate_count", 1) or 1) for a in alerts)
+    ports = {a.dst_port for a in alerts if getattr(a, "dst_port", None) is not None}
+    signatures: dict[str, int] = {}
+    for alert in alerts:
+        key = f"[{alert.generator_id}:{alert.signature_id}:{alert.revision}] {alert.message}"
+        signatures[key] = signatures.get(key, 0) + int(alert.duplicate_count or 1)
+    times = [a.effective_time for a in alerts if a.effective_time]
+    rows = [
+        ("Snort records linked", f"{len(alerts):,}" + (" (newest 200 shown)" if len(alerts) >= 200 else "")),
+        ("Raw Snort alerts", f"{raw:,} - each alert line Snort wrote, repeats included"),
+        ("Distinct destination ports", f"{len(ports):,}" if ports else "None recorded"),
+        ("First / last Snort alert",
+         f"{_stamp(min(times), precise=True)} / {_stamp(max(times), precise=True)}"
+         if times else "Not recorded"),
+    ]
+    body = "Signatures (raw alerts):\n" + "\n".join(
+        f"  {count:>8,}  {name}" for name, count in sorted(signatures.items(), key=lambda kv: -kv[1])
+    )
+    return DetailSection(heading, rows=rows, body=body)
 
 
 def _rule_text(alert: SnortAlert) -> str:
@@ -163,7 +841,211 @@ def _selection_note(lines: Sequence[str]) -> str:
     return "\n\nHow this entry was selected\n" + "\n".join(lines)
 
 
-def _mitigation_section(match: MitigationMatch | None) -> DetailSection:
+
+# The filling itself lives in aethra_sec.ui.guide_text, because the
+# Mitigation screen and the Vulnerability Assessment drawer show the same
+# stored procedures against different kinds of record. These names are kept
+# so this module reads as it did.
+_guide_context = guide_context
+_apply_guide_context = apply_guide_context
+_unfilled_placeholders = unfilled_placeholders
+
+
+#: Rules whose detector stores a packets-per-second figure of its own. That
+#: figure is uncapped and is what the severity was taken from, so it is shown
+#: as-is. Every other detection - HTTP flood (stored as requests/s), port scan
+#: (ports), host sweep (hosts), Snort (signature) - has its packet rate
+#: measured from captured traffic instead, so the column is pps for every row.
+_STORED_PPS_RULES = frozenset({"RULE-ICMP-RATE", "RULE-UDP-RATE", "RULE-TCP-SYN-RATE"})
+
+#: How many recent detections to measure a packet rate for per load. Bounds the
+#: worker's query count; older detections' rows have been pruned and would
+#: measure to nothing anyway.
+_RATE_MEASURE_LIMIT = 150
+
+
+def _format_pps(measured: float | None) -> str:
+    """A packets-per-second figure for the Rate column, or "-" when unmeasured.
+
+    "-" means no packet from the source was retained to measure - never a real
+    zero.
+    """
+    if measured is None:
+        return "-"
+    try:
+        value = float(measured)
+    except (TypeError, ValueError):
+        return "-"
+    if value <= 0:
+        return "-"
+    return f"{value:,.1f}"
+
+
+def _measured_rate(anomaly: Any, measured: float | None = None) -> str:
+    """Packets per second for this detection, so an attack can be tracked.
+
+    The ICMP, UDP and TCP-SYN flood rules store their own packet rate, and the
+    peak is shown - one number, because that is the figure the severity was
+    taken from. (The live, possibly lower rate is what the Now column bands.)
+    Every other rule stores something that is not a packet rate, so the rate
+    measured from captured traffic is shown instead, passed in as ``measured``.
+
+    The column is volume only. A port scan or host sweep is classified on
+    ports or hosts touched, so a low rate beside a MEDIUM severity is expected
+    and correct; the figure is never adjusted to match the severity.
+    """
+    if str(getattr(anomaly, "rule_id", "")) not in _STORED_PPS_RULES:
+        # A port scan or host sweep graded on the pps legend carries the very
+        # rate it was graded on; show that, so the number and the severity
+        # beside it always agree. Older rows have none and fall back to the
+        # rate measured from captured traffic.
+        recorded = (getattr(anomaly, "evidence", None) or {}).get(
+            "packets_per_second"
+        )
+        if recorded is not None:
+            return _format_pps(recorded)
+        return _format_pps(measured)
+    return _format_pps(getattr(anomaly, "observed_value", None))
+
+
+def _measure_rates(
+    dashboard: Any,
+    alerts: list[Any],
+    anomalies: list[Any],
+) -> dict[tuple[str, int], float]:
+    """Measure packets/second for detections without a stored packet rate.
+
+    Runs on the worker, never the Tk thread. One-directional - packets the
+    detection's source sent over the detection's own window - so a target's
+    replies are never counted as the attacker's. Bounded by
+    ``_RATE_MEASURE_LIMIT`` per source so a full page is not a thousand queries.
+    """
+    from datetime import timedelta
+
+    rates: dict[tuple[str, int], float] = {}
+    if dashboard is None:
+        return rates
+
+    def _anchor(item: Any) -> Any:
+        return (
+            getattr(item, "last_seen", None)
+            or getattr(item, "detected_at", None)
+            or getattr(item, "created_at", None)
+        )
+
+    def _measure(src: Any, end: Any, seconds: float, dst: Any) -> float | None:
+        try:
+            return dashboard.measured_source_rate(
+                src, end - timedelta(seconds=seconds), end, dst_ip=dst or None
+            )
+        except Exception:  # noqa: BLE001 - a measurement must never break a load
+            return None
+
+    pending = [
+        a for a in anomalies
+        if a.id is not None
+        and str(a.rule_id) not in _STORED_PPS_RULES
+        # Graded detections already carry their rate; only older rows need one.
+        and "packets_per_second" not in (getattr(a, "evidence", None) or {})
+        and getattr(a, "src_ip", None)
+        and _anchor(a) is not None
+    ]
+    pending.sort(key=_anchor, reverse=True)
+    for anomaly in pending[:_RATE_MEASURE_LIMIT]:
+        rate = _measure(
+            anomaly.src_ip,
+            _anchor(anomaly),
+            getattr(anomaly, "window_seconds", None) or 10,
+            getattr(anomaly, "dst_ip", None),
+        )
+        if rate is not None:
+            rates[(ORIGIN_AETHRA, anomaly.id)] = rate
+
+    snort_pending = [
+        a for a in alerts
+        if a.id is not None
+        # A Snort alert graded on the pps legend carries its own peak_pps.
+        and getattr(a, "peak_pps", None) is None
+        and getattr(a, "src_ip", None)
+        and getattr(a, "effective_time", None) is not None
+    ]
+    snort_pending.sort(key=lambda a: a.effective_time, reverse=True)
+    for alert in snort_pending[:_RATE_MEASURE_LIMIT]:
+        # Snort stamps to the whole second, so a flood whose first packet lands
+        # at :22.436 sits AFTER an alert stamped :22.000. A window ending at the
+        # stamp misses the attack entirely; measure across the alert's own
+        # episode instead - first second through the end of the last - with a
+        # floor so a one-off alert still gets a usable window.
+        first = getattr(alert, "first_observed", None) or alert.effective_time
+        last = getattr(alert, "last_observed", None) or first
+        end = max(last, first) + timedelta(seconds=1)
+        seconds = max((end - first).total_seconds(), 5.0)
+        rate = _measure(
+            alert.src_ip, first + timedelta(seconds=seconds), seconds,
+            getattr(alert, "dst_ip", None),
+        )
+        if rate is not None:
+            rates[(ORIGIN_SNORT, alert.id)] = rate
+    return rates
+
+
+def _current_band(anomaly: Any) -> str:
+    """The band the most recent measurement falls into, or "-" if there is none.
+
+    Only the flood rules classify by packet rate. A port scan's severity is
+    measured in distinct ports and a host sweep's in distinct hosts, so
+    neither has a rate to put in a band, and this returns "-" rather than
+    pushing those numbers through thresholds that do not describe them.
+    """
+    from aethra_sec.analytics.anomaly_rules import FLOOD_RULES, flood_severity
+
+    if str(getattr(anomaly, "rule_id", "")) not in FLOOD_RULES:
+        return "-"
+    rate = getattr(anomaly, "latest_value", None)
+    if rate is None:
+        return "-"
+    try:
+        measured = float(rate)
+    except (TypeError, ValueError):
+        return "-"
+    if measured <= 0:
+        return "-"
+    band, _summary = flood_severity(measured)
+    return str(band)
+
+
+def _source_silence_note(snort: Any) -> str:
+    """How long the alert source has been silent, when that is knowable.
+
+    "RUNNING" on this screen means the transport is connected, not that the
+    sensor is producing anything - and a file nobody writes tails perfectly
+    for ever. Saying how old the source is turns an invisible dead feed into
+    something an operator can see.
+    """
+    transport = getattr(snort, "_transport", None)
+    age_of = getattr(transport, "source_age_seconds", None)
+    if not callable(age_of):
+        return ""
+    try:
+        age = age_of()
+    except Exception:  # noqa: BLE001 - a diagnostic is never worth a crash
+        return ""
+    if age is None:
+        return ""
+    if age < 300:
+        return f" · source written {int(age)}s ago"
+    hours, remainder = divmod(int(age), 3600)
+    minutes = remainder // 60
+    span = f"{hours}h {minutes}m" if hours else f"{minutes}m"
+    return (
+        f" · NO NEW ALERTS FOR {span} - the file is being tailed correctly; "
+        "nothing is writing to it"
+    )
+
+
+def _mitigation_section(
+    match: MitigationMatch | None, detection: Any = None
+) -> DetailSection:
     """Render the mitigation block for one resolved detection.
 
     Three outcomes, kept apart on purpose. Guidance that exists is shown with
@@ -210,13 +1092,44 @@ def _mitigation_section(match: MitigationMatch | None) -> DetailSection:
         )
 
     entry = match.recommendation
+    context = _guide_context(detection) if detection is not None else {}
+
+    def filled(text: str) -> str:
+        return _apply_guide_context(str(text or ""), context)
+
+    procedure = filled(getattr(entry, "procedure_steps", ""))
+    verification = filled(entry.verification_steps)
+    rollback = filled(getattr(entry, "rollback_steps", ""))
+
+    # Across every part, not just the procedure: a host sweep records no
+    # destination, so <TARGET_IP> survives into the verification steps, and
+    # a placeholder the operator cannot account for is worse than none.
+    outstanding: list[str] = []
+    for part in (filled(getattr(entry, "enforcement_point", "")), procedure,
+                 verification, rollback,
+                 filled(getattr(entry, "operational_warnings", ""))):
+        for placeholder in _unfilled_placeholders(part):
+            if placeholder not in outstanding:
+                outstanding.append(placeholder)
+
+    # Named, not hidden. The operator has to supply these before the
+    # commands can be run, and saying so is the whole point.
+    note = placeholder_note(outstanding)
+    missing_note = f"\n\n{note}" if note else ""
+
     body_parts = [
         ("Recommendation", entry.threat_name),
-        ("What was observed", entry.explanation),
-        ("Why it matters", entry.why_it_matters),
-        ("Recommended immediate action", entry.immediate_action),
-        ("Recommended long-term action", entry.long_term_action),
-        ("Verification", entry.verification_steps),
+        ("What was observed", filled(entry.explanation)),
+        ("Why it matters", filled(entry.why_it_matters)),
+        ("Where to make the change",
+         filled(getattr(entry, "enforcement_point", ""))),
+        ("Recommended immediate action", filled(entry.immediate_action)),
+        ("Step-by-step procedure", procedure + missing_note),
+        ("Verification", verification),
+        ("How to undo this change", rollback),
+        ("Operational risks and warnings",
+         filled(getattr(entry, "operational_warnings", ""))),
+        ("Recommended long-term action", filled(entry.long_term_action)),
         ("References", entry.references),
     ]
     body = "\n\n".join(
@@ -314,6 +1227,49 @@ def _summary_cells(totals: dict[str, int]) -> dict[str, int]:
             len(unknown), sorted(set(unknown)),
         )
     return cells
+
+
+
+
+#: Default of ``detection.episode_gap_seconds`` (config/defaults.py).
+EPISODE_GAP_DEFAULT = 15
+
+
+def _episode_timeout(screen: Any) -> int:
+    """The configured inactivity timeout, in seconds.
+
+    Takes the screen rather than being a method on it: the row builders are
+    exercised in the tests by calling them unbound, with ``self`` as ``None``,
+    so a Tk screen need not be constructed. The timeout is settings state, not
+    screen state, so nothing is lost by reading it through a plain function
+    that copes with having no screen.
+    """
+    try:
+        # The same boundary the detector uses to end an episode, so a row
+        # cannot read Ongoing after a new episode of the same attack opened.
+        return int(screen.context.settings.get_int(
+            "detection.episode_gap_seconds", EPISODE_GAP_DEFAULT,
+        ))
+    except Exception:  # noqa: BLE001 - unbound, or settings unavailable
+        return EPISODE_GAP_DEFAULT
+
+def _episode_cells(record: Any, inactivity: int) -> dict[str, Any]:
+    """The three episode cells for a detection row.
+
+    A record with one observation shows an em dash for last-seen rather than
+    repeating its own timestamp, so the table never implies a span that was
+    not observed. A missing last-observed time shows the same dash and the
+    status reads Unknown - neither is filled in from the first timestamp.
+    """
+    episode = record.episode(inactivity_seconds=inactivity)
+    if episode.last_seen is None:
+        return {"last_seen": "\u2014", "duration": "\u2014",
+                "episode": EpisodeStatus.UNKNOWN.label}
+    return {
+        "last_seen": format_local(episode.last_seen, "%d %b %H:%M:%S"),
+        "duration": episode.duration_text,
+        "episode": episode.status.label,
+    }
 
 
 class AlertsScreen(Screen):
@@ -488,6 +1444,10 @@ class AlertsScreen(Screen):
         self._severity_var = tk.StringVar(value="All")
         self._status_var = tk.StringVar(value="All")
         self._window_var = tk.StringVar(value="Last 24 hours")
+        self._view_var = tk.StringVar(value=VIEW_EACH_DETECTION)
+        self._source_var = tk.StringVar(value=SOURCE_AETHRA)
+        #: Every detection of each attack shown, keyed by its primary row.
+        self._attack_members: dict[tuple[str, Any], list[dict[str, Any]]] = {}
         #: Bounds for the Custom range, held as real datetimes.
         self._custom_range: tuple[datetime, datetime] | None = None
         for label, variable, values, width in (
@@ -502,6 +1462,17 @@ class AlertsScreen(Screen):
             # is the Dashboard's own local-midnight boundary, so a count
             # filtered to Today here matches the Dashboard's daily figure.
             ("Period", self._window_var, list(NAMED_RANGES), 16),
+            # One attack can raise several detections - AETHRA-SEC's flood
+            # rule, Snort's flood rule, Snort's per-packet rule. "One row per
+            # attack" shows each correlated attack once; the detections stay
+            # recorded and are listed in its detail view.
+            ("View", self._view_var,
+             [VIEW_EACH_DETECTION, VIEW_ONE_PER_ATTACK], 18),
+            # The primary alerts are AETHRA-SEC's detections. Snort's alerts
+            # are evidence: a port scan alone leaves thousands of "TCP SYN
+            # (any port)" rows (3,853 stored here), which listed beside the
+            # detections read as thousands of attacks.
+            ("Source", self._source_var, [SOURCE_AETHRA, SOURCE_SNORT], 26),
         ):
             ttk.Label(row, text=label, style="CardMuted.TLabel").pack(side="left")
             box = ttk.Combobox(
@@ -513,6 +1484,11 @@ class AlertsScreen(Screen):
                 # waiting until Apply would leave the control claiming a range
                 # nobody entered.
                 box.bind("<<ComboboxSelected>>", self._on_period_selected)
+            elif variable is self._source_var:
+                box.bind("<<ComboboxSelected>>", lambda _e: self.refresh())
+            elif variable is self._view_var:
+                # Changing the view regroups what is loaded; no query.
+                box.bind("<<ComboboxSelected>>", lambda _e: self._regroup())
 
         ttk.Button(
             row, text="Apply", style="Accent.TButton", command=self.refresh
@@ -663,6 +1639,8 @@ class AlertsScreen(Screen):
         self._severity_var.set("All")
         self._status_var.set("All")
         self._window_var.set("Last 24 hours")
+        self._view_var.set(VIEW_EACH_DETECTION)
+        self._source_var.set(SOURCE_AETHRA)
         self._custom_range = None
         self.refresh()
 
@@ -676,8 +1654,21 @@ class AlertsScreen(Screen):
     # Data
     # ------------------------------------------------------------------
     def refresh(self) -> None:
-        """Reload alerts using the current filters."""
+        """Reload alerts using the current filters.
+
+        Single-flight. Every new detection from either engine calls this, and
+        each call used to start its own worker running both searches, the
+        totals and a rate query per detection, then rebuild a table of up to
+        1,000 rows on the Tk thread - so a burst of alerts queued that much
+        work once per alert. A refresh asked for while one is running now
+        sets a flag, and exactly one more load runs when it finishes, which
+        still shows the newest data.
+        """
+        if getattr(self, "_load_running", False):
+            self._load_again = True
+            return
         snort = self.context.snort
+        dashboard = self.context.dashboard
         session = self.session
         if snort is None or session is None:
             return
@@ -703,8 +1694,12 @@ class AlertsScreen(Screen):
         # Tk state, and asking a status filter means the operator is looking at
         # Snort's own workflow queue, which anomalies are not part of.
         snort_queue_only = self._status_var.get() != "All"
+        snort_view = self._source_var.get() == SOURCE_SNORT
 
-        def work() -> tuple[list[SnortAlert], list[TrafficAnomaly], dict[str, int]]:
+        def work() -> tuple[
+            list[SnortAlert], list[TrafficAnomaly], dict[str, int],
+            dict[tuple[str, int], float],
+        ]:
             """Both detection sources, plus the totals for the same filters.
 
             The rows are capped at ``ROW_LIMIT`` so the table stays responsive;
@@ -714,7 +1709,10 @@ class AlertsScreen(Screen):
             screen and the Dashboard disagreed by exactly the detections that
             did not fit on the page.
             """
-            alerts = snort.search(session, **filters)
+            # One source per view. Snort alerts are queried only for the
+            # evidence view, and the totals count only the source listed, so
+            # the summary never counts Snort alerts as AETHRA-SEC detections.
+            alerts = snort.search(session, **filters) if snort_view else []
             # The anomaly store shares severity, text and time filters but has
             # no status or priority, so only the filters that mean the same
             # thing on both sides are passed through.
@@ -723,29 +1721,59 @@ class AlertsScreen(Screen):
                 for key, value in filters.items()
                 if key in ("text", "severity", "start", "limit")
             }
-            if snort_queue_only:
+            if snort_view:
                 anomalies: list[TrafficAnomaly] = []
             else:
+                # The Snort workflow status filter has no meaning for
+                # AETHRA-SEC detections and is ignored in this view.
                 anomalies = snort.search_anomalies(session, **anomaly_filters)
 
             counted = {k: v for k, v in filters.items() if k != "limit"}
             counted_anomaly = {
                 k: v for k, v in anomaly_filters.items() if k != "limit"
             }
-            totals = snort.detection_totals(
-                session,
-                alert_filters=counted,
-                anomaly_filters=None if snort_queue_only else counted_anomaly,
-            )
-            return alerts, anomalies, totals
+            if snort_view:
+                totals = snort.snort_evidence_totals(session, counted)
+            else:
+                totals = snort.aethra_detection_totals(session, counted_anomaly)
+            # A real pps for every detection that does not store one, measured
+            # here on the worker so the Tk thread never waits on it.
+            rates = _measure_rates(dashboard, alerts, anomalies)
+            return alerts, anomalies, totals, rates
 
-        self.run_async(work, self._apply, name="alerts-load")
+        self._load_running = True
+        self._load_again = False
+
+        def finished() -> None:
+            self._load_running = False
+            if getattr(self, "_load_again", False) and self.is_alive:
+                self._load_again = False
+                self.refresh()
+
+        def applied(result: Any) -> None:
+            try:
+                self._apply(result)
+            finally:
+                finished()
+
+        def failed(message: str) -> None:
+            try:
+                self.show_error_message(message)
+            finally:
+                finished()
+
+        self.run_async(work, applied, failed, name="alerts-load")
 
     def _apply(
-        self, loaded: tuple[list[SnortAlert], list[TrafficAnomaly], dict[str, int]]
+        self,
+        loaded: tuple[
+            list[SnortAlert], list[TrafficAnomaly], dict[str, int],
+            dict[tuple[str, int], float],
+        ],
     ) -> None:
         """Render both detection sources in one table, newest first."""
-        alerts, anomalies, totals = loaded
+        alerts, anomalies, totals, rates = loaded
+        self._last_loaded = loaded
         self._alerts = {a.id: a for a in alerts if a.id is not None}
         self._anomalies = {a.id: a for a in anomalies if a.id is not None}
 
@@ -753,27 +1781,43 @@ class AlertsScreen(Screen):
         # that was loaded, and comes from the same query the Dashboard uses.
         self._summary.update_counts(_summary_cells(totals))
 
-        rows = self._alert_rows(alerts) + self._anomaly_rows(anomalies)
+        rows = self._alert_rows(alerts, rates) + self._anomaly_rows(
+            anomalies, rates
+        )
         # One ordering across both sources, so the newest detection is at the
         # top whichever engine raised it.
         rows.sort(key=lambda row: row["_sort"], reverse=True)
-        self._table.set_rows(rows)
+        detections_loaded = len(rows)
+        attacks, members = one_row_per_attack(rows)
+        self._attack_members = members
+        per_attack = self._view_var.get() == VIEW_ONE_PER_ATTACK
+        self._table.set_rows(attacks if per_attack else rows)
         # set_rows clears the selection, so the buttons follow it back down.
         self._paint_actions()
 
-        shown = len(rows)
+        shown = detections_loaded
         matching = int(totals.get("total", shown))
+        attack_note = (
+            f" · {len(attacks):,} attack(s) among the {detections_loaded:,} "
+            "loaded (correlated detections counted once)"
+        )
         # When the cap bites, say so. A table quietly showing 1,000 of 1,412
         # while the summary says 1,412 would look like a fresh inconsistency
         # rather than the row limit it is.
         truncated = matching > shown
-        self._count_label.configure(
-            text=(
-                f"{matching:,} detection(s) · {len(alerts):,} Snort · "
-                f"{len(anomalies):,} AETHRA-SEC"
+        if self._source_var.get() == SOURCE_SNORT:
+            count_text = (
+                f"{matching:,} Snort alert record(s) - supporting evidence, not "
+                "AETHRA-SEC detections"
                 + (f" · showing newest {shown:,}" if truncated else "")
             )
-        )
+        else:
+            count_text = (
+                f"{matching:,} AETHRA-SEC detection(s)"
+                + (f" · showing newest {shown:,}" if truncated else "")
+                + attack_note
+            )
+        self._count_label.configure(text=count_text)
         if not matching:
             self.status("No detections match the current filters.")
         elif truncated:
@@ -787,8 +1831,21 @@ class AlertsScreen(Screen):
                 f"{len(anomalies):,} from AETHRA-SEC's own rules."
             )
 
-    def _anomaly_rows(self, anomalies: list[TrafficAnomaly]) -> list[dict[str, Any]]:
+    def _regroup(self) -> None:
+        """Re-render what is loaded in the chosen view, without a new query."""
+        loaded = getattr(self, "_last_loaded", None)
+        if loaded is None:
+            self.refresh()
+            return
+        self._apply(loaded)
+
+    def _anomaly_rows(
+        self,
+        anomalies: list[TrafficAnomaly],
+        rates: dict[tuple[str, int], float] | None = None,
+    ) -> list[dict[str, Any]]:
         """Rows for detections raised by AETHRA-SEC's own rules."""
+        rates = rates or {}
         rows: list[dict[str, Any]] = []
         for anomaly in anomalies:
             when = anomaly.detected_at or anomaly.last_seen or anomaly.created_at
@@ -796,6 +1853,7 @@ class AlertsScreen(Screen):
                 {
                     "_id": anomaly.id,
                     "_origin": ORIGIN_AETHRA,
+                    "_attack": anomaly.incident_id,
                     "_sort": when,
                     # From the detection's own stored review state, through
                     # the one predicate the UNREVIEWED counter's SQL mirrors.
@@ -804,6 +1862,10 @@ class AlertsScreen(Screen):
                     "time": format_local(when, "%d %b %H:%M:%S") if when else "-",
                     "origin": "AETHRA-SEC",
                     "severity": str(anomaly.severity),
+                    "now": _current_band(anomaly),
+                    "rate": _measured_rate(
+                        anomaly, rates.get((ORIGIN_AETHRA, anomaly.id))
+                    ),
                     "priority": "-",
                     "signature": anomaly.rule_id,
                     "message": anomaly.title or anomaly.observation or "-",
@@ -814,7 +1876,13 @@ class AlertsScreen(Screen):
                         if anomaly.dst_port
                         else anomaly.dst_ip or "-"
                     ),
-                    "count": anomaly.event_count,
+                    # Observations in the record - never the legacy count
+                    # that started at the trigger rate (see measurement_count).
+                    "count": (
+                        measurement_count(anomaly)[0]
+                        if measurement_count(anomaly)[0] is not None else "-"
+                    ),
+                    **_episode_cells(anomaly, _episode_timeout(self)),
                     # Anomalies carry no Snort workflow status. Saying so is
                     # more honest than borrowing a status they do not have.
                     "status": "-",
@@ -823,18 +1891,35 @@ class AlertsScreen(Screen):
             )
         return rows
 
-    def _alert_rows(self, alerts: list[SnortAlert]) -> list[dict[str, Any]]:
+    def _alert_rows(
+        self,
+        alerts: list[SnortAlert],
+        rates: dict[tuple[str, int], float] | None = None,
+    ) -> list[dict[str, Any]]:
         """Rows for alerts ingested from Snort."""
+        rates = rates or {}
+        timeout = _episode_timeout(self)
         return [
                 {
                     "_id": alert.id,
                     "_origin": ORIGIN_SNORT,
+                    "_attack": alert.incident_id,
                     "_sort": alert.effective_time,
                     # See _anomaly_rows: the stored state, not an inference.
                     "review": _review_cell(alert),
                     "origin": "Snort",
                     "time": format_local(alert.effective_time, "%d %b %H:%M:%S"),
                     "severity": str(alert.severity),
+                    # The Now band is left to the flood rules. The Rate column
+                    # shows the pps this alert was graded on (peak_pps); older
+                    # alerts graded by Snort priority show the source's rate
+                    # measured from captured traffic instead.
+                    "now": "-",
+                    "rate": _format_pps(
+                        alert.peak_pps
+                        if getattr(alert, "peak_pps", None) is not None
+                        else rates.get((ORIGIN_SNORT, alert.id))
+                    ),
                     "priority": alert.priority if alert.priority is not None else "-",
                     "signature": alert.signature_text,
                     "message": alert.message or "-",
@@ -850,6 +1935,7 @@ class AlertsScreen(Screen):
                         else alert.dst_ip or "-"
                     ),
                     "count": alert.duplicate_count,
+                    **_episode_cells(alert, timeout),
                     "status": str(alert.status),
                     "evaluation": alert.evaluation.label,
                 }
@@ -865,7 +1951,8 @@ class AlertsScreen(Screen):
         self._snort_label.configure(
             text=(
                 f"{status.status_text} · transport: {status.transport} · "
-                f"{status.endpoint or 'not configured'}\n{status.detail}"
+                f"{status.endpoint or 'not configured'}"
+                f"{_source_silence_note(snort)}\n{status.detail}"
             ),
             foreground=state_colour(
                 "RUNNING" if status.is_connected else
@@ -999,7 +2086,10 @@ class AlertsScreen(Screen):
         triaged this" are different claims, and only the buttons make the
         second one.
         """
-        render = self._render_alert_detail if snort else self._render_anomaly_detail
+        if not snort:
+            self._open_anomaly_detail(detection)
+            return
+        render = self._render_alert_detail
         mitigation = self.context.mitigation
         if mitigation is None:
             # No mitigation service wired: say so rather than leaving the
@@ -1017,6 +2107,38 @@ class AlertsScreen(Screen):
             on_error=lambda message: render(
                 detection,
                 MitigationMatch(lookup_failed=True, failure_detail=message),
+            ),
+            name="detection-detail",
+        )
+
+    def _open_anomaly_detail(self, anomaly: Any) -> None:
+        """Resolve guidance and the linked Snort evidence on a worker, then render."""
+        mitigation = self.context.mitigation
+        snort = self.context.snort
+        session = self.session
+
+        def work() -> tuple[Any, Any]:
+            match = None
+            if mitigation is not None:
+                try:
+                    match = mitigation.match_for_anomaly(anomaly)
+                except Exception as exc:  # noqa: BLE001 - shown in the dialog
+                    match = MitigationMatch(lookup_failed=True, failure_detail=str(exc))
+            evidence: Any = None
+            if snort is not None and anomaly.incident_id:
+                try:
+                    evidence = snort.snort_evidence_for_attack(
+                        session, int(anomaly.incident_id)
+                    )
+                except Exception as exc:  # noqa: BLE001 - shown in the dialog
+                    evidence = exc
+            return match, evidence
+
+        self.status("Loading detection detail...")
+        self.run_async(
+            work,
+            lambda result: self._render_anomaly_detail(
+                anomaly, result[0], snort_evidence=result[1]
             ),
             name="detection-detail",
         )
@@ -1061,6 +2183,9 @@ class AlertsScreen(Screen):
         the record look more complete than it is.
         """
         latency = alert.detection_latency_seconds
+        _alert_episode = alert.episode(
+            inactivity_seconds=_episode_timeout(self)
+        )
         sections: list[DetailSection] = [
             DetailSection(
                 "ALERT INFORMATION",
@@ -1074,6 +2199,27 @@ class AlertsScreen(Screen):
                     ("Rule (GID:SID:Rev)", _rule_text(alert)),
                     ("Message", _value(alert.message, "Not supplied")),
                     ("Classification", _value(alert.classification, "Not supplied")),
+                ],
+            ),
+            DetailSection(
+                "OBSERVED EPISODE",
+                rows=[
+                    ("Occurrences", _value(alert.duplicate_count)),
+                    ("First observed", _stamp(alert.first_observed)),
+                    ("Last observed", _stamp(alert.last_observed)),
+                    ("Observed duration", _alert_episode.duration_text),
+                    ("Episode status", _alert_episode.status.label),
+                    ("What that means", _alert_episode.status.explanation),
+                    (
+                        "Note",
+                        "The duration is the span between the first and last "
+                        "observation. It does not assert that traffic was "
+                        "continuously present throughout, and a gap in "
+                        "observations is not evidence the activity stopped. "
+                        "This is not detection time (section 3.9.2), which "
+                        "needs a separately recorded attack-initiation "
+                        "timestamp.",
+                    ),
                 ],
             ),
             DetailSection(
@@ -1104,7 +2250,7 @@ class AlertsScreen(Screen):
                     ("Occurrences folded into this row", str(alert.duplicate_count)),
                 ],
             ),
-            _mitigation_section(match),
+            _mitigation_section(match, alert),
             DetailSection(
                 "WORKFLOW STATUS",
                 rows=[
@@ -1130,6 +2276,11 @@ class AlertsScreen(Screen):
                 collapsed=True,
             ),
         ]
+        related = _related_section(
+            self._attack_members.get((ORIGIN_SNORT, alert.id)), ORIGIN_SNORT, alert.id
+        )
+        if related is not None:
+            sections.insert(len(sections) - 1, related)
         actions, holder = self._mitigation_actions(match)
         dialog = DetailDialog(
             self, f"Alert {alert.id} - {alert.signature_text}",
@@ -1229,7 +2380,8 @@ class AlertsScreen(Screen):
         )
 
     def _render_anomaly_detail(
-        self, anomaly: TrafficAnomaly, match: MitigationMatch | None
+        self, anomaly: TrafficAnomaly, match: MitigationMatch | None,
+        snort_evidence: Any = None,
     ) -> None:
         """Everything stored about one AETHRA-SEC detection, plus its guidance.
 
@@ -1244,56 +2396,18 @@ class AlertsScreen(Screen):
         meant the guidance was effectively unreachable from the queue.
         """
         when = anomaly.detected_at or anomaly.last_seen or anomaly.created_at
+        _anomaly_episode = anomaly.episode(
+            inactivity_seconds=_episode_timeout(self)
+        )
         evidence = anomaly.evidence or {}
-        sections: list[DetailSection] = [
-            DetailSection(
-                "DETECTION INFORMATION",
-                rows=[
-                    ("Detection ID", _value(anomaly.id)),
-                    ("Detected", _stamp(when, precise=True)),
-                    ("Detected by", "AETHRA-SEC traffic rules"),
-                    ("Rule", _value(anomaly.rule_id)),
-                    ("Category", _value(anomaly.category)),
-                    ("Severity", _value(anomaly.severity)),
-                    (
-                        "Confidence",
-                        f"{anomaly.confidence}%" if anomaly.confidence
-                        else "Not recorded",
-                    ),
-                    ("Title", _value(anomaly.title)),
-                ],
-            ),
-            DetailSection(
-                "NETWORK DETAILS",
-                rows=[
-                    ("Protocol", _value(anomaly.protocol)),
-                    ("Source IP", _value(anomaly.src_ip)),
-                    ("Destination IP", _value(anomaly.dst_ip)),
-                    ("Destination port", _value(anomaly.dst_port)),
-                    ("Interface", _value(anomaly.interface)),
-                ],
-            ),
-            DetailSection(
-                "EVIDENCE",
-                rows=[
-                    ("Evidence source", _value(anomaly.source)),
-                    ("Observed", f"{anomaly.observed_value:g}"),
-                    ("Threshold", f"{anomaly.threshold_value:g}"),
-                    ("Window", f"{anomaly.window_seconds}s"),
-                    ("Events", _value(anomaly.event_count)),
-                    ("First seen", _stamp(anomaly.first_seen)),
-                    ("Last seen", _stamp(anomaly.last_seen)),
-                ],
-                body="\n\n".join(
-                    f"{label}\n{_value(text, 'Not recorded')}"
-                    for label, text in (
-                        ("Observation", anomaly.observation),
-                        ("Why it matters", anomaly.why_it_matters),
-                        ("What to check", anomaly.what_to_check),
-                    )
-                ),
-            ),
-            _mitigation_section(match),
+        # Built from this record alone, by a pure function, so what the dialog
+        # shows can be tested without a window and cannot pick up values from
+        # whichever detection was opened before.
+        sections: list[DetailSection] = _anomaly_detail_sections(
+            anomaly, when, _anomaly_episode
+        )
+        sections += [
+            _mitigation_section(match, anomaly),
             DetailSection(
                 "WORKFLOW STATUS",
                 rows=[
@@ -1321,6 +2435,13 @@ class AlertsScreen(Screen):
                 collapsed=True,
             ),
         ]
+        related = _related_section(
+            self._attack_members.get((ORIGIN_AETHRA, anomaly.id)),
+            ORIGIN_AETHRA, anomaly.id,
+        )
+        if related is not None:
+            sections.insert(4, related)
+        sections.insert(4, snort_evidence_section(anomaly, snort_evidence))
         actions, holder = self._mitigation_actions(match)
         dialog = DetailDialog(
             self, f"Detection {anomaly.id} - {anomaly.title}",

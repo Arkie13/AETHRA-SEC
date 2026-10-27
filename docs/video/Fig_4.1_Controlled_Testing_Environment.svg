@@ -1,0 +1,157 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080" font-family="Segoe UI, Inter, Arial, sans-serif">
+  <defs>
+    <marker id="arrow-attack" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto">
+      <path d="M0,1 L10,5.5 L0,10 z" fill="#F58A3C"/>
+    </marker>
+    <marker id="arrow-mirror" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto">
+      <path d="M0,1 L10,5.5 L0,10 z" fill="#5B8DEF"/>
+    </marker>
+    <marker id="arrow-link" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+      <path d="M0,1 L8,4.5 L0,8 z" fill="#2A3242"/>
+    </marker>
+  </defs>
+
+  <rect width="1920" height="1080" fill="#0B0E14"/>
+
+  <!-- ============================ header ============================ -->
+  <text x="96" y="92" fill="#E8ECF4" font-size="40" font-weight="700" letter-spacing="0.5">
+    Figure 4.1 — Controlled Testing Environment
+  </text>
+  <text x="96" y="130" fill="#8C97AC" font-size="23">
+    AETHRA-SEC evaluation testbed · Isabela State University – Echague · CCSICT Network Security Laboratory
+  </text>
+
+  <!-- isolation banner -->
+  <rect x="96" y="160" width="1728" height="62" rx="10" fill="#2A1E14" stroke="#F58A3C" stroke-width="1.5"/>
+  <circle cx="134" cy="191" r="9" fill="#F58A3C"/>
+  <text x="162" y="199" fill="#F58A3C" font-size="22" font-weight="700" letter-spacing="1.1">
+    ISOLATED NETWORK
+  </text>
+  <text x="446" y="199" fill="#E8ECF4" font-size="20">
+    Air-gapped from the campus network. No production hosts, no internet uplink, no third-party systems. All traffic stays on this segment.
+  </text>
+
+  <!-- ============================ topology ============================ -->
+
+  <!-- severed uplink -->
+  <g opacity="0.75">
+    <rect x="818" y="268" width="284" height="56" rx="10" fill="#11151E" stroke="#2A3242" stroke-width="1.5" stroke-dasharray="7 6"/>
+    <text x="960" y="303" fill="#5C6678" font-size="20" text-anchor="middle">Internet / campus WAN</text>
+    <line x1="960" y1="324" x2="960" y2="372" stroke="#5C6678" stroke-width="3" stroke-dasharray="8 7"/>
+    <g stroke="#F2555A" stroke-width="5" stroke-linecap="round">
+      <line x1="938" y1="330" x2="982" y2="366"/>
+      <line x1="982" y1="330" x2="938" y2="366"/>
+    </g>
+    <text x="1012" y="356" fill="#F2555A" font-size="19" font-weight="600">NOT CONNECTED</text>
+  </g>
+
+  <!-- router -->
+  <rect x="800" y="384" width="320" height="86" rx="12" fill="#161B26" stroke="#1C2230" stroke-width="1.5"/>
+  <rect x="800" y="384" width="5" height="86" rx="2.5" fill="#5C6678"/>
+  <text x="834" y="419" fill="#E8ECF4" font-size="25" font-weight="650">Router</text>
+  <text x="834" y="449" fill="#8C97AC" font-size="19">Lab gateway · DHCP · no WAN route</text>
+
+  <!-- router to switch -->
+  <line x1="960" y1="470" x2="960" y2="528" stroke="#2A3242" stroke-width="3"/>
+
+  <!-- switch -->
+  <rect x="724" y="528" width="472" height="100" rx="12" fill="#161B26" stroke="#5B8DEF" stroke-width="2"/>
+  <rect x="724" y="528" width="5" height="100" rx="2.5" fill="#5B8DEF"/>
+  <text x="760" y="567" fill="#E8ECF4" font-size="25" font-weight="650">Managed switch</text>
+  <text x="760" y="597" fill="#5B8DEF" font-size="19" font-weight="600">Port mirroring (SPAN) enabled → monitoring port</text>
+
+  <!-- switched links down to the two endpoints -->
+  <line x1="960" y1="628" x2="960" y2="666" stroke="#2A3242" stroke-width="3"/>
+  <line x1="372" y1="666" x2="960" y2="666" stroke="#2A3242" stroke-width="3"/>
+  <line x1="372" y1="666" x2="372" y2="722" stroke="#2A3242" stroke-width="3" marker-end="url(#arrow-link)"/>
+  <line x1="960" y1="666" x2="960" y2="722" stroke="#2A3242" stroke-width="3" marker-end="url(#arrow-link)"/>
+
+  <!-- the mirror leg: its own path, dashed end to end -->
+  <polyline points="1196,604 1548,604 1548,722" fill="none" stroke="#5B8DEF"
+            stroke-width="3" stroke-dasharray="9 7" marker-end="url(#arrow-mirror)"/>
+
+  <!-- attacker machine -->
+  <rect x="176" y="722" width="392" height="168" rx="14" fill="#161B26" stroke="#F58A3C" stroke-width="2"/>
+  <rect x="176" y="722" width="5" height="168" rx="2.5" fill="#F58A3C"/>
+  <text x="212" y="764" fill="#E8ECF4" font-size="26" font-weight="650">Attacker machine</text>
+  <text x="212" y="797" fill="#F58A3C" font-size="19" font-weight="600">Authorised test-traffic generator</text>
+  <text x="212" y="828" fill="#8C97AC" font-size="18">Generates the five test scenarios</text>
+  <text x="212" y="856" fill="#8C97AC" font-size="18">Scripted, rate-controlled, repeatable</text>
+  <text x="212" y="879" fill="#5C6678" font-size="17">No exploitation — traffic patterns only</text>
+
+  <!-- target device -->
+  <rect x="764" y="722" width="392" height="168" rx="14" fill="#161B26" stroke="#1C2230" stroke-width="2"/>
+  <rect x="764" y="722" width="5" height="168" rx="2.5" fill="#8C97AC"/>
+  <text x="800" y="764" fill="#E8ECF4" font-size="26" font-weight="650">Target device</text>
+  <text x="800" y="797" fill="#8C97AC" font-size="19">Victim host under test</text>
+  <text x="800" y="828" fill="#8C97AC" font-size="18">Receives the scenario traffic</text>
+  <text x="800" y="856" fill="#8C97AC" font-size="18">Same state at the start of each run</text>
+  <text x="800" y="879" fill="#5C6678" font-size="17">Lab-owned hardware, no user data</text>
+
+  <!-- monitoring server -->
+  <rect x="1352" y="722" width="392" height="168" rx="14" fill="#161B26" stroke="#5B8DEF" stroke-width="2"/>
+  <rect x="1352" y="722" width="5" height="168" rx="2.5" fill="#5B8DEF"/>
+  <text x="1388" y="764" fill="#E8ECF4" font-size="26" font-weight="650">Monitoring server</text>
+  <text x="1388" y="797" fill="#5B8DEF" font-size="19" font-weight="600">AETHRA-SEC console</text>
+  <text x="1388" y="828" fill="#8C97AC" font-size="18">PyShark / TShark · Snort IDS · Nmap</text>
+  <text x="1388" y="856" fill="#8C97AC" font-size="18">MariaDB evidence store</text>
+  <text x="1388" y="879" fill="#5C6678" font-size="17">Receives a mirrored copy — never injects</text>
+
+  <!-- attack traffic path, attacker -> target -->
+  <path d="M568,806 L752,806" stroke="#F58A3C" stroke-width="3.5" fill="none" marker-end="url(#arrow-attack)"/>
+  <rect x="566" y="754" width="190" height="34" rx="8" fill="#0B0E14"/>
+  <text x="661" y="778" fill="#F58A3C" font-size="18" font-weight="600" text-anchor="middle">test traffic</text>
+
+  <!-- mirrored copy label -->
+  <text x="1216" y="592" fill="#5B8DEF" font-size="18" font-weight="600">mirrored copy — read-only</text>
+
+  <!-- ============================ scenarios ============================ -->
+  <text x="96" y="954" fill="#8C97AC" font-size="19" font-weight="700" letter-spacing="1.3">
+    TEST SCENARIOS — EACH EXECUTED 5–10 TIMES UNDER IDENTICAL CONDITIONS
+  </text>
+
+  <g font-size="19">
+    <rect x="96" y="972" width="330" height="72" rx="10" fill="#11151E" stroke="#1C2230"/>
+    <text x="120" y="1001" fill="#E8ECF4" font-weight="600">Port scanning</text>
+    <text x="120" y="1028" fill="#8C97AC" font-size="17">distinct-port threshold</text>
+
+    <rect x="442" y="972" width="330" height="72" rx="10" fill="#11151E" stroke="#1C2230"/>
+    <text x="466" y="1001" fill="#E8ECF4" font-weight="600">TCP SYN flood</text>
+    <text x="466" y="1028" fill="#8C97AC" font-size="17">200 SYN/s threshold</text>
+
+    <rect x="788" y="972" width="330" height="72" rx="10" fill="#11151E" stroke="#1C2230"/>
+    <text x="812" y="1001" fill="#E8ECF4" font-weight="600">UDP flood</text>
+    <text x="812" y="1028" fill="#8C97AC" font-size="17">300 packets/s threshold</text>
+
+    <rect x="1134" y="972" width="330" height="72" rx="10" fill="#11151E" stroke="#1C2230"/>
+    <text x="1158" y="1001" fill="#E8ECF4" font-weight="600">ICMP flood</text>
+    <text x="1158" y="1028" fill="#8C97AC" font-size="17">120 packets/s threshold</text>
+
+    <rect x="1480" y="972" width="344" height="72" rx="10" fill="#11151E" stroke="#1C2230"/>
+    <text x="1504" y="1001" fill="#E8ECF4" font-weight="600">Abnormal HTTP volume</text>
+    <text x="1504" y="1028" fill="#8C97AC" font-size="17">10 requests/s threshold</text>
+  </g>
+
+  <!-- legend -->
+  <g transform="translate(1352,384)">
+    <rect x="0" y="0" width="392" height="194" rx="12" fill="#11151E" stroke="#1C2230" stroke-width="1.5"/>
+    <text x="28" y="40" fill="#8C97AC" font-size="17" font-weight="700" letter-spacing="1.2">LEGEND</text>
+    <line x1="28" y1="72" x2="88" y2="72" stroke="#2A3242" stroke-width="3"/>
+    <text x="104" y="79" fill="#8C97AC" font-size="18">Switched link</text>
+    <line x1="28" y1="112" x2="88" y2="112" stroke="#F58A3C" stroke-width="3.5"/>
+    <text x="104" y="119" fill="#8C97AC" font-size="18">Authorised test traffic</text>
+    <line x1="28" y1="152" x2="88" y2="152" stroke="#5B8DEF" stroke-width="3" stroke-dasharray="9 7"/>
+    <text x="104" y="159" fill="#8C97AC" font-size="18">Mirrored copy to monitor</text>
+  </g>
+
+  <!-- why mirroring note -->
+  <g transform="translate(176,384)">
+    <rect x="0" y="0" width="548" height="194" rx="12" fill="#131D30" stroke="#1A2942" stroke-width="1.5"/>
+    <text x="28" y="40" fill="#5B8DEF" font-size="17" font-weight="700" letter-spacing="1.2">WHY PORT MIRRORING</text>
+    <text x="28" y="76" fill="#E8ECF4" font-size="18">A switch forwards a frame only to its destination port,</text>
+    <text x="28" y="103" fill="#E8ECF4" font-size="18">so a passive monitor on an ordinary port sees none of</text>
+    <text x="28" y="130" fill="#E8ECF4" font-size="18">the attacker-to-target traffic. Mirroring copies both</text>
+    <text x="28" y="157" fill="#E8ECF4" font-size="18">directions to the monitoring port, which is what makes</text>
+    <text x="28" y="184" fill="#E8ECF4" font-size="18">detection measurable rather than incidental.</text>
+  </g>
+</svg>

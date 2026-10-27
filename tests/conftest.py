@@ -135,6 +135,10 @@ def _drop_all(manager: DatabaseManager) -> None:
 #: user account, so every account in the test schema was created by a test.
 PER_TEST_TABLES = (
     "incident_events", "incident_notes", "incidents", "snort_alerts",
+    # Before traffic_anomalies: it is the child side of that foreign key, and
+    # listing it first keeps the order meaningful even though the truncation
+    # runs with FOREIGN_KEY_CHECKS off.
+    "anomaly_severity_transitions",
     "traffic_anomalies", "scan_findings", "ports", "scan_hosts", "scans",
     "traffic_records", "traffic_aggregates", "host_observations",
     "trusted_hosts", "hosts", "notification_reads", "notifications",

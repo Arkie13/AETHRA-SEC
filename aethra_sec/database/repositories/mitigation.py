@@ -27,7 +27,9 @@ _FILTERABLE = {
 _SELECT = (
     "SELECT id, code, threat_name, category, severity, applies_to_service, "
     "detection_source, explanation, why_it_matters, immediate_action, "
-    "long_term_action, verification_steps, reference_notes, is_active, "
+    "long_term_action, verification_steps, reference_notes, "
+    "enforcement_point, procedure_steps, rollback_steps, "
+    "operational_warnings, is_active, "
     "is_builtin, created_by, updated_by, created_at, updated_at "
     "FROM mitigation_recommendations"
 )
@@ -60,6 +62,10 @@ class MitigationRepository(Repository):
             long_term_action=as_text(row.get("long_term_action")),
             verification_steps=as_text(row.get("verification_steps")),
             references=as_text(row.get("reference_notes")),
+            enforcement_point=as_text(row.get("enforcement_point")),
+            procedure_steps=as_text(row.get("procedure_steps")),
+            rollback_steps=as_text(row.get("rollback_steps")),
+            operational_warnings=as_text(row.get("operational_warnings")),
             is_active=as_bool(row.get("is_active")),
             is_builtin=as_bool(row.get("is_builtin")),
             created_by=as_int(row.get("created_by")),
@@ -132,7 +138,8 @@ class MitigationRepository(Repository):
             "SELECT m.id, m.code, m.threat_name, m.category, m.severity, "
             "m.applies_to_service, m.detection_source, m.explanation, "
             "m.why_it_matters, m.immediate_action, m.long_term_action, "
-            "m.verification_steps, m.reference_notes, m.is_active, "
+            "m.verification_steps, m.reference_notes, m.enforcement_point, "
+            "m.procedure_steps, m.rollback_steps, m.operational_warnings, m.is_active, "
             "m.is_builtin, m.created_by, m.updated_by, m.created_at, "
             "m.updated_at FROM mitigation_recommendations m "
             "JOIN threat_mitigation_mapping tm ON tm.recommendation_id = m.id "

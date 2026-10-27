@@ -583,6 +583,19 @@ class AlertFileTransport(AlertTransport):
             return
         self._emit(alert)
 
+    def source_age_seconds(self) -> float | None:
+        """Seconds since the alert file was last written, or None if unknown.
+
+        This is the sensor's pulse as seen from here. The transport cannot
+        tell whether Snort is alive, but it can tell whether anything has
+        arrived in the file it is tailing, and a long silence is worth
+        showing rather than reporting as a healthy connection.
+        """
+        try:
+            return max(0.0, time.time() - self._path.stat().st_mtime)
+        except OSError:
+            return None
+
     def _check_rotation(self) -> None:
         """Reopen the file if Snort rotated or truncated it."""
         handle = self._handle

@@ -15,6 +15,17 @@ from aethra_sec.models.enums import (
 )
 
 
+def without_correlation_key(message: str | None) -> str:
+    """A stored notification message as an operator should read it.
+
+    A service that deduplicates its alerts stores the key it correlates on
+    after an invisible marker. It is an implementation detail of the
+    deduplication and has no business on an operator's screen, so every
+    surface that displays a notification message goes through here.
+    """
+    return str(message or "").split("⁣", 1)[0].rstrip()
+
+
 @dataclass
 class SystemSetting:
     """One administrator-tunable setting persisted in ``system_settings``."""
@@ -134,16 +145,18 @@ class Notification:
     is_read: bool = False
     created_at: datetime | None = None
     read_at: datetime | None = None
+    #: The detection's own severity (HIGH / MEDIUM / LOW) for a notification
+    #: about an alert. Distinct from ``level``, which is the notification's
+    #: urgency and drives the sound threshold - HIGH maps to level ERROR, and
+    #: showing that level as if it were the severity is what put "ERROR" on
+    #: the popup. In memory only: carried to the popup on the event; empty for
+    #: notifications that are not about a detection.
+    severity: str = ""
 
     @property
     def display_message(self) -> str:
-        """The message with any correlation key removed.
-
-        A service that deduplicates its alerts stores the key it correlates on
-        after an invisible marker. It is an implementation detail of the
-        deduplication and has no business on an operator's screen.
-        """
-        return str(self.message or "").split("⁣", 1)[0].rstrip()
+        """The message with any correlation key removed."""
+        return without_correlation_key(self.message)
 
 
 @dataclass
@@ -199,6 +212,12 @@ class DashboardSnapshot:
 
     ``has_any_data`` drives the first-run empty state: on a clean installation
     every counter is genuinely zero and the UI says so (§72).
+
+    ``unreadable`` is what keeps that honest. Every counter here defaults to
+    zero, so a failed query would otherwise be indistinguishable from a quiet
+    network - the one mistake a security console must never make. Any figure
+    whose query raised is named in ``unreadable`` and the screen reports it
+    rather than showing a zero it did not observe.
     """
 
     generated_at: datetime
@@ -272,9 +291,27 @@ class DashboardSnapshot:
     recent_activity: tuple[Any, ...] = ()
     threat_timeline: tuple[dict[str, Any], ...] = ()
 
+    #: Names of the figures whose query failed while this snapshot was built.
+    #: Empty on a healthy build. A name here means the matching field holds
+    #: its default and was never observed, so it must not be read as a
+    #: measurement.
+    unreadable: tuple[str, ...] = ()
+
+    @property
+    def is_complete(self) -> bool:
+        """True when every figure on this snapshot was actually read."""
+        return not self.unreadable
+
     @property
     def has_any_data(self) -> bool:
-        """True once any real security or traffic record exists."""
+        """True once any real security or traffic record exists.
+
+        A snapshot with unreadable figures never reports "no data": the
+        counters are zero because the queries failed, which is not the same
+        as a clean installation.
+        """
+        if self.unreadable:
+            return True
         return bool(
             self.total_packets_stored
             or self.ids_alerts_total

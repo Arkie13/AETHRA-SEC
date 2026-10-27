@@ -285,10 +285,16 @@ class MitigationPanel(ScrollableFrame):
 
         self._render_header(entry)
         self._section("Why this matters", entry.why_it_matters)
+        self._section("Where to make the change",
+                      getattr(entry, "enforcement_point", ""))
         self._render_actions(entry)
+        self._render_procedure(entry)
+        self._section("Operational risks and warnings",
+                      getattr(entry, "operational_warnings", ""))
         self._render_evidence(self._incidents)
         self._render_firewall(build_firewall_proposal(self._incidents))
         self._render_verification(entry)
+        self._render_rollback(entry)
         # Widths are only real after layout runs, so wrap on the next idle.
         self.after_idle(self._reflow)
         self._section("Long-term action", entry.long_term_action)
@@ -396,6 +402,51 @@ class MitigationPanel(ScrollableFrame):
                 row, text=step, style="Card.TLabel", wraplength=520,
                 justify="left",
             ).pack(side="left", fill="x", expand=True)
+
+    def _render_numbered(self, title: str, text: str, note: str = "") -> None:
+        """Stored steps, in the order they are stored, or nothing at all.
+
+        An empty field renders no heading. A procedure that does not exist
+        must not leave a heading implying one does.
+        """
+        steps = _split_steps(text)
+        if not steps:
+            return
+        self._heading(title)
+        if note:
+            ttk.Label(
+                self.interior, text=note, style="CardMuted.TLabel",
+                wraplength=560, justify="left",
+            ).pack(anchor="w", pady=(0, METRICS.space_xs))
+        for index, step in enumerate(steps, start=1):
+            row = ttk.Frame(self.interior, style="Card.TFrame")
+            row.pack(fill="x", pady=2)
+            ttk.Label(
+                row, text=f"{index:02d}", style="CardTitle.TLabel",
+                foreground=PALETTE.accent, width=4, anchor="w",
+            ).pack(side="left")
+            ttk.Label(
+                row, text=step, style="Card.TLabel", wraplength=520,
+                justify="left",
+            ).pack(side="left", fill="x", expand=True)
+
+    def _render_procedure(self, entry: Any) -> None:
+        """The full procedure, which the operator carries out themselves."""
+        self._render_numbered(
+            "Step-by-step procedure",
+            getattr(entry, "procedure_steps", ""),
+            note=(
+                "AETHRA-SEC does not carry these out. Read them, decide, and "
+                "run them yourself on a host you are authorised to change."
+            ),
+        )
+
+    def _render_rollback(self, entry: Any) -> None:
+        """How to undo the change, kept with the change that needs undoing."""
+        self._render_numbered(
+            "How to undo this change",
+            getattr(entry, "rollback_steps", ""),
+        )
 
     def _render_evidence(self, incidents: list[Any]) -> None:
         """Real stored evidence, or an honest statement that there is none."""

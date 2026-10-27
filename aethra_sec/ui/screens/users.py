@@ -36,6 +36,10 @@ from aethra_sec.ui.widgets import (
 from aethra_sec.utils.timeutil import format_local
 
 USER_COLUMNS = (
+    # The real users.id primary key, not a row number: an administrator
+    # reading an audit entry or a support request needs the identifier the
+    # rest of the system uses, and until now the screen never showed it.
+    Column("id", "ID", width=56, anchor="e"),
     Column("username", "Username", width=140),
     Column("full_name", "Full name", width=180),
     Column("email", "Email", width=210),
@@ -45,6 +49,11 @@ USER_COLUMNS = (
     Column("last_login", "Last sign-in", width=155),
     Column("last_host", "Last host", width=140),
     Column("created", "Created", width=145),
+    # When an administrator last edited the account. Read from the stored
+    # column and never computed here: an account nobody has edited shows a
+    # dash, because repeating the created date would assert an edit that
+    # never took place.
+    Column("date_modified", "Date Modified", width=145),
 )
 
 ATTEMPT_COLUMNS = (
@@ -286,6 +295,7 @@ class UsersScreen(Screen):
             [
                 {
                     "_id": user.id,
+                    "id": user.id,
                     "username": user.username,
                     "full_name": user.full_name or "-",
                     "email": user.email or "-",
@@ -295,6 +305,10 @@ class UsersScreen(Screen):
                     "last_login": format_local(user.last_login_at),
                     "last_host": user.last_login_host or "-",
                     "created": format_local(user.created_at, "%d %b %Y"),
+                    # The stored value, or a dash. format_local already
+                    # renders None as a dash, so a never-edited account is
+                    # not given a date it never earned.
+                    "date_modified": format_local(user.date_modified),
                 }
                 for user in user_list
             ]

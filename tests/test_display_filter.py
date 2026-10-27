@@ -301,16 +301,19 @@ class TestSafety:
 
 class TestPresetsAndComposition:
     def test_every_required_preset_exists(self) -> None:
-        assert {p.key for p in PROTOCOL_PRESETS} == {"HTTP", "HTTPS", "WEB", "SITES", "TCP", "UDP", "ICMP", "DNS", "ARP"}
+        assert {p.key for p in PROTOCOL_PRESETS} == {"HTTP", "HTTPS", "SITES", "TCP", "UDP", "ICMP", "DNS", "ARP"}
         assert {p.key for p in DIRECTION_PRESETS} == {"INCOMING", "OUTGOING", "TRANSIT"}
 
     def test_every_preset_compiles(self) -> None:
         for preset in PROTOCOL_PRESETS + DIRECTION_PRESETS:
             compile_filter(preset.expression)
 
-    def test_web_is_http_plus_tls(self) -> None:
-        web = compose_filter(FilterRequest(protocol="WEB"))
-        assert {n for n, p in PACKETS.items() if web.compiled.matches(p)} == matching("http") | matching("tls")
+    def test_the_web_view_is_gone(self) -> None:
+        """Removed: it was exactly HTTP or HTTPS/TLS, both still on the bar."""
+        from aethra_sec.analytics.display_filter import FilterSyntaxError
+
+        with pytest.raises(FilterSyntaxError):
+            compose_filter(FilterRequest(protocol="WEB"))
 
     def test_http_and_incoming_combine(self) -> None:
         composed = compose_filter(FilterRequest(protocol="HTTP", direction="INCOMING"))
@@ -320,8 +323,9 @@ class TestPresetsAndComposition:
         assert {n for n, p in PACKETS.items() if composed.compiled.matches(p)} == {"http_response"}
 
     def test_a_disjunctive_preset_is_parenthesised_when_combined(self) -> None:
-        composed = compose_filter(FilterRequest(protocol="WEB", direction="OUTGOING"))
-        assert composed.expression == "(http || tls) && direction == outgoing"
+        """Without the brackets the && would bind tighter than the ||."""
+        composed = compose_filter(FilterRequest(protocol="ICMP", direction="OUTGOING"))
+        assert composed.expression == "(icmp || icmpv6) && direction == outgoing"
 
     @pytest.mark.parametrize(
         ("scope", "expected"),
@@ -363,7 +367,7 @@ class TestPresetsAndComposition:
 
     def test_the_https_views_are_marked_encrypted(self) -> None:
         assert compose_filter(FilterRequest(protocol="HTTPS")).encrypted
-        assert compose_filter(FilterRequest(protocol="WEB")).encrypted
+        assert compose_filter(FilterRequest(protocol="SITES")).encrypted
         assert compose_filter(FilterRequest(expression="tls.handshake.type == 1")).encrypted
         assert not compose_filter(FilterRequest(protocol="HTTP")).encrypted
 
@@ -401,10 +405,9 @@ class TestTlsSegmentsTheTlsDissectorHandled:
         assert compiled.matches(self.segment("TLSv1.2", 1466))
         assert compiled.matches(self.segment("TLSv1.3", 1466))
 
-    def test_it_is_also_counted_as_https_and_web(self) -> None:
+    def test_it_is_also_counted_as_https(self) -> None:
         packet = self.segment("SSL", 55)
         assert compose_filter(FilterRequest(protocol="HTTPS")).compiled.matches(packet)
-        assert compose_filter(FilterRequest(protocol="WEB")).compiled.matches(packet)
         assert packet.is_tls
 
     def test_dtls_and_plain_tcp_to_443_are_not_tls(self) -> None:
@@ -436,10 +439,9 @@ class TestTlsTheDnsDissectorParsed:
         assert not compile_filter("ssl").matches(packet)
         assert not packet.is_tls
 
-    def test_it_is_in_neither_the_https_nor_the_web_view(self) -> None:
+    def test_it_is_not_in_the_https_view(self) -> None:
         packet = self.answer()
         assert not compose_filter(FilterRequest(protocol="HTTPS")).compiled.matches(packet)
-        assert not compose_filter(FilterRequest(protocol="WEB")).compiled.matches(packet)
 
     def test_the_protocol_statistics_do_not_count_it_as_tls(self) -> None:
         packet = self.answer()

@@ -144,6 +144,40 @@ _CATEGORY_KEYWORDS: tuple[tuple[ThreatCategory, tuple[str, ...]], ...] = (
 )
 
 
+#: Categories whose incidents are keyed source -> destination with no port.
+_FLOOD_CATEGORIES: frozenset[ThreatCategory] = frozenset({
+    ThreatCategory.TCP_SYN_FLOOD,
+    ThreatCategory.UDP_FLOOD,
+    ThreatCategory.ICMP_FLOOD,
+    ThreatCategory.HTTP_FLOOD,
+})
+
+#: Categories grouped by episode activity rather than the flat window. A port
+#: scan is one episode per scanning SOURCE (see _correlation_key).
+_EPISODE_CATEGORIES: frozenset[ThreatCategory] = _FLOOD_CATEGORIES | {
+    ThreatCategory.PORT_SCAN,
+}
+
+#: Flood incidents a generic Snort alert on each protocol may belong to.
+_GENERIC_ALERT_FLOODS: dict[str, tuple[ThreatCategory, ...]] = {
+    "ICMP": (ThreatCategory.ICMP_FLOOD,),
+    "UDP": (ThreatCategory.UDP_FLOOD,),
+    # A SYN to one port is evidence of a SYN flood on that pair, or of a
+    # port scan from that source - the exact pair is tried first.
+    "TCP": (ThreatCategory.TCP_SYN_FLOOD, ThreatCategory.HTTP_FLOOD,
+            ThreatCategory.PORT_SCAN),
+}
+
+#: How long a generic Snort alert waits for a flood incident to claim it
+#: before it is filed on its own. Snort's per-packet rules fire on the first
+#: packet; AETHRA-SEC's flood rule needs its 5 s window to fill first.
+FLOOD_GRACE_SECONDS = 30
+
+#: Pending generic Snort alerts from one source in one correlation cycle that
+#: mark a burst (a scan's per-port probes). Below it an alert is filed at once.
+BURST_ALERTS = 5
+
+
 @dataclass
 class CorrelationStatistics:
     """Real counters for the System Health screen."""
@@ -280,11 +314,35 @@ class CorrelationService:
         processed = 0
 
         try:
-            for alert in self._alerts.uncorrelated_alerts(since, limit=500):
-                if self._correlate_alert(alert, window):
-                    processed += 1
+            # Detections first, then Snort alerts, so a flood detected by
+            # AETHRA-SEC in this cycle already has its incident when the Snort
+            # alerts for the same traffic look for one. In the old order the
+            # Snort "ICMP echo request" alert of the 15 Oct 2026 21:01 ping
+            # flood opened incident 1875 30 ms before the flood's incident 1874.
             for anomaly in self._alerts.uncorrelated_anomalies(since, limit=500):
                 if self._correlate_anomaly(anomaly, window):
+                    processed += 1
+            pending_alerts = self._alerts.uncorrelated_alerts(since, limit=500)
+            # Sources with many pending alerts this cycle: a scan's per-port
+            # Snort rows are each seen once, so "repeating" alone never held
+            # them for the scan's attack to claim.
+            # Only Snort's per-packet observation rules (deployed rule set,
+            # matched by generator/signature/revision) can be probes of an
+            # AETHRA-SEC scan or flood; any other burst is filed at once.
+            from aethra_sec.analytics.attack_categories import snort_signature
+
+            per_source: dict[str, int] = {}
+            for alert in pending_alerts:
+                meaning = snort_signature(
+                    alert.generator_id, alert.signature_id, alert.revision
+                )
+                if meaning is not None and not meaning.is_attack_rule:
+                    per_source[alert.src_ip] = per_source.get(alert.src_ip, 0) + 1
+            self._burst_sources = {
+                src for src, count in per_source.items() if count >= BURST_ALERTS
+            }
+            for alert in pending_alerts:
+                if self._correlate_alert(alert, window):
                     processed += 1
         except Exception:  # noqa: BLE001 - correlation must never break the app
             with self._lock:
@@ -301,20 +359,44 @@ class CorrelationService:
             return False
         category = categorise_alert(alert)
         service = self._service_for(alert.dst_ip, alert.dst_port, alert.protocol)
-        key = self._correlation_key(category, alert.src_ip, alert.dst_ip, alert.dst_port)
 
-        incident = self._find_or_create(
-            key=key,
-            category=category,
-            src_ip=alert.src_ip,
-            dst_ip=alert.dst_ip,
-            dst_port=alert.dst_port,
-            protocol=alert.protocol,
-            service=service,
-            occurred_at=alert.effective_time or utcnow(),
-            title=self._title_for(category, alert.src_ip, alert.dst_ip, alert.message),
-            window=window,
-        )
+        # A generic Snort alert - "ICMP echo request", "TCP SYN (any port)" -
+        # that fires on the same source -> destination traffic as an open
+        # flood incident is evidence OF that flood, not a separate attack.
+        # Filed on its own it opened a second, "Unclassified", incident for
+        # every ping flood. The alert itself is kept unchanged and linked as
+        # an event; only the incident it belongs to is decided here.
+        incident = self._open_flood_incident(alert, category, window)
+        flood_alert = category in _EPISODE_CATEGORIES
+        if incident is None and flood_alert:
+            incident = self._incidents.find_open_episode(
+                self._correlation_key(category, alert.src_ip, alert.dst_ip, None),
+                alert.effective_time or utcnow(), self._episode_gap(),
+                exclude_alert_dedup=alert.dedup_key or None,
+            )
+        if incident is None and self._should_wait_for_flood(alert, category):
+            # Not yet: the flood rule may not have fired for this traffic.
+            # Left uncorrelated, it is offered again on the next cycle.
+            return False
+        if incident is None:
+            key = self._correlation_key(
+                category, alert.src_ip, alert.dst_ip, alert.dst_port
+            )
+            incident = self._find_or_create(
+                match=not flood_alert,
+                key=key,
+                category=category,
+                src_ip=alert.src_ip,
+                dst_ip=alert.dst_ip,
+                dst_port=alert.dst_port,
+                protocol=alert.protocol,
+                service=service,
+                occurred_at=alert.effective_time or utcnow(),
+                title=self._title_for(
+                    category, alert.src_ip, alert.dst_ip, alert.message
+                ),
+                window=window,
+            )
         if incident is None or incident.id is None:
             return False
 
@@ -349,7 +431,23 @@ class CorrelationService:
             anomaly.category, anomaly.src_ip, anomaly.dst_ip, anomaly.dst_port
         )
 
-        incident = self._find_or_create(
+        episode_match = None
+        if anomaly.category in _EPISODE_CATEGORIES:
+            # One flood run is one attack. Matched on activity, not on a
+            # flat window: see IncidentRepository.find_open_episode.
+            at = (anomaly.first_seen or utcnow()) + timedelta(
+                seconds=max(0, int(anomaly.window_seconds or 0))
+            )
+            episode_match = self._incidents.find_open_episode(
+                key, at, self._episode_gap(),
+                exclude_anomaly=(
+                    anomaly.rule_id, anomaly.src_ip,
+                    None if anomaly.category is ThreatCategory.PORT_SCAN
+                    else anomaly.dst_ip,
+                ),
+            )
+        incident = episode_match or self._find_or_create(
+            match=anomaly.category not in _EPISODE_CATEGORIES,
             key=key,
             category=anomaly.category,
             src_ip=anomaly.src_ip,
@@ -389,6 +487,65 @@ class CorrelationService:
         self._refresh(incident)
         return True
 
+    def _open_flood_incident(
+        self, alert: SnortAlert, category: ThreatCategory, window: int
+    ) -> Incident | None:
+        """The open flood incident this generic alert's traffic belongs to.
+
+        Matched on protocol, source and destination - all three - inside the
+        correlation window, through the same key the flood incident was filed
+        under. Different sources, targets or protocols never meet here.
+        """
+        if category in _EPISODE_CATEGORIES:
+            return None
+        candidates = _GENERIC_ALERT_FLOODS.get((alert.protocol or "").upper(), ())
+        if not candidates or not alert.src_ip or not alert.dst_ip:
+            return None
+        at = alert.effective_time or utcnow()
+        for flood in candidates:
+            key = self._correlation_key(flood, alert.src_ip, alert.dst_ip, None)
+            found = self._incidents.find_open_episode(
+                key, at, self._episode_gap(),
+                exclude_alert_dedup=alert.dedup_key or None,
+            )
+            if found is not None and found.id is not None:
+                with self._lock:
+                    self.statistics.incidents_updated += 1
+                return found
+        return None
+
+    def _episode_gap(self) -> int:
+        """``detection.episode_gap_seconds`` - the one episode boundary."""
+        return max(1, self._settings.get_int("detection.episode_gap_seconds", 15))
+
+    def _should_wait_for_flood(
+        self, alert: SnortAlert, category: ThreatCategory
+    ) -> bool:
+        """True while a generic alert is young enough for a flood to claim it.
+
+        Only an alert that is already REPEATING waits: a per-packet rule
+        fired by a flood has folded many repeats by the first correlation
+        cycle (8,475 for the 21:01 ping flood). A single alert - one ping, one
+        SSH connection - is filed at once, exactly as before.
+        """
+        if category in _EPISODE_CATEGORIES:
+            return False
+        repeating = int(getattr(alert, "duplicate_count", 1) or 1) > 1
+        in_burst = alert.src_ip in getattr(self, "_burst_sources", set())
+        if not repeating and not in_burst:
+            return False
+        if (alert.protocol or "").upper() not in _GENERIC_ALERT_FLOODS:
+            return False
+        moment = alert.effective_time
+        if moment is None:
+            return False
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=utcnow().tzinfo)
+        grace = self._settings.get_int(
+            "correlation.flood_grace_seconds", FLOOD_GRACE_SECONDS
+        )
+        return (utcnow() - moment).total_seconds() < max(0, grace)
+
     # ------------------------------------------------------------------
     # Incident lifecycle
     # ------------------------------------------------------------------
@@ -402,8 +559,12 @@ class CorrelationService:
         port varies within one flood; scan and sweep categories group by source
         and destination host, since the varying ports *are* the pattern.
         """
+        if category is ThreatCategory.PORT_SCAN:
+            # One scanner probing many hosts is one scan. Keyed per target it
+            # left one attack per host reached (603 stored port-scan rows).
+            # Which run of it is decided by episode activity, not this key.
+            return f"{category}|{src_ip}"
         if category in (
-            ThreatCategory.PORT_SCAN,
             ThreatCategory.HOST_SWEEP,
             ThreatCategory.RECONNAISSANCE,
         ):
@@ -449,6 +610,7 @@ class CorrelationService:
     def _find_or_create(
         self,
         *,
+        match: bool = True,
         key: str,
         category: ThreatCategory,
         src_ip: str,
@@ -460,11 +622,15 @@ class CorrelationService:
         title: str,
         window: int,
     ) -> Incident | None:
-        """Return the incident this evidence belongs to, creating it if needed."""
+        """Return the incident this evidence belongs to, creating it if needed.
+
+        ``match=False`` only creates: flood evidence has already been matched
+        by episode activity, and finding nothing there means a new attack.
+        """
         include_resolved = self._settings.get_bool("correlation.reopen_resolved", False)
         existing = self._incidents.find_open_by_correlation_key(
             key, utcnow() - timedelta(seconds=window), include_resolved
-        )
+        ) if match else None
         if existing is not None:
             with self._lock:
                 self.statistics.incidents_updated += 1

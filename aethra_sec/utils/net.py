@@ -7,7 +7,10 @@ import os
 import shutil
 import socket
 import subprocess
+import threading
+import time
 from collections.abc import Sequence
+from functools import lru_cache
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -66,6 +69,69 @@ class NetworkInterface:
         return " ".join(parts)
 
 
+#: How long one reading of the machine's adapters is reused.
+#:
+#: ``psutil.net_if_addrs()`` is ``GetAdaptersAddresses`` behind a C extension
+#: that does not release the GIL, and it measures 41 ms mean / 77 ms worst on
+#: the development machine - ``net_if_stats()`` another 59 ms. While either
+#: runs, no thread in the process can execute Python, the Tk thread included.
+#:
+#: That mattered because the adapters were re-read per host: one
+#: ``AssessmentQueueService.statistics()`` over a 2,156-row inventory made 737
+#: enumerations in 60 s, 32.95 s of wall time, and froze the interface for
+#: 17.7 s of every minute. Reading them once and reusing the answer for a few
+#: seconds removes the stall without changing any answer, because an adapter
+#: list does not change between two hosts of the same loop.
+#:
+#: Deliberately short, and well inside ``SCOPE_CACHE_SECONDS``: the interfaces
+#: are still read live, so moving the machine to a different network is still
+#: picked up - within this window rather than instantly. Call
+#: :func:`invalidate_adapter_cache` where an immediate re-read is wanted.
+ADAPTER_CACHE_SECONDS = 10.0
+
+_adapter_lock = threading.Lock()
+_adapter_snapshot: tuple[float, dict, dict] | None = None
+
+
+def invalidate_adapter_cache() -> None:
+    """Force the next adapter read to go to the operating system."""
+    global _adapter_snapshot
+    with _adapter_lock:
+        _adapter_snapshot = None
+
+
+def adapter_tables(*, max_age: float | None = None) -> tuple[dict, dict]:
+    """The machine's adapter address and status tables, briefly cached.
+
+    Returns:
+        ``(addresses, stats)`` exactly as psutil reports them, or two empty
+        dicts when psutil is unavailable or reported nothing - callers surface
+        that condition rather than substituting placeholders.
+    """
+    global _adapter_snapshot
+    try:
+        import psutil
+    except ImportError:
+        return {}, {}
+
+    limit = ADAPTER_CACHE_SECONDS if max_age is None else max_age
+    now = time.monotonic()
+    # Held across the read, so two workers arriving together make one call
+    # instead of two. The second waits on the lock and then finds the fresh
+    # snapshot, which is cheaper than paying the enumeration again.
+    with _adapter_lock:
+        cached = _adapter_snapshot
+        if cached is not None and (now - cached[0]) <= limit:
+            return cached[1], cached[2]
+        try:
+            addresses = psutil.net_if_addrs()
+            stats = psutil.net_if_stats()
+        except Exception:  # noqa: BLE001 - treated as "nothing to report"
+            return {}, {}
+        _adapter_snapshot = (time.monotonic(), addresses, stats)
+        return addresses, stats
+
+
 def list_interfaces() -> list[NetworkInterface]:
     """Enumerate the machine's network interfaces via psutil.
 
@@ -79,10 +145,8 @@ def list_interfaces() -> list[NetworkInterface]:
     except ImportError:
         return []
 
-    try:
-        addresses = psutil.net_if_addrs()
-        stats = psutil.net_if_stats()
-    except Exception:
+    addresses, stats = adapter_tables()
+    if not addresses:
         return []
 
     interfaces: list[NetworkInterface] = []
@@ -175,6 +239,37 @@ def is_authorized_target(address: str, settings: AuthorizationSettings) -> bool:
     return any(ip in network for network in settings.parsed_networks)
 
 
+
+def network_within_authorization(
+    network: "ipaddress.IPv4Network | ipaddress.IPv6Network",
+    settings: AuthorizationSettings,
+) -> bool:
+    """True when every address in ``network`` is inside one authorised network.
+
+    The containment test costs one comparison per configured network, where
+    checking the addresses one at a time costs one per address - 65,534 of
+    them for a /16. The answer is the same: a network contained in an
+    authorised network has no address outside it.
+
+    Deliberately conservative. A target spanning two adjacent authorised
+    networks is not recognised as covered, because it is contained in neither
+    of them individually. That direction is safe: it refuses something that
+    could have been allowed, rather than allowing something that should have
+    been refused, and the caller falls back to the per-address check when the
+    network is small enough to enumerate.
+    """
+    if settings.allow_public:
+        return True
+    for allowed in settings.parsed_networks:
+        if allowed.version != network.version:
+            continue
+        try:
+            if network.subnet_of(allowed):  # type: ignore[arg-type]
+                return True
+        except TypeError:  # pragma: no cover - mixed versions already skipped
+            continue
+    return False
+
 def unauthorized_addresses(
     addresses: tuple[str, ...], settings: AuthorizationSettings
 ) -> tuple[str, ...]:
@@ -214,12 +309,9 @@ def local_ipv4_networks() -> tuple[ipaddress.IPv4Network, ...]:
     correct after the machine moves to a different network.
     """
     networks: list[ipaddress.IPv4Network] = []
+    addresses, _stats = adapter_tables()
     try:
-        import psutil
-    except ImportError:  # pragma: no cover - psutil is a declared dependency
-        return ()
-    try:
-        for entries in psutil.net_if_addrs().values():
+        for entries in addresses.values():
             for entry in entries:
                 if entry.family != socket.AF_INET or not entry.netmask:
                     continue
@@ -236,6 +328,22 @@ def local_ipv4_networks() -> tuple[ipaddress.IPv4Network, ...]:
     except Exception:  # noqa: BLE001 - never break capture over this
         return ()
     return tuple(dict.fromkeys(networks))
+
+
+def local_ipv4_addresses() -> frozenset[str]:
+    """Every IPv4 address configured on this machine right now.
+
+    Separate from :func:`local_addresses`, which goes through
+    :func:`list_interfaces` and therefore also wants the adapter *status*
+    table - a second enumeration this question does not need.
+    """
+    addresses, _stats = adapter_tables()
+    found: set[str] = set()
+    for entries in addresses.values():
+        for entry in entries:
+            if getattr(entry, "family", None) == socket.AF_INET and entry.address:
+                found.add(entry.address)
+    return frozenset(found)
 
 
 def is_on_link(address: str, networks: Sequence[ipaddress.IPv4Network]) -> bool:
@@ -355,14 +463,42 @@ def find_executable(
     return None
 
 
+@lru_cache(maxsize=65536)
+def _system_service_name(port: int, protocol: str) -> str:
+    """The operating system's name for a port, or "" - cached.
+
+    ``socket.getservbyport`` is a Winsock lookup that measures **1.896 ms mean**
+    on the development machine, and it was being called for every observed port
+    that is not in :data:`COMMON_PORT_SERVICES` - which is nearly all of them
+    above 1024.
+
+    That made it a per-packet operating-system call on the capture path. During
+    a real full-port Nmap scan of one host the interface stalled 54 times in
+    220 seconds, worst 2,075 ms: the scan put ~65,000 unnamed ports through
+    this function, which at 1.896 ms each is ~124 s of lookups competing with
+    the Tk thread.
+
+    A port's service name comes from the system services database and does not
+    change while the process runs, so the answer is cached - including the
+    empty answer, which is the common case and was the expensive one. The key
+    space is bounded (65,536 ports x a handful of protocols), so the cache
+    cannot grow without limit.
+    """
+    try:
+        return socket.getservbyport(port, protocol)
+    except (OSError, TypeError, ValueError):
+        return ""
+
+
 def service_name_for_port(port: int, protocol: str = "tcp") -> str:
     """Best-effort service name for a port from static, well-known mappings."""
     if port in COMMON_PORT_SERVICES:
         return COMMON_PORT_SERVICES[port]
     try:
-        return socket.getservbyport(port, protocol.lower())
-    except (OSError, TypeError, ValueError):
+        number = int(port)
+    except (TypeError, ValueError):
         return ""
+    return _system_service_name(number, (protocol or "tcp").lower())
 
 
 @dataclass(frozen=True)

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import tkinter as tk
 from tkinter import ttk
-from typing import Callable
+from typing import Any, Callable
 
 from aethra_sec.ui.theme import (
     PALETTE,
@@ -110,6 +110,8 @@ class Chip(tk.Canvas):
         self._pulse_dir = -1.0
         self._pulse_job: str | None = None
         self._dot_item: int | None = None
+        #: Built on first use and kept; see :meth:`_measure`.
+        self._measurer: Any = None
 
         if on_click is not None:
             self.configure(cursor="hand2")
@@ -130,7 +132,19 @@ class Chip(tk.Canvas):
     # Content
     # ------------------------------------------------------------------
     def set_value(self, text: str, colour: str | None = None) -> None:
-        """Update the label and, optionally, the accent colour."""
+        """Update the label and, optionally, the accent colour.
+
+        Returns immediately when neither has changed. The header repaints the
+        whole status strip on every UI tick so it is correct even before the
+        first status change is published, which means almost every call asks
+        for the chip it is already showing. Measured with capture running, that
+        unconditional repaint cost 441-568 ms of the Tk thread per tick, worst
+        1,271 ms - the application froze for a second or more, recovered, and
+        froze again on the next tick. Redrawing only on a real change costs
+        nothing when nothing changed.
+        """
+        if text == self._text and (not colour or colour == self._colour):
+            return
         self._text = text
         if colour:
             self._colour = colour
@@ -143,11 +157,21 @@ class Chip(tk.Canvas):
             self._tooltip.set_text(text)
 
     def _measure(self) -> None:
-        """Size the canvas to fit the text."""
-        try:
-            from tkinter import font as tkfont
+        """Size the canvas to fit the text.
 
-            width = tkfont.Font(font=self._font).measure(self._text or "")
+        The measuring font is built once and kept. It used to be constructed
+        on every call, and each construction allocates a Tcl font command that
+        Tk must later reclaim - paid once per chip per repaint, on the Tk
+        thread. Caching it is free: the font never changes for the life of the
+        widget, because a theme change rebuilds the chip.
+        """
+        try:
+            measurer = self._measurer
+            if measurer is None:
+                from tkinter import font as tkfont
+
+                measurer = self._measurer = tkfont.Font(root=self, font=self._font)
+            width = measurer.measure(self._text or "")
         except Exception:  # noqa: BLE001 - font measurement is best effort
             width = 8 * len(self._text or "")
         # A compact indicator has no pill, so it needs only the dot's width
@@ -292,7 +316,14 @@ class StatusChip(Chip):
         )
 
     def set_text(self, text: str, *, colour: str = "") -> None:
-        """Replace the label and colour without changing the bound state."""
+        """Replace the label and colour without changing the bound state.
+
+        Guarded like :meth:`set_value`: this is the call the header's status
+        strip makes for every chip on every UI tick, so it is almost always
+        asked for what the chip already shows.
+        """
+        if text == self._text and (not colour or colour == self._colour):
+            return
         self._text = text
         if colour:
             self._colour = colour
@@ -362,7 +393,12 @@ class CountBadge(tk.Canvas):
         self._colour = colour or PALETTE.accent
         self._size = size
         self._font = fonts.small_bold if fonts else ("TkDefaultFont", 8, "bold")
-        self._count = 0
+        #: -1 means "never painted", so the first set_count always draws -
+        #: including the first zero, which is what hides the badge.
+        self._count = -1
+        #: Built on first use and kept; constructing a font per paint
+        #: allocates a Tcl command each time.
+        self._measurer: Any = None
 
     @property
     def count(self) -> int:
@@ -382,11 +418,26 @@ class CountBadge(tk.Canvas):
             self.configure(background=surface)
         except tk.TclError:  # pragma: no cover - torn down
             return
-        self.set_count(self._count, colour=self._colour)
+        self.set_count(self._count, colour=self._colour, force=True)
 
-    def set_count(self, count: int, colour: str | None = None) -> None:
-        """Show a count, hiding the badge when it is zero."""
-        self._count = max(0, int(count))
+    def set_count(
+        self, count: int, colour: str | None = None, *, force: bool = False
+    ) -> None:
+        """Show a count, hiding the badge when it is zero.
+
+        Returns immediately when the count and colour are unchanged. The
+        sidebar badges are refreshed on every UI tick, so this is nearly
+        always asked for the number already on screen; repainting it anyway
+        cost 305 ms of the Tk thread per tick with capture running.
+        """
+        count = max(0, int(count))
+        if (
+            not force
+            and count == self._count
+            and (not colour or colour == self._colour)
+        ):
+            return
+        self._count = count
         if colour:
             self._colour = colour
         self.delete("all")
@@ -396,9 +447,12 @@ class CountBadge(tk.Canvas):
 
         text = "99+" if self._count > 99 else str(self._count)
         try:
-            from tkinter import font as tkfont
+            measurer = self._measurer
+            if measurer is None:
+                from tkinter import font as tkfont
 
-            text_width = tkfont.Font(font=self._font).measure(text)
+                measurer = self._measurer = tkfont.Font(root=self, font=self._font)
+            text_width = measurer.measure(text)
         except Exception:  # noqa: BLE001
             text_width = 8 * len(text)
         width = max(self._size, text_width + 12)

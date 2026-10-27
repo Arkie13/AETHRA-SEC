@@ -42,7 +42,10 @@ class TestTheScreenIsRemoved:
     def test_the_security_section_is_alerts_and_mitigation(self) -> None:
         from aethra_sec.ui.app import NAV_GROUPS
 
-        assert dict(NAV_GROUPS)["SECURITY"] == ("alerts", "mitigation")
+        # Attack Statistics added 15 Oct 2026; still no incidents screen.
+        assert dict(NAV_GROUPS)["SECURITY"] == (
+            "alerts", "attack_statistics", "mitigation"
+        )
 
     def test_no_navigation_entry_names_incidents(self) -> None:
         from aethra_sec.ui.app import NAVIGATION

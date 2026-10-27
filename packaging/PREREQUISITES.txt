@@ -6,8 +6,11 @@ Visual Studio Code, PyCharm or any development tool: the Python runtime and
 every library are inside this installer.
 
 What you DO need is the security tooling AETHRA-SEC integrates with. Those are
-separate products with their own licences, so they are installed separately.
-The next page reports which of them are already on this machine.
+separate products with their own licences, so they are not bundled. This setup
+checks which of them are already on this machine and, for anything missing,
+offers to download its OFFICIAL installer and start it for you - you just tick
+the box and follow that installer. It can also make the XAMPP database start
+automatically with Windows. An internet connection is needed for the downloads.
 
 
 REQUIRED

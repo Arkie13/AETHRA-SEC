@@ -75,12 +75,24 @@ class TestTheWindowIsAnInterval:
         )
 
     def test_the_event_count_reflects_what_was_counted(self) -> None:
-        """event_count was hard-coded to 1 whatever the observed value."""
+        """What was counted is recorded as what it is.
+
+        This test used to require ``event_count == int(observed_value)``. For a
+        rate rule ``observed_value`` is a RATE (here 5.0 pps), not a count -
+        the rule counted 25 packets in its 5 s window - so the record started
+        at "5 events" and every later measurement added one, mixing a rate
+        with an observation count (detection 2860's "Events: 158" was
+        120 + 38). Revised 15 Oct 2026: ``event_count`` counts observations and
+        starts at 1; the packets counted are in the evidence, and agree with
+        the rate over the window.
+        """
         raised = self._fire_udp()
         anomaly = raised[0]
-        assert anomaly.event_count == int(anomaly.observed_value), (
-            f"counted {anomaly.observed_value} but recorded "
-            f"event_count={anomaly.event_count}"
+        assert anomaly.event_count == 1, "one detection is one observation"
+        counted = anomaly.evidence["udp_packets_in_window"]
+        assert counted == round(anomaly.observed_value * anomaly.window_seconds), (
+            f"rate {anomaly.observed_value} over {anomaly.window_seconds}s "
+            f"but {counted} packets recorded"
         )
 
     def test_the_window_precedes_the_trigger(self) -> None:

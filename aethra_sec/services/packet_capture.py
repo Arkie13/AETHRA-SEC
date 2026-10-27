@@ -23,14 +23,21 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from aethra_sec.analytics.anomaly_rules import (
     AnomalyRuleEngine,
     DetectionThresholds,
+    RULE_HOST_SWEEP,
+    RULE_PORT_SCAN,
     thresholds_from_settings,
 )
 from aethra_sec.analytics.display_filter import validate_filter
+from aethra_sec.analytics.domain_correlation import (
+    DomainResolver,
+    learn_from_packet,
+)
 from aethra_sec.analytics.traffic_analyzer import TrafficAnalyzer, summarise_hosts
 from aethra_sec.config.settings import CaptureSettings, ToolSettings
 from aethra_sec.core.errors import CaptureError, ToolUnavailableError
@@ -108,6 +115,15 @@ def _is_host_mac(mac: str) -> bool:
 LOGGER = get_logger("services.capture")
 
 
+#: How long the capture worker may run without standing aside, and how
+#: long it stands aside for. The worker is pure Python and CPU-bound
+#: during a flood; without this it keeps the interpreter lock and the
+#: interface stops repainting. Measured: one thread at 89% of a core
+#: with the window unresponsive.
+WORKER_YIELD_INTERVAL = 0.020
+WORKER_YIELD_SECONDS = 0.001
+
+
 @dataclass
 class PipelineCounters:
     """Counters owned by the processing worker."""
@@ -172,6 +188,12 @@ class PacketCaptureService:
             rate_window_seconds=settings.get_int("detection.rate_window_seconds", 5)
         )
         self.rules = AnomalyRuleEngine(thresholds_from_settings(settings.get))
+        #: Server address -> the domain the capture actually observed for
+        #: it. Bounded and expiring; see analytics.domain_correlation.
+        self.domains = DomainResolver(
+            ttl_seconds=settings.get_int("capture.domain_ttl_seconds", 600),
+            max_entries=settings.get_int("capture.domain_cache_entries", 4096),
+        )
         self.counters = PipelineCounters()
         #: Recent packets and the display filter applied to them. Owned here,
         #: beside the pipeline that feeds it, so what the table can show and
@@ -222,6 +244,11 @@ class PacketCaptureService:
     def availability(self) -> Any:
         """Probe TShark/PyShark (§10, §101)."""
         return probe_tshark(self._tools.tshark_path)
+
+    def reader_pid(self) -> int | None:
+        """The capture child's process id, or None when nothing is running."""
+        reader = self._reader
+        return getattr(reader, "pid", None) if reader is not None else None
 
     def list_interfaces(self) -> list[CaptureInterface]:
         """Enumerate capture interfaces exactly as TShark reports them."""
@@ -373,6 +400,17 @@ class PacketCaptureService:
         live = self._access.require(
             session, Permission.MONITOR_CONTROL, target=interface or self._interface
         )
+        # The two adapter probes run external programs - `tshark -D` and the
+        # Windows adapter query - measured at 5.2-6.1 s and 4.35 s. They used
+        # to run inside the lock below, and the Live Monitoring screen reads
+        # capture state on the Tk thread every tick through that same lock:
+        # a UI-stall report (logs/ui_stall_20261015_220316_1.txt) shows the
+        # Tk thread waiting in `state` on this lock for 8.6 s while capture-
+        # start ran `tshark`. They now run first, outside the lock, and only
+        # their results are applied under it.
+        target = (interface or self._interface).strip()
+        probed_networks = self._probe_monitored_adapter(target)
+        probed_friendly = self._resolve_adapter_friendly_name(target)
         with self._lock:
             # Guard on the state machine, not on is_running. Between the
             # reader thread starting and TShark actually appearing, is_running
@@ -439,7 +477,7 @@ class PacketCaptureService:
             )
             self.rules.update_thresholds(thresholds_from_settings(self._settings.get))
             self.rules.update_trusted(self._safe_trusted_addresses())
-            self._resolve_monitored_adapter()
+            self._apply_monitored_adapter(*probed_networks)
             self._last_error = ""
             self._stopped_at = None
             self._aggregate_anchor = utcnow()
@@ -451,6 +489,15 @@ class PacketCaptureService:
             # counts are dropped and this interface's addresses are read
             # again. The display filter is kept across the restart.
             self.view.begin_session(self._interface)
+            # Resolved ONCE, here, off the detection path. Enumerating the
+            # interfaces runs `tshark -D`, measured at 5.2-6.1 s per call on
+            # this machine, and _adapter_packets used to do it on every
+            # detection - on the capture worker, between the rule firing and
+            # the row being stored. That was the 4.5-7 s gap between
+            # detected_at and created_at on every detection (see
+            # evaluation/detection_major_revision/NOTIFICATION_LATENCY_ROOT_CAUSE.md).
+            self._adapter_friendly = probed_friendly
+            self._capture_baseline = self._adapter_packets()
             # Two decode paths, one choice. Field extraction reads only the
             # fields the rules and the table use and measured 11x faster on
             # the same packets; PyShark's full decode remains selectable for
@@ -706,7 +753,19 @@ class PacketCaptureService:
         pending_rows: list[tuple[Any, ...]] = []
         ui_batch: list[CapturedPacket] = []
         last_flush = time.monotonic()
+        # The UI batch keeps its own clock. It used to read ``last_flush``,
+        # which only moves when a row batch is written - and row writes stop
+        # entirely once ``_allow_row`` hits its per-minute ceiling, which is
+        # precisely what happens during a flood. The half-second condition
+        # then held true on every pass and the loop published one event per
+        # packet, saturating the interface's event buffer.
+        last_ui = time.monotonic()
         last_stats = time.monotonic()
+        # When the queue never empties, this loop never blocks, and a thread
+        # that never blocks never hands the interpreter lock to the interface.
+        # Measured during a real flood: this thread held 89% of a core while
+        # the window stopped repainting. See the yield below.
+        last_yield = time.monotonic()
 
         while not self._stop_worker.is_set() or not self._queue.empty():
             try:
@@ -725,15 +784,25 @@ class PacketCaptureService:
                 pending_rows.clear()
                 last_flush = now
 
-            if ui_batch and (len(ui_batch) >= 50 or (now - last_flush) >= 0.5):
+            if ui_batch and (len(ui_batch) >= 50 or (now - last_ui) >= 0.5):
                 self._publish_batch(ui_batch)
                 ui_batch = []
+                last_ui = now
 
             if (now - last_stats) >= 1.0:
                 self._publish_stats()
                 self._flush_aggregate()
                 self._flush_host_observations()
                 last_stats = now
+
+            # Stand aside so the interface can be scheduled. Only reached
+            # while packets arrive without a pause - an empty queue blocks in
+            # ``get`` above and releases the lock on its own. One millisecond
+            # every twenty is about five per cent of this thread's throughput
+            # and gives the window roughly fifty slices a second.
+            if (now - last_yield) >= WORKER_YIELD_INTERVAL:
+                last_yield = now
+                time.sleep(WORKER_YIELD_SECONDS)
 
         if pending_rows:
             self._write_rows(pending_rows)
@@ -753,6 +822,11 @@ class PacketCaptureService:
             self.counters.processed += 1
 
         self.analyzer.observe(packet)
+        # Learn any domain this frame actually states, so the frames that
+        # follow it - which carry an address and no name - can be attributed.
+        # Reads fields already extracted, so it costs no extra dissection, and
+        # it runs here on the worker rather than on the Tk thread.
+        learn_from_packet(self.domains, packet)
         ui_batch.append(packet)
         self._accumulate_host(packet)
 
@@ -831,29 +905,498 @@ class PacketCaptureService:
     # ------------------------------------------------------------------
     # Anomalies
     # ------------------------------------------------------------------
+    @staticmethod
+    def _adapter_name(device: str) -> str:
+        """The operating system's name for an NPF device.
+
+        Capture addresses an adapter as ``\\Device\\NPF_{GUID}``; the OS
+        counters are keyed on the friendly name ("Wi-Fi"). The interface list
+        already carries both, so the GUID is matched back to its display name
+        rather than parsed.
+        """
+        return device
+
+    def _adapter_packets(self) -> int | None:
+        """Total packets the OS has counted on the monitored adapter.
+
+        Returns ``None`` when the adapter cannot be identified or the counters
+        are unavailable, which is reported as unknown rather than guessed.
+        """
+        friendly = getattr(self, "_adapter_friendly", None)
+        if not friendly:
+            # Unknown is reported as unknown. It is never resolved here: this
+            # runs on the capture worker for every detection.
+            return None
+        try:
+            import psutil
+
+            counters = psutil.net_io_counters(pernic=True).get(friendly)
+            if counters is None:
+                return None
+            return int(counters.packets_recv) + int(counters.packets_sent)
+        except Exception:  # noqa: BLE001 - a diagnostic must not break capture
+            return None
+
+    def _resolve_adapter_friendly_name(self, interface: str | None = None) -> str | None:
+        """The OS name of the capture adapter, for its packet counters.
+
+        Slow (it enumerates interfaces through TShark), so it is called once
+        when capture starts - before the capture lock is taken - and the
+        result is kept.
+        """
+        wanted = interface if interface is not None else self._interface
+        try:
+            for candidate in self.list_interfaces():
+                if candidate.name == wanted:
+                    return getattr(candidate, "display_name", "") or None
+        except Exception:  # noqa: BLE001 - a diagnostic must not break capture
+            LOGGER.debug("Could not resolve the capture adapter name.", exc_info=True)
+        return None
+
+    def _capture_completeness(self) -> tuple[int | None, float | None]:
+        """Packets the OS counted since capture began, and the share captured.
+
+        Returns ``(os_packets, completeness)``. ``completeness`` above 1.0 is
+        possible and is not clamped: loopback and some adapters present a
+        packet to the capture twice, and a silently corrected figure would
+        hide that rather than show it.
+        """
+        baseline = getattr(self, "_capture_baseline", None)
+        if baseline is None:
+            return None, None
+        current = self._adapter_packets()
+        if current is None:
+            return None, None
+        offered = current - baseline
+        if offered <= 0:
+            return offered, None
+        try:
+            captured = int(
+                getattr(self.statistics(), "total_packets", 0) or 0
+            )
+        except Exception:  # noqa: BLE001
+            return offered, None
+        return offered, captured / float(offered)
+
+    def _attach_capture_fidelity(self, anomaly: Any) -> None:
+        """Record how much traffic the capture was losing when this fired.
+
+        A rate is only as good as the capture behind it. AETHRA-SEC measures
+        what it RECEIVES, which on a busy or non-elevated interface can be a
+        fraction of what crossed the wire - a flood sent at 2,000 pps and
+        captured at 500 reads as MEDIUM, correctly for the measurement and
+        misleadingly for the attack.
+
+        The counters go into the detection's own evidence so an operator
+        reading a severity can see whether the rate behind it was complete.
+        Nothing is corrected or extrapolated: an estimate of the packets that
+        were never captured would be an invention, and the measured rate
+        stays exactly as measured.
+        """
+        try:
+            statistics = self.statistics()
+        except Exception:  # noqa: BLE001 - evidence must not break detection
+            return
+        captured = int(getattr(statistics, "total_packets", 0) or 0)
+        dropped = int(getattr(statistics, "dropped", 0) or 0)
+        offered = captured + dropped
+        evidence = dict(anomaly.evidence or {})
+        evidence["capture_packets_seen"] = captured
+        evidence["capture_packets_dropped"] = dropped
+        if offered > 0:
+            loss = dropped / offered
+            evidence["capture_loss_rate"] = round(loss, 6)
+            if loss > 0:
+                evidence["measured_rate_is_a_floor"] = (
+                    f"The capture dropped {loss:.2%} of the packets offered "
+                    "to it, so the measured rate is a lower bound on the "
+                    "traffic that crossed the interface, not the attack rate."
+                )
+        # Npcap's own drop counter cannot see packets that never reached it.
+        # The OS adapter counters can, so they are the ones that decide
+        # whether a measured rate represents the traffic or a fraction of it.
+        offered, completeness = self._capture_completeness()
+        if offered is not None:
+            evidence["adapter_packets_since_capture_start"] = offered
+        if completeness is not None:
+            evidence["capture_completeness"] = round(completeness, 4)
+            if completeness < 0.95:
+                missed = 1.0 - completeness
+                evidence["measured_rate_is_a_floor"] = (
+                    f"The adapter counted {offered:,} packets since capture "
+                    f"began and only {completeness:.1%} of them reached the "
+                    f"analysis, so roughly {missed:.0%} of the traffic was "
+                    "never measured. The rate above is a lower bound on what "
+                    "crossed the interface, not the attack rate. Capture on a "
+                    "wired interface, or run AETHRA-SEC elevated, and repeat "
+                    "the measurement."
+                )
+        anomaly.evidence = evidence
+
+    #: Evidence fields that count the packets a flood rule measured.
+    _WINDOW_COUNT_FIELDS = (
+        "icmp_packets_in_window", "udp_packets_in_window",
+        "syn_packets_in_window", "http_requests_in_window",
+    )
+    #: Capture-state fields copied from the fidelity probe into a measurement.
+    _CAPTURE_FIELDS = (
+        "capture_packets_seen", "capture_packets_dropped", "capture_loss_rate",
+        "adapter_packets_since_capture_start", "capture_completeness",
+    )
+
+    def _record_measurement(
+        self,
+        existing: Any,
+        anomaly: Any,
+        measured: float,
+        band: Any,
+        measured_at: datetime,
+    ) -> None:
+        """Store what this repeat measurement actually observed.
+
+        Everything here comes from the observation being folded in: its own
+        count, window, band, capture counters and analysis lag. Nothing is
+        derived from the episode's event count, and a value the rule did not
+        record is left out rather than filled in.
+        """
+        evidence = dict(getattr(anomaly, "evidence", None) or {})
+        measurement: dict[str, Any] = {
+            "measured_at": measured_at.isoformat() if measured_at else None,
+            "rate_pps": round(float(measured), 3),
+            "window_seconds": getattr(anomaly, "window_seconds", None),
+            "severity_band": str(band),
+        }
+        for name in self._WINDOW_COUNT_FIELDS:
+            if name in evidence:
+                measurement["packets_in_window"] = evidence[name]
+                measurement["packets_counted"] = name
+                break
+        analysed_at = getattr(anomaly, "detected_at", None)
+        if analysed_at is not None and measured_at is not None:
+            measurement["analysed_at"] = analysed_at.isoformat()
+            measurement["analysis_lag_seconds"] = round(
+                (analysed_at - measured_at).total_seconds(), 3
+            )
+        probe = SimpleNamespace(evidence={})
+        self._attach_capture_fidelity(probe)
+        for name in self._CAPTURE_FIELDS:
+            if name in probe.evidence:
+                measurement[name] = probe.evidence[name]
+        try:
+            self._alerts.record_episode_measurement(existing.id, measurement, measured)
+        except Exception:  # noqa: BLE001 - evidence must not break detection
+            LOGGER.exception(
+                "Could not record the latest measurement for anomaly %s.",
+                existing.id,
+            )
+
+    def _record_extent_measurement(
+        self,
+        existing: Any,
+        anomaly: Any,
+        measured_at: datetime,
+        pps: float | None,
+    ) -> None:
+        """Store a port scan's or host sweep's repeat measurement in its evidence.
+
+        The counterpart of :meth:`_record_measurement` for rules measured in
+        distinct ports or hosts. ``observed_value`` is that count, so the peak
+        comparison in ``record_episode_measurement`` is like for like. The
+        packet count is stored under its own name: the detail view prints
+        ``packets_in_window`` beside the measured value as if it were that
+        value's count, which for these rules it is not.
+        """
+        evidence = dict(getattr(anomaly, "evidence", None) or {})
+        sweep = anomaly.rule_id == RULE_HOST_SWEEP
+        measurement: dict[str, Any] = {
+            "measured_at": measured_at.isoformat() if measured_at else None,
+            "distinct_count": evidence.get("distinct_hosts" if sweep else "distinct_ports"),
+            "count_unit": "hosts" if sweep else "ports",
+            "window_seconds": getattr(anomaly, "window_seconds", None),
+            "packets_per_second": pps,
+            "packets_counted_in_window": evidence.get("packets_in_window"),
+        }
+        analysed_at = getattr(anomaly, "detected_at", None)
+        if analysed_at is not None and measured_at is not None:
+            measurement["analysed_at"] = analysed_at.isoformat()
+            measurement["analysis_lag_seconds"] = round(
+                (analysed_at - measured_at).total_seconds(), 3
+            )
+        try:
+            self._alerts.record_episode_measurement(
+                existing.id, measurement, float(anomaly.observed_value)
+            )
+        except Exception:  # noqa: BLE001 - evidence must not break detection
+            LOGGER.exception(
+                "Could not record the latest measurement for anomaly %s.",
+                existing.id,
+            )
+
+    def _fold_into_episode(self, existing: Any, anomaly: Any) -> None:
+        """Add an observation to a running episode, reclassifying it.
+
+        Severity used to be written once, when the episode's first detection
+        was inserted, and nothing ever updated it: a flood detected at 500 pps
+        stayed MEDIUM however far it escalated. A new measurement now raises
+        the episode's severity when it classifies higher.
+
+        It does not lower it. The episode's severity states the worst rate it
+        has validly measured, because that column is what the IDS badge, the
+        severity counters, the filter, exports, the dashboard and notification
+        eligibility all read - and a UDP flood that reached 1,733 pps read LOW
+        once the rate tailed off below 500. The falling rate is not hidden:
+        ``latest_value`` carries the current measurement and the transition
+        history below records the change.
+
+        Only the four flood rules are reclassified. Their severity comes from
+        a measured packet rate, which is exactly what a new observation
+        supplies. Every other rule - port scan, host sweep - carries a
+        baseline severity measured in distinct ports or hosts, not packets per
+        second, so passing ``severity=None`` leaves the stored value alone
+        rather than re-deriving it from a number that does not mean what the
+        rate bands assume.
+        """
+        from aethra_sec.analytics.anomaly_rules import FLOOD_RULES, flood_severity
+
+        observed_at = anomaly.last_seen or anomaly.detected_at or utcnow()
+        rate = anomaly.observed_value
+
+        if anomaly.rule_id not in FLOOD_RULES:
+            # A port scan or host sweep is detected by ports or hosts touched,
+            # but graded on the pps legend from the rate recorded with it. A
+            # faster repeat raises the grade - never lowers it - and the
+            # recorded pps rises with it so the Rate column matches the grade.
+            # Detections stored before pps grading carry no such rate and keep
+            # the severity they were recorded with.
+            evidence = anomaly.evidence or {}
+            graded = None
+            pps_value: float | None = None
+            if evidence.get("severity_basis") and "packets_per_second" in evidence:
+                try:
+                    pps_value = float(evidence["packets_per_second"])
+                except (TypeError, ValueError):
+                    pps_value = None
+                if pps_value is not None and pps_value >= 0:
+                    graded, _band = flood_severity(pps_value)
+            # Before the occurrence update, which raises the peak this compares
+            # against (see record_episode_measurement).
+            self._record_extent_measurement(existing, anomaly, observed_at, pps_value)
+            self._alerts.update_anomaly_occurrence(
+                existing.id, last_seen=observed_at, observed_value=rate,
+                severity=graded,
+                measured_at=observed_at,
+            )
+            if graded is not None and pps_value is not None:
+                self._alerts.raise_anomaly_pps(existing.id, pps_value)
+            return
+
+        # A rate that is missing or not a positive number classifies nothing.
+        # The observation still counts and still extends the episode; what it
+        # must not do is move the severity on the strength of a value that was
+        # never measured.
+        try:
+            measured = float(rate)
+        except (TypeError, ValueError):
+            measured = -1.0
+        if measured <= 0:
+            self._alerts.update_anomaly_occurrence(
+                existing.id, last_seen=observed_at, observed_value=rate,
+                measured_at=observed_at,
+            )
+            return
+
+        current, _band = flood_severity(measured)
+        stored = existing.severity
+        # When this measurement was taken is the capture time of the packet
+        # that completed it. ``detected_at`` is when the analysis got to it,
+        # which during a flood ran up to 27 s later (detection 2859): writing
+        # that as the measurement time made "latest measured at" read later
+        # than "last seen" for the same packets. The lag is kept as evidence.
+        self._record_measurement(existing, anomaly, measured, current, observed_at)
+
+        # The band the PREVIOUS measurement produced. The transition history
+        # describes what the traffic did, so it has to be compared against the
+        # last measurement rather than against the stored severity - which no
+        # longer falls, and would therefore log the same de-escalation over and
+        # over for as long as the flood continued.
+        previous = stored
+        prior_rate = getattr(existing, "latest_value", None)
+        if prior_rate is not None:
+            try:
+                prior = float(prior_rate)
+            except (TypeError, ValueError):
+                prior = -1.0
+            if prior > 0:
+                previous, _prior_band = flood_severity(prior)
+
+        self._alerts.update_anomaly_occurrence(
+            existing.id,
+            last_seen=observed_at,
+            observed_value=measured,
+            severity=current,
+            measured_at=observed_at,
+        )
+
+        if current == previous:
+            # The traffic is still in the same band, so nothing is logged and
+            # nothing is announced. A steady flood folds hundreds of
+            # observations without writing a single transition row or raising a
+            # single notification.
+            return
+
+        try:
+            self._alerts.record_severity_transition(
+                existing.id,
+                occurred_at=observed_at,
+                previous=previous,
+                new=current,
+                observed_value=measured,
+                window_seconds=anomaly.window_seconds,
+                measured_at=observed_at,
+            )
+        except Exception:  # noqa: BLE001 - history must not break detection
+            LOGGER.exception(
+                "Could not record a severity transition for anomaly %s.",
+                existing.id,
+            )
+
+        LOGGER.info(
+            "Episode %s severity %s -> %s at %.2f %s",
+            existing.id, previous, current, measured,
+            "requests/second" if anomaly.rule_id.endswith("HTTP-RATE")
+            else "packets/second",
+        )
+
+        # Announce an escalation only, and judge it against the severity the
+        # episode already carries rather than against the previous
+        # measurement: a rate that drops to LOW and climbs back to HIGH is not
+        # a new worst case and must not interrupt the operator twice. A rate
+        # falling back is recorded in the history but announced to nobody.
+        # An episode can therefore escalate at most twice, LOW -> MEDIUM ->
+        # HIGH, however long the flood lasts.
+        if current.rank > stored.rank:
+            existing.severity = current
+            existing.observed_value = measured
+            existing.latest_value = measured
+            existing.last_seen = observed_at
+            self._bus.publish(
+                EventType.TRAFFIC_ANOMALY_DETECTED,
+                AnomalyPayload(
+                    anomaly=existing, source=EvidenceSource.PYSHARK
+                ),
+            )
+
     def _store_anomaly(self, anomaly: Any) -> None:
         """Persist a fired rule, folding repeats into the existing record."""
         try:
-            suppression = self._settings.get_int(
-                "detection.suppression_window_seconds", 120
-            )
-            since = utcnow() - timedelta(seconds=max(1, suppression))
-            existing = self._alerts.recent_anomaly(
-                (anomaly.rule_id, anomaly.src_ip, anomaly.dst_ip, anomaly.dst_port),
-                since,
-            )
-            if existing and existing.id:
-                self._alerts.update_anomaly_occurrence(
-                    existing.id,
-                    last_seen=anomaly.last_seen or utcnow(),
-                    observed_value=anomaly.observed_value,
+            key = (anomaly.rule_id, anomaly.src_ip, anomaly.dst_ip, anomaly.dst_port)
+            measurement_only = bool(getattr(anomaly, "measurement_only", False))
+            starts_episode = bool(getattr(anomaly, "starts_episode", False))
+            if starts_episode and anomaly.first_seen is not None:
+                # Checked first: the same episode start processed again must
+                # find the row it already wrote, not fold into it.
+                already = self._alerts.anomaly_with_start(key, anomaly.first_seen)
+                if already is not None:
+                    LOGGER.info(
+                        "[EPISODE] %s %s -> %s starting %s is already detection "
+                        "%s; not recorded twice.", anomaly.rule_id, anomaly.src_ip,
+                        anomaly.dst_ip or "-", anomaly.first_seen, already.id,
+                    )
+                    with self.counters._lock:  # noqa: SLF001
+                        self.counters.anomalies_suppressed += 1
+                    return
+            # The episode this observation belongs to, if one is still running:
+            # last observed within the episode gap, on the PACKET clock against
+            # the episode's own last_seen (also the packet clock), and started
+            # no later than this observation. This used to be utcnow() - 120 s:
+            # the wrong clock - analysis ran up to 27 s behind the wire during
+            # floods - and a window a new run starting under two minutes later
+            # fell inside. The rule engine applies the same gap on the same
+            # clock, so when it says a new episode starts nothing matches here
+            # - except after a detector restart in the middle of a flood, when
+            # the engine has no history and the stored episode is continued.
+            gap = max(1, self._settings.get_int("detection.episode_gap_seconds", 15))
+            at = anomaly.last_seen or utcnow()
+            since = at - timedelta(seconds=gap + 1)
+            existing = self._alerts.recent_anomaly(key, since, at)
+            scan_target_moved = False
+            if existing is None and anomaly.rule_id == RULE_PORT_SCAN:
+                # One scan is one episode per SOURCE while it stays active:
+                # a scanner sweeping a subnet used to leave one detection per
+                # host it reached. The per-target detection extends the
+                # source's running scan, and the target joins its evidence.
+                existing = self._alerts.recent_anomaly_for_source(
+                    anomaly.rule_id, anomaly.src_ip, since, at
                 )
+                # The per-packet destination port is part of the lookup key, so
+                # a running scan's own measurement update lands here too. Only
+                # a different destination HOST is a scan that moved.
+                scan_target_moved = existing is not None and (
+                    (existing.dst_ip or "") != (anomaly.dst_ip or "")
+                )
+            if existing is not None and starts_episode and not scan_target_moved:
+                LOGGER.info(
+                    "[EPISODE] %s %s -> %s: the detector reported a new episode "
+                    "but detection %s was active %.1f s earlier (detector "
+                    "restarted?); continuing it.", anomaly.rule_id,
+                    anomaly.src_ip, anomaly.dst_ip or "-", existing.id,
+                    (at - existing.last_seen.replace(tzinfo=at.tzinfo)).total_seconds()
+                    if existing.last_seen and at.tzinfo else -1.0,
+                )
+            if existing is None and measurement_only:
+                # The rule tracks this source as one flood across targets (the
+                # ICMP and SYN counters are per source), while the record
+                # names the destination of the packet that completed the
+                # window. A measurement whose destination moved still belongs
+                # to that source's running episode.
+                existing = self._alerts.recent_anomaly_for_source(
+                    anomaly.rule_id, anomaly.src_ip, since, at
+                )
+            if existing and existing.id:
+                if anomaly.rule_id == RULE_PORT_SCAN:
+                    try:
+                        self._alerts.merge_scan_evidence(
+                            existing.id, anomaly.dst_ip,
+                            list((anomaly.evidence or {}).get("ports_sample") or []),
+                        )
+                    except Exception:  # noqa: BLE001 - evidence must not stop detection
+                        LOGGER.exception("Could not merge scan evidence into %s.", existing.id)
+                    if scan_target_moved:
+                        LOGGER.info(
+                            "[EPISODE] Port scan from %s reached %s; extending "
+                            "detection %s.", anomaly.src_ip, anomaly.dst_ip, existing.id,
+                        )
+                self._fold_into_episode(existing, anomaly)
                 with self.counters._lock:  # noqa: SLF001
                     self.counters.anomalies_suppressed += 1
+                LOGGER.debug(
+                    "[EPISODE] %s %s -> %s folded into detection %s.",
+                    anomaly.rule_id, anomaly.src_ip, anomaly.dst_ip or "-", existing.id,
+                )
                 return
+
+            if measurement_only:
+                # A qualifying measurement with no episode to extend. It used
+                # to be counted and DROPPED, which is how a real flood could
+                # leave no record at all. It is recorded, and says how it
+                # was opened.
+                anomaly.evidence = {
+                    **(anomaly.evidence or {}),
+                    "episode_opened_by": "measurement with no running episode",
+                }
+                anomaly.measurement_only = False
+                LOGGER.info(
+                    "[EPISODE] %s %s -> %s: a qualifying measurement matched no "
+                    "running episode; recording it as a new detection.",
+                    anomaly.rule_id, anomaly.src_ip, anomaly.dst_ip or "-",
+                )
 
             host_id = self._hosts.find_id_by_ip(anomaly.src_ip) if anomaly.src_ip else None
             anomaly.host_id = host_id
+            self._attach_capture_fidelity(anomaly)
+            # Marks rows whose measurement times are on the packet clock, so
+            # the detail view can tell them from rows recorded before.
+            anomaly.evidence = {**(anomaly.evidence or {}), "measurement_clock": "packet"}
             anomaly.id = self._alerts.insert_anomaly(anomaly)
             with self.counters._lock:  # noqa: SLF001
                 self.counters.anomalies_raised += 1
@@ -863,12 +1406,13 @@ class PacketCaptureService:
             )
             LOGGER.info(
                 "Traffic anomaly recorded: %s (%s -> %s, observed %.2f vs "
-                "threshold %.2f)",
+                "threshold %.2f) - new episode, detection %s",
                 anomaly.rule_id,
                 anomaly.src_ip,
                 anomaly.dst_ip or "-",
                 anomaly.observed_value,
                 anomaly.threshold_value,
+                anomaly.id,
             )
         except Exception:  # noqa: BLE001
             LOGGER.exception("Could not store a traffic anomaly.")
@@ -925,13 +1469,28 @@ class PacketCaptureService:
 
     def _resolve_monitored_adapter(self) -> None:
         """Identify the OS adapter behind the capture device, once per start."""
+        self._apply_monitored_adapter(*self._probe_monitored_adapter(self._interface))
+
+    @staticmethod
+    def _probe_monitored_adapter(interface: str) -> tuple[str, tuple[Any, ...], str]:
+        """The slow part: ask the OS which adapter and networks are behind it.
+
+        Holds no lock and touches no state, so it can run before ``start``
+        takes the capture lock.
+        """
         try:
             from aethra_sec.analytics.assessment_scope import attached_networks
 
-            adapter, networks, _own, problem = attached_networks(self._interface)
+            adapter, networks, _own, problem = attached_networks(interface)
         except Exception:  # noqa: BLE001 - never block capture on this
             LOGGER.debug("Could not resolve the monitored adapter.", exc_info=True)
-            adapter, networks, problem = "", (), "resolution failed"
+            return "", (), "resolution failed"
+        return adapter, tuple(networks), problem
+
+    def _apply_monitored_adapter(
+        self, adapter: str, networks: tuple[Any, ...], problem: str
+    ) -> None:
+        """The fast part: record a probe's result."""
         self._monitored_adapter = adapter if networks else ""
         self._local_networks = tuple(networks)
         self._local_networks_at = time.monotonic() if networks else 0.0

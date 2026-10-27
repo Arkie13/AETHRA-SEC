@@ -44,12 +44,40 @@ class TargetSpec:
         raw: the operator's original text, retained for audit records.
         kind: ``"ip"``, ``"cidr"``, ``"range"`` or ``"hostname"``.
         addresses: concrete addresses covered by the target when they can be
-            enumerated cheaply; empty for hostnames, which are resolved by Nmap.
+            enumerated cheaply; empty for hostnames, which are resolved by
+            Nmap, and empty for a network above
+            :data:`CHEAP_ENUMERATION_ADDRESSES`, whose ``network`` is carried
+            instead. Check :attr:`enumerated` before relying on it.
+        network: the parsed network for a CIDR target, else ``None``.
     """
 
     raw: str
     kind: str
     addresses: tuple[str, ...]
+    #: The parsed network, for a CIDR target. Carried so a caller can reason
+    #: about the whole range - authorisation, address count, display - without
+    #: enumerating it. ``None`` for every other kind of target.
+    network: "ipaddress.IPv4Network | ipaddress.IPv6Network | None" = None
+
+    @property
+    def address_count(self) -> int:
+        """How many addresses the target covers.
+
+        Taken from the network for a CIDR, so it is correct even when the
+        addresses were deliberately not enumerated. This is the size of the
+        range, NOT a count of live hosts - nothing here has contacted
+        anything.
+        """
+        if self.network is not None:
+            return int(self.network.num_addresses)
+        return len(self.addresses)
+
+    @property
+    def enumerated(self) -> bool:
+        """True when :attr:`addresses` lists every address in the target."""
+        if self.network is None:
+            return True
+        return len(self.addresses) > 0
 
 
 def contains_shell_metacharacters(value: str) -> bool:
@@ -211,7 +239,23 @@ def _expand_hyphen_range(value: str) -> tuple[str, ...]:
     return tuple(f"{prefix}.{octet}" for octet in range(first_octet, last_octet + 1))
 
 
-def validate_target(value: str, *, max_hosts: int = 4096) -> TargetSpec:
+#: Largest network whose addresses are listed out in :attr:`TargetSpec.addresses`.
+#: Above this the network is carried instead: enumerating a /16 costs 959 ms
+#: and 3.83 MB to produce a list whose only consumer is an authorisation
+#: check that a containment test answers without it.
+CHEAP_ENUMERATION_ADDRESSES = 4096
+
+#: Largest network a single assessment target may cover. This is a guard
+#: against a mistyped prefix turning into an unintended sweep - /12 is already
+#: far larger than a campus segment - and not a statement about how long such
+#: a scan would take. The authorisation boundary, not this number, is what
+#: decides whether a network may be assessed at all.
+MAX_TARGET_ADDRESSES = 1 << 20
+
+
+def validate_target(
+    value: str, *, max_hosts: int = MAX_TARGET_ADDRESSES
+) -> TargetSpec:
     """Validate an assessment target and describe what it covers.
 
     Accepted forms: a single IP address, a CIDR network, an IPv4 hyphen range,
@@ -236,12 +280,22 @@ def validate_target(value: str, *, max_hosts: int = 4096) -> TargetSpec:
             raise ValidationError(f"'{candidate}' is not a valid network.") from exc
         if network.num_addresses > max_hosts:
             raise ValidationError(
-                f"Network {network} covers {network.num_addresses} addresses, "
-                f"which exceeds the {max_hosts}-address limit. Scan a smaller "
-                "subnet."
+                f"Network {network} covers {network.num_addresses:,} "
+                f"addresses, which exceeds the {max_hosts:,}-address limit "
+                "for a single target. Assess it as several smaller networks."
+            )
+        if network.num_addresses > CHEAP_ENUMERATION_ADDRESSES:
+            # Carried, not enumerated. Nmap is handed the CIDR text and walks
+            # the range itself, and the authorisation check has a containment
+            # test for exactly this case, so listing the addresses would cost
+            # time and memory to produce something nothing reads.
+            return TargetSpec(
+                raw=candidate, kind="cidr", addresses=(), network=network
             )
         hosts = tuple(str(h) for h in network.hosts()) or (str(network.network_address),)
-        return TargetSpec(raw=candidate, kind="cidr", addresses=hosts)
+        return TargetSpec(
+            raw=candidate, kind="cidr", addresses=hosts, network=network
+        )
 
     if "-" in candidate and not candidate.replace("-", "").replace(".", "").isalpha():
         head = candidate.rpartition("-")[0].strip()

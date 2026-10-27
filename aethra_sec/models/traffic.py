@@ -158,6 +158,11 @@ class CapturedPacket:
     #: publishes. Deliberately not the service *instance* label beside it,
     #: which devices are free to randomise.
     dns_srv_target: str = ""
+    #: The address a DNS answer resolved :attr:`dns_query` to, when this frame
+    #: is a response carrying one. The join between a name and the traffic that
+    #: follows it: later frames of that flow carry this address and no name.
+    #: Empty for a query, and for a response with no A/AAAA record.
+    dns_answer_address: str = ""
     icmp_type: int | None = None
     icmp_code: int | None = None
     arp_opcode: int | None = None

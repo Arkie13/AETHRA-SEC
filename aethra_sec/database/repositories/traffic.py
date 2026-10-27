@@ -212,6 +212,43 @@ class TrafficRepository(Repository):
         )
         return int(value or 0)
 
+    def measured_rate_for(
+        self,
+        src_ip: str,
+        start: datetime,
+        end: datetime,
+        *,
+        dst_ip: str | None = None,
+    ) -> float | None:
+        """Packets per second sent BY ``src_ip`` inside ``[start, end]``.
+
+        One-directional - from the source only - so a target's replies are never
+        counted as traffic the source produced: a ping flood seen at 432 pps
+        from each end is 432, not 865. ``dst_ip`` narrows it to one target.
+
+        ``None`` when the window is empty or nothing from that source was
+        retained, so the caller shows "-" rather than a false zero. Row storage
+        is capped per minute, so above that cap this is a floor.
+        """
+        if not src_ip:
+            return None
+        seconds = (end - start).total_seconds()
+        if seconds <= 0:
+            return None
+        clause = "captured_at >= %s AND captured_at <= %s AND src_ip = %s"
+        params: list[Any] = [to_db(start), to_db(end), src_ip]
+        if dst_ip:
+            clause += " AND dst_ip = %s"
+            params.append(dst_ip)
+        count = int(self.db.query_value(
+            f"SELECT COUNT(*) FROM traffic_records WHERE {clause}",
+            tuple(params),
+            default=0,
+        ) or 0)
+        if count <= 0:
+            return None
+        return round(count / seconds, 1)
+
     def total_packets_observed(self) -> int:
         """All packets ever observed, from aggregates."""
         value = self.db.query_value(

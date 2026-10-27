@@ -410,14 +410,22 @@ class ReportBuilder:
             ReportSection(
                 title="Traffic anomalies",
                 columns=(
-                    "First seen", "Severity", "Rule", "Observation",
-                    "Measured", "Threshold", "Window (s)", "Occurrences",
+                    "First seen", "Severity", "Rule", "Trigger observation",
+                    "Peak measured", "Threshold", "Window (s)", "Observations",
                 ),
+                # "Observation" was the sentence written when the threshold was
+                # first crossed, and "Occurrences" the raw event_count, which on
+                # records before 15 Oct 2026 started at the trigger rate. The
+                # labels now say what each value is, and the count is the one
+                # the detail view shows (TrafficAnomaly.observation_count).
                 rows=[
                     (
                         format_local(a.first_seen), str(a.severity), a.rule_id,
                         a.observation, f"{a.observed_value:g}",
-                        f"{a.threshold_value:g}", a.window_seconds, a.event_count,
+                        f"{a.threshold_value:g}", a.window_seconds,
+                        a.observation_count()[0]
+                        if a.observation_count()[0] is not None
+                        else "not recoverable",
                     )
                     for a in anomalies
                 ],

@@ -37,6 +37,12 @@ ASSETS_DIRNAME = "assets"
 #: that was provided.
 SECURITY_ALERT_SOUND = "security-alert.mp3"
 
+#: The siren played for an IDS detection notification. Synthesised by
+#: ``scripts/generate_siren.py`` (standard library only, deterministic), so it
+#: can be rebuilt byte-for-byte and carries no third-party licence. A WAV, so
+#: Windows plays it natively through ``PlaySound`` without a decoder.
+IDS_SIREN_SOUND = "ids-siren.wav"
+
 #: The application icon, used by the desktop shortcut.
 APPLICATION_ICON = "aethra-sec.ico"
 
@@ -96,3 +102,8 @@ def resolve(name: str) -> Asset:
 def security_alert_sound() -> Asset:
     """The packaged security alert sound."""
     return resolve(SECURITY_ALERT_SOUND)
+
+
+def ids_siren_sound() -> Asset:
+    """The packaged siren for IDS detection notifications."""
+    return resolve(IDS_SIREN_SOUND)

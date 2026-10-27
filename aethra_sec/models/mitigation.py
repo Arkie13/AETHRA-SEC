@@ -30,6 +30,16 @@ class MitigationRecommendation:
     long_term_action: str = ""
     verification_steps: str = ""
     references: str = ""
+    #: Which firewall or control should enforce this, and why an
+    #: endpoint rule and a gateway rule are not interchangeable here.
+    enforcement_point: str = ""
+    #: The ordered procedure, one step per line. Separate from
+    #: ``immediate_action``, which stays the short summary.
+    procedure_steps: str = ""
+    #: How to undo exactly the rule the procedure created.
+    rollback_steps: str = ""
+    #: What the change may legitimately break.
+    operational_warnings: str = ""
     is_active: bool = True
     is_builtin: bool = False
     created_by: int | None = None

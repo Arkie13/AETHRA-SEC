@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from aethra_sec.models.enums import NotificationLevel
-from aethra_sec.resources import security_alert_sound
+from aethra_sec.resources import ids_siren_sound, security_alert_sound
 from aethra_sec.utils.logging import get_logger
 
 LOGGER = get_logger("services.audio_alerts")
@@ -61,6 +61,10 @@ _WINDOWS_SOUNDS: dict[str, str] = {
 #: service-status change from sounding like an intrusion.
 SECURITY_CATEGORY = "security"
 
+#: The notification category of an IDS detection - a Snort alert or an
+#: AETHRA-SEC detection - which gets the siren.
+DETECTION_CATEGORY = "alert"
+
 #: Levels in ascending order of urgency, for the "minimum level" setting.
 _ORDER: tuple[str, ...] = ("INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL")
 
@@ -69,6 +73,16 @@ _REPEATABLE: frozenset[str] = frozenset({"CRITICAL"})
 
 #: Seconds between repeats of an unacknowledged critical alert.
 REPEAT_INTERVAL_SECONDS = 20.0
+
+#: Seconds between loops of the persistent siren tied to an open popup. Short
+#: enough that a brief clip does not leave long silences while a detection
+#: popup is up, long enough not to overlap a clip with itself.
+PERSISTENT_SIREN_INTERVAL_SECONDS = 4.0
+
+#: A persistent siren can never outlive its popup, but if a popup is somehow
+#: never acknowledged (a wedged window), the loop stops itself after this many
+#: seconds rather than sounding for ever. The detection stays recorded.
+PERSISTENT_SIREN_MAX_SECONDS = 1800.0
 
 #: Fallback hold time when a clip will not report its own length.
 MAX_CLIP_SECONDS = 8.0
@@ -142,6 +156,34 @@ def play_sound_file(path: Path) -> None:
     ).start()
 
 
+def play_wav_file(path: Path) -> None:
+    """Start a WAV file playing and return at once.
+
+    ``winsound.PlaySound`` with ``SND_ASYNC`` hands the file to Windows and
+    returns immediately, so the worker - and the queue behind it - is never
+    held for the length of the clip. ``SND_NODEFAULT`` matters: without it a
+    file Windows cannot play is silently replaced by the default beep, and a
+    failure would masquerade as success. With it, a failure raises.
+
+    Raises:
+        SoundUnavailableError: the file is absent, or Windows refused it.
+    """
+    if not path.is_file():
+        raise SoundUnavailableError(f"{path.name} is not present")
+    try:
+        import winsound
+    except ImportError:  # pragma: no cover - not Windows
+        print("\a", end="", flush=True)
+        return
+    try:
+        winsound.PlaySound(
+            str(path),
+            winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT,
+        )
+    except RuntimeError as exc:
+        raise SoundUnavailableError(f"Windows could not play {path.name}: {exc}") from exc
+
+
 def _clip_seconds(command: Callable[[str], int], alias: str) -> float:
     """How long to leave the device open, from the clip's own length."""
     try:
@@ -185,6 +227,110 @@ class SoundRequest:
     key: str
     raised_at: float
     security: bool = False
+    #: An IDS detection (a notification of category ``alert``): plays the
+    #: siren. Like ``security``, decided by what raised the notification,
+    #: never by how urgent its level is.
+    detection: bool = False
+
+
+class _PersistentSiren:
+    """Loops one popup's siren until that popup is acknowledged.
+
+    The sound a detection popup makes must continue while the popup is open and
+    unacknowledged, and stop the instant CHECK or CLOSE is pressed - not when
+    one clip ends. The previous design played a single clip and only re-sounded
+    CRITICAL notifications on a 20 s timer, so a HIGH detection (notification
+    level ERROR) went silent within seconds while its popup stayed up. See
+    evaluation/stability_revision/PERSISTENT_NOTIFICATION_SOUND_DESIGN.md.
+
+    Exactly one siren is active at a time. Starting a new one (a superseding
+    popup) stops the old one first, so popups can never pile up audio workers.
+
+    The stop signal is a :class:`threading.Event`; the loop waits on it between
+    iterations, so an acknowledgement stops the siren between loops immediately
+    rather than after the current wait. Playback itself is the service's async
+    player, so nothing here holds the GUI, the database or packet capture.
+    """
+
+    def __init__(self, play_once: Callable[[], bool], interval: float) -> None:
+        self._play_once = play_once
+        self._interval = max(0.5, float(interval))
+        self._lock = threading.Lock()
+        self._token: object | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.loops_played = 0
+
+    @property
+    def active_token(self) -> object | None:
+        with self._lock:
+            return self._token
+
+    def start(self, token: object) -> None:
+        """Begin (or replace) the loop for ``token``. Plays once immediately."""
+        with self._lock:
+            if self._token is token and self._thread is not None \
+                    and self._thread.is_alive():
+                return  # already sounding for this popup
+            # Signal the previous loop to stop. It owns its own (old) Event and
+            # exits on its own; we do not join here, so the Tk thread that calls
+            # this on an escalation is never blocked. The old loop plays nothing
+            # more because its token no longer matches and its Event is set.
+            self._stop.set()
+            self._token = token
+            self._stop = threading.Event()    # a fresh signal for the new loop
+            self._thread = threading.Thread(
+                target=self._run, args=(token, self._stop), name="persistent-siren",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def stop(self, token: object | None = None) -> bool:
+        """Stop the loop. With a ``token``, only if it still owns the siren.
+
+        Returns True when a loop was stopped. Idempotent: a second CLOSE, or a
+        CLOSE after a CHECK, simply finds nothing to stop.
+        """
+        with self._lock:
+            if self._token is None:
+                return False
+            if token is not None and token is not self._token:
+                return False  # a stale button from a popup already superseded
+            self._stop.set()
+            self._token = None
+            thread = self._thread
+            self._thread = None
+        # Join briefly so an orderly shutdown leaves no siren worker running.
+        # The loop waits on the event, so it returns as soon as it is set; the
+        # timeout only guards against a clip call that is mid-flight.
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        return True
+
+    def _run(self, token: object, stop: threading.Event) -> None:
+        started = time.monotonic()
+        # The first sound is immediate; the popup appears and is heard at once.
+        try:
+            self._play_once()
+            self.loops_played += 1
+        except Exception:  # noqa: BLE001 - a bad sound device is never fatal
+            LOGGER.debug("Persistent siren first play failed.", exc_info=True)
+        while not stop.wait(self._interval):
+            if (time.monotonic() - started) > PERSISTENT_SIREN_MAX_SECONDS:
+                LOGGER.warning(
+                    "[NOTIFY] Persistent siren stopped itself after %.0f s "
+                    "without acknowledgement; the detection stays recorded.",
+                    PERSISTENT_SIREN_MAX_SECONDS,
+                )
+                with self._lock:
+                    if self._token is token:
+                        self._token = None
+                return
+            try:
+                self._play_once()
+                self.loops_played += 1
+            except Exception:  # noqa: BLE001
+                LOGGER.debug("Persistent siren loop play failed.", exc_info=True)
 
 
 class AudioAlertService:
@@ -195,6 +341,7 @@ class AudioAlertService:
         settings: Any,
         *,
         player: Callable[[str], None] | None = None,
+        siren_player: Callable[[Path], None] | None = None,
     ) -> None:
         """Wire the service to settings and (optionally) a custom player.
 
@@ -202,9 +349,23 @@ class AudioAlertService:
             settings: the settings service, read for the operator's choices.
             player: overrides the platform player. Tests pass a recorder here
                 so the behaviour can be asserted without a sound card.
+            siren_player: overrides the siren player, for the same reason.
         """
         self._settings = settings
         self._player = player or self._play_platform_sound
+        self._siren_player = siren_player or play_wav_file
+        #: The IDS detection siren. A detection used to fall through to the
+        #: Windows "SystemHand" alias - on this installation a soft chime
+        #: ("Windows Foreground.wav"), or nothing at all under a "No Sounds"
+        #: scheme - because only category "security" got a packaged file.
+        self._siren = ids_siren_sound()
+        self._siren_failures = 0
+        self._siren_error = ""
+        if not self._siren.available:
+            LOGGER.warning(
+                "The IDS siren is unavailable: %s Detections will use the "
+                "system sound instead.", self._siren.detail,
+            )
         self._queue: "queue.Queue[SoundRequest]" = queue.Queue(maxsize=64)
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -227,6 +388,13 @@ class AudioAlertService:
                 self._sound.detail,
             )
 
+        #: Loops a detection popup's siren until CHECK/CLOSE. Plays the siren
+        #: when available, otherwise the security sound, otherwise the system
+        #: sound - the same fallback order as a one-shot detection sound.
+        self._persistent = _PersistentSiren(
+            self._play_detection_sound, PERSISTENT_SIREN_INTERVAL_SECONDS
+        )
+
         self._worker = threading.Thread(
             target=self._run, name="audio-alerts", daemon=True
         )
@@ -248,6 +416,7 @@ class AudioAlertService:
                 return False
 
             security = self._is_security(notification)
+            detection = self._is_detection(notification)
             key = self._dedup_key(notification)
             now = time.monotonic()
             with self._lock:
@@ -257,12 +426,18 @@ class AudioAlertService:
                     # has already been told, and the count is preserved on the
                     # notification record itself.
                     self._suppressed += 1
+                    LOGGER.info(
+                        "[NOTIFY] Sound deduplicated: key=%s within %ss",
+                        key, int(self._dedup_window()),
+                    )
                     return False
                 self._last_played[key] = now
                 if level in _REPEATABLE:
                     self._unacknowledged[key] = now
 
-            self._queue.put_nowait(SoundRequest(level, key, now, security))
+            self._queue.put_nowait(
+                SoundRequest(level, key, now, security, detection)
+            )
             return True
         except queue.Full:
             # Alerting is best-effort; losing a beep must never cost an event.
@@ -280,7 +455,64 @@ class AudioAlertService:
             else:
                 self._unacknowledged.clear()
 
-    def test_sound(self, level: str = "CRITICAL", *, security: bool = False) -> None:
+    # ------------------------------------------------------------------
+    # Persistent siren, tied to an open detection popup
+    # ------------------------------------------------------------------
+    def begin_persistent(self, token: object, level: str, is_detection: bool) -> bool:
+        """Start looping the siren for a just-shown popup. Returns True if it did.
+
+        Called from the Tk thread when a persistent popup is built. It only
+        signals the siren thread, so it returns at once and never blocks the
+        interface. The siren sounds only for an eligible detection popup under
+        the operator's severity and sound settings; anything else is left to
+        the one-shot :meth:`notify`.
+        """
+        try:
+            if not is_detection or not self._should_sound(str(level).upper()):
+                return False
+            self._persistent.start(token)
+            LOGGER.info("[NOTIFY] Persistent siren started for popup %s", token)
+            return True
+        except Exception:  # noqa: BLE001 - alerting must never break the UI
+            LOGGER.debug("Could not start the persistent siren.", exc_info=True)
+            return False
+
+    def end_persistent(self, token: object | None = None) -> None:
+        """Stop the persistent siren (CHECK, CLOSE, supersede or shutdown).
+
+        With a ``token`` it stops only if that popup still owns the siren, so a
+        stale callback from a popup that was already replaced cannot silence
+        the new one. Returns at once; safe to call more than once.
+        """
+        try:
+            if self._persistent.stop(token):
+                LOGGER.info("[NOTIFY] Persistent siren stopped for popup %s",
+                            token if token is not None else "(any)")
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("Could not stop the persistent siren.", exc_info=True)
+
+    def _play_detection_sound(self) -> bool:
+        """One detection sound: siren, else security file, else system sound."""
+        if self._play_siren():
+            with self._lock:
+                self._played += 1
+            return True
+        if self._play_security_sound():
+            with self._lock:
+                self._played += 1
+            return True
+        self._player("ERROR")
+        with self._lock:
+            self._played += 1
+        return True
+
+    def test_sound(
+        self,
+        level: str = "CRITICAL",
+        *,
+        security: bool = False,
+        detection: bool = False,
+    ) -> None:
         """Play one sound for the settings screen's Test control.
 
         This is an audio check only. It creates no notification, no incident
@@ -293,7 +525,8 @@ class AudioAlertService:
         try:
             self._queue.put_nowait(
                 SoundRequest(
-                    str(level).upper(), "__test__", time.monotonic(), security
+                    str(level).upper(), "__test__", time.monotonic(), security,
+                    detection,
                 )
             )
         except queue.Full:  # pragma: no cover - test is a single sound
@@ -307,10 +540,13 @@ class AudioAlertService:
                 "played": self._played,
                 "suppressed": self._suppressed,
                 "awaiting_acknowledgement": len(self._unacknowledged),
+                "persistent_siren_active": 1 if self._persistent.active_token is not None else 0,
+                "persistent_siren_loops": self._persistent.loops_played,
             }
 
     def close(self) -> None:
-        """Stop the worker."""
+        """Stop the siren and the worker."""
+        self._persistent.stop()
         self._stop.set()
         try:
             self._queue.put_nowait(SoundRequest("", "__stop__", time.monotonic()))
@@ -349,11 +585,32 @@ class AudioAlertService:
         category = str(getattr(notification, "category", "") or "").strip().lower()
         return category == SECURITY_CATEGORY
 
+    @staticmethod
+    def _is_detection(notification: Any) -> bool:
+        """Whether this notification is about an IDS detection - gets the siren.
+
+        The notification service stamps category ``alert`` on every Snort
+        alert and every AETHRA-SEC detection it announces, and on nothing
+        else, so a report or a status change never sounds like an intrusion.
+        """
+        category = str(getattr(notification, "category", "") or "").strip().lower()
+        return category == DETECTION_CATEGORY
+
     def _dedup_key(self, notification: Any) -> str:
-        """What counts as "the same finding" for folding repeats."""
+        """What counts as "the same finding" for folding repeats.
+
+        The alert's identifier, plus its severity when it carries one. Without
+        the severity, a detection announced at MEDIUM and then escalated to
+        HIGH two seconds later was folded into the MEDIUM sound and the HIGH
+        escalation was silent (logged on 14 Oct: "Sound not played" for
+        notification 2234). A repeat at the same severity still folds.
+        """
         reference_type = str(getattr(notification, "reference_type", "") or "")
         reference_id = getattr(notification, "reference_id", None)
+        severity = str(getattr(notification, "severity", "") or "").upper()
         if reference_type and reference_id is not None:
+            if severity:
+                return f"{reference_type}:{reference_id}:{severity}"
             return f"{reference_type}:{reference_id}"
         # No reference: fall back to the text, which is what an operator would
         # themselves recognise as a repeat.
@@ -379,8 +636,11 @@ class AudioAlertService:
             # A sound for something that has scrolled well into the past is
             # dropped rather than played late.
             if (time.monotonic() - request.raised_at) > MAX_SOUND_AGE_SECONDS:
+                LOGGER.info(
+                    "[NOTIFY] Sound dropped as stale: key=%s", request.key
+                )
                 continue
-            self._emit(request.level, request.security)
+            self._emit(request.level, request.security, request.detection)
 
     def _repeat_due(self) -> None:
         """Re-sound critical alerts the operator has not acknowledged."""
@@ -399,15 +659,23 @@ class AudioAlertService:
         for _ in due:
             self._emit("CRITICAL")
 
-    def _emit(self, level: str, security: bool = False) -> None:
+    def _emit(
+        self, level: str, security: bool = False, detection: bool = False
+    ) -> None:
         """Play one sound, counting it, without ever raising.
 
-        A security notification plays the packaged file. If that cannot be
-        played - the file is missing, or this machine has no way to play an
-        MP3 - the operator still hears the system sound rather than silence,
-        and the reason is recorded once for the Settings screen to show.
+        An IDS detection plays the siren; a security notification plays the
+        packaged file. If either cannot be played - the file is missing, or
+        the device refuses it - the operator still hears the system sound
+        rather than silence, and the reason is recorded for the Settings
+        screen to show. "Played" here means the device accepted the request;
+        whether anyone heard it cannot be known from software.
         """
         try:
+            if detection and self._play_siren():
+                with self._lock:
+                    self._played += 1
+                return
             if security and self._play_security_sound():
                 with self._lock:
                     self._played += 1
@@ -417,6 +685,43 @@ class AudioAlertService:
                 self._played += 1
         except Exception:  # noqa: BLE001 - a missing sound device is not fatal
             LOGGER.debug("Could not play an alert sound.", exc_info=True)
+
+    def _play_siren(self) -> bool:
+        """Request the IDS siren. False when it could not be started."""
+        if not self._siren.available:
+            return False
+        try:
+            self._siren_player(self._siren.path)
+        except Exception as exc:  # noqa: BLE001
+            with self._lock:
+                self._siren_failures += 1
+                self._siren_error = str(exc)
+            LOGGER.warning(
+                "[NOTIFY] Siren playback FAILED (%s); falling back to the "
+                "system sound.", exc,
+            )
+            return False
+        with self._lock:
+            self._siren_error = ""
+        LOGGER.info("[NOTIFY] Siren playback requested: %s", self._siren.name)
+        return True
+
+    def siren_status(self) -> tuple[bool, str]:
+        """Whether the IDS siren is usable, and why not when it is not."""
+        with self._lock:
+            failures, error = self._siren_failures, self._siren_error
+        if not self._siren.available:
+            return False, self._siren.detail
+        if error:
+            return False, (
+                f"{self._siren.name} is present but could not be played "
+                f"({error}). {failures} attempt(s) fell back to the system "
+                "sound."
+            )
+        return True, (
+            f"{self._siren.name} ({self._siren.size_bytes:,} bytes) is "
+            "packaged and playable."
+        )
 
     def _play_security_sound(self) -> bool:
         """Play the packaged alert file. False when it could not be played."""
@@ -436,6 +741,73 @@ class AudioAlertService:
         with self._lock:
             self._sound_error = ""
         return True
+
+    def diagnose(self, *, play: bool = True) -> list[tuple[str, bool, str]]:
+        """Check the audio path stage by stage and report each result (§4).
+
+        Returns a list of ``(stage, ok, detail)`` covering: the file is found,
+        it is readable, playback initialised, playback completed. Each answer
+        comes from actually attempting that step, and a failure carries the
+        real error rather than a generic one.
+
+        This is an audio check, not an alert. It creates no notification, no
+        incident and no database record, so the sound can be verified without
+        a fabricated security event existing to justify it. Pass
+        ``play=False`` to check the file without making a noise.
+        """
+        stages: list[tuple[str, bool, str]] = []
+
+        asset = self._sound
+        found = bool(asset.available and asset.path and asset.path.is_file())
+        stages.append((
+            "AUDIO FILE FOUND",
+            found,
+            str(asset.path) if found else (asset.detail or "not resolved"),
+        ))
+        if not found:
+            stages.append(("AUDIO FILE READABLE", False, "file not found"))
+            stages.append(("AUDIO PLAYBACK INITIALIZED", False, "no file to play"))
+            stages.append(("AUDIO PLAYBACK FAILED", False, "no file to play"))
+            return stages
+
+        try:
+            with asset.path.open("rb") as handle:
+                header = handle.read(4)
+            stages.append((
+                "AUDIO FILE READABLE",
+                True,
+                f"{asset.size_bytes:,} bytes, first bytes {header.hex()}",
+            ))
+        except OSError as exc:
+            stages.append(("AUDIO FILE READABLE", False, str(exc)))
+            stages.append(("AUDIO PLAYBACK INITIALIZED", False, "unreadable"))
+            stages.append(("AUDIO PLAYBACK FAILED", False, "unreadable"))
+            return stages
+
+        if not play:
+            stages.append((
+                "AUDIO PLAYBACK INITIALIZED", True, "skipped (play=False)"
+            ))
+            return stages
+
+        try:
+            play_sound_file(asset.path)
+            stages.append(("AUDIO PLAYBACK INITIALIZED", True, "device accepted"))
+            stages.append((
+                "AUDIO PLAYBACK COMPLETED",
+                True,
+                "handed to the device asynchronously; it returns before the "
+                "sound finishes by design, so the worker is never held",
+            ))
+        except SoundUnavailableError as exc:
+            # The actual error, never swallowed: this is the one place an
+            # operator can find out why an incident was silent.
+            stages.append(("AUDIO PLAYBACK INITIALIZED", False, str(exc)))
+            stages.append(("AUDIO PLAYBACK FAILED", False, str(exc)))
+        except Exception as exc:  # noqa: BLE001 - report whatever it was
+            stages.append(("AUDIO PLAYBACK INITIALIZED", False, repr(exc)))
+            stages.append(("AUDIO PLAYBACK FAILED", False, repr(exc)))
+        return stages
 
     def sound_status(self) -> tuple[bool, str]:
         """Whether the packaged sound is usable, and why not when it is not.

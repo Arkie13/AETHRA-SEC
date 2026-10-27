@@ -52,6 +52,3 @@ Desktop.ini
 .idea/
 .vscode/
 *.swp
-
-# Claude Code local machine config
-.claude/

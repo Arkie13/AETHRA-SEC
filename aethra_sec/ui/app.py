@@ -26,6 +26,7 @@ from typing import Any, Callable
 
 from aethra_sec.core.application import ApplicationContext
 from aethra_sec.core.events import Event, EventType
+from aethra_sec.diagnostics import flood_probe
 from aethra_sec.core.permissions import Permission
 from aethra_sec.core.session import Session
 from aethra_sec.models.enums import Severity
@@ -55,6 +56,7 @@ from aethra_sec.ui.widgets.dialogs import confirm
 from aethra_sec.ui.widgets.palette import Command, CommandPalette
 from aethra_sec.ui.widgets.toast import ToastManager
 from aethra_sec.ui.widgets.tooltip import attach_tooltip
+from aethra_sec.models.system import without_correlation_key
 from aethra_sec.utils.logging import get_logger
 from aethra_sec.utils.timeutil import format_local, utcnow
 from aethra_sec.version import APP_NAME, APP_VERSION
@@ -71,6 +73,7 @@ NAVIGATION: tuple[tuple[str, str, str], ...] = (
     ("hosts", "Hosts", Permission.HOST_VIEW),
     ("alerts", "Alerts", Permission.ALERT_VIEW),
     ("mitigation", "Mitigation", Permission.MITIGATION_VIEW),
+    ("attack_statistics", "Attack Statistics", Permission.ALERT_VIEW),
     ("reports", "Reports", Permission.REPORT_GENERATE),
     ("logs", "Logs & Audit", Permission.LOG_VIEW),
     ("users", "Users", Permission.USER_MANAGE),
@@ -88,7 +91,7 @@ NAVIGATION: tuple[tuple[str, str, str], ...] = (
 #: groups nobody opens during an incident sit at the bottom.
 NAV_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("MONITOR", ("dashboard", "traffic")),
-    ("SECURITY", ("alerts", "mitigation")),
+    ("SECURITY", ("alerts", "attack_statistics", "mitigation")),
     ("ASSETS", ("hosts", "vulnerabilities")),
     ("REPORTING", ("reports", "logs")),
     ("ADMINISTRATION", ("users", "health", "settings")),
@@ -137,13 +140,74 @@ _UI_EVENTS: tuple[str, ...] = (
     EventType.SNORT_STATUS_CHANGED, EventType.NMAP_SCAN_STARTED,
     EventType.NMAP_SCAN_COMPLETED, EventType.NMAP_SCAN_FAILED,
     EventType.MITIGATION_GENERATED, EventType.DATABASE_STATUS_CHANGED,
-    EventType.SERVICE_STATUS_CHANGED, EventType.NOTIFICATION_RAISED,
+    EventType.SERVICE_STATUS_CHANGED,
     EventType.REPORT_GENERATED, EventType.SYSTEM_ERROR,
 )
+
+#: Drained on the same tick, but through a buffer of its own.
+#:
+#: These used to share the queue above. The bus discards the oldest event
+#: when a buffer fills, so during a flood the capture pipeline's packet
+#: batches evicted stored notifications before the interface ever saw them -
+#: the popup simply never happened, and nothing said so. A separate
+#: subscription means traffic cannot reach this buffer, and ``dispatch_all``
+#: serves subscriptions round-robin so neither can starve the other.
+_NOTIFICATION_EVENTS: tuple[str, ...] = (EventType.NOTIFICATION_STORED,)
+
+
+#: How each stored ``reference_type`` is named on a notification popup. These
+#: are the values the notifications table actually holds; anything else, or
+#: nothing at all, falls back to the notification's own id rather than an
+#: invented reference.
+#:
+#: Deliberately absent: the correlated-group type that older rows carry.
+#: That feature was withdrawn from the interface, nothing raises one now, and
+#: naming it here would put retired terminology back in front of the
+#: operator. Those legacy rows show their notification id instead.
+REFERENCE_LABELS: dict[str, str] = {
+    "alert": "Snort alert",
+    "security_alert": "Snort alert",
+    "anomaly": "Traffic anomaly",
+    "scan": "Assessment",
+    "report": "Report",
+}
+
+
+def _notification_reference(payload: Any) -> str:
+    """Name the record this notification is about, from the payload alone.
+
+    The payload carries ``reference_type`` and ``reference_id`` and nothing
+    more about the detection - no addresses, no protocol, no detection
+    timestamp - so this states the identifier and stops there. CHECK is how
+    the operator gets to the full record.
+    """
+    kind = str(getattr(payload, "reference_type", "") or "").strip()
+    reference_id = getattr(payload, "reference_id", None)
+    label = REFERENCE_LABELS.get(kind)
+    if label and reference_id:
+        return f"{label} #{reference_id}"
+    notification_id = getattr(payload, "notification_id", None)
+    if notification_id:
+        return f"Notification #{notification_id}"
+    return ""
 
 
 class MainWindow:
     """The application console."""
+
+    #: Wall-clock limit for draining the event bus on one UI tick.
+    #:
+    #: The tick interval is at least 250 ms, so 60 ms leaves the rest of the
+    #: tick - the status strip, the sidebar badges and the screen's own tick,
+    #: together under 20 ms measured - plenty of room while keeping the main
+    #: loop's worst case well inside what a person reads as responsive.
+    #:
+    #: Raising it lets a burst drain faster at the cost of a longer worst-case
+    #: stall; lowering it defers more events to later ticks. Under sustained
+    #: load heavier than this can drain, the bus's bounded queues shed the
+    #: oldest events and count them, which is the pre-existing policy and is
+    #: visible on the System Health screen as dropped_events.
+    EVENT_BUDGET_MS = 60.0
 
     def __init__(
         self, root: tk.Tk, context: ApplicationContext, fonts: Fonts, session: Session
@@ -178,6 +242,10 @@ class MainWindow:
         self._badge_counts: dict[str, int] = {}
         self._badge_job_running = False
         self._badge_refreshed_at = 0.0
+        #: The unread-notification count is a query, so it is asked on a
+        #: worker. These keep one worker at a time; see refresh_notifications.
+        self._notification_count_running = False
+        self._notification_count_again = False
         #: How this console ended: "sign out" returns to the login window,
         #: "quit" exits the application. run_console() returns this.
         self.outcome = "quit"
@@ -202,11 +270,60 @@ class MainWindow:
         self._subscription = context.event_bus.subscribe(
             _UI_EVENTS, self._on_event, queued=True, max_size=4000, name="main-window"
         )
+        # Small on purpose: only notifications arrive here, they arrive at
+        # human speed, and a buffer this size cannot fill from traffic. If it
+        # ever did overflow, the bus now logs the loss rather than hiding it.
+        self._notification_subscription = context.event_bus.subscribe(
+            _NOTIFICATION_EVENTS, self._on_notification_event,
+            queued=True, max_size=512, name="main-window-notifications",
+        )
+        # Prompt delivery. The queue above was drained only by the UI tick
+        # (ui.refresh_interval_ms, 2,000 ms here), so a stored notification
+        # waited up to two seconds - more when the tick ran long - before its
+        # popup. This subscriber runs on the publishing thread and does no UI
+        # work: it posts ONE drain request to the 40 ms worker-to-Tk
+        # dispatcher (single-flight, so a burst cannot flood it). Rendering
+        # stays on the Tk thread; the bounded queue stays the only buffer.
+        self._notification_wake_pending = False
+        self._notification_wake = context.event_bus.subscribe(
+            _NOTIFICATION_EVENTS, self._wake_for_notification,
+            queued=False, name="main-window-notification-wake",
+        )
         if self.state.get_bool(KEY_SIDEBAR_COLLAPSED):
             self.toggle_sidebar()
         self.navigate(self._initial_screen())
         self._schedule_tick()
+        self._start_stall_watchdog()
         self.root.deiconify()
+
+    def _start_stall_watchdog(self) -> None:
+        """Record where the Tk thread is stuck whenever it stops answering.
+
+        The reported "crash under a high-severity attack" was Windows closing
+        a window that had stopped responding (Event ID 1002, AppHangB1, 14 Oct
+        2026 04:28:20), with nothing in the log. See
+        :mod:`aethra_sec.diagnostics.ui_watchdog`.
+        """
+        from aethra_sec.diagnostics.ui_watchdog import UiStallWatchdog, install_on_tk
+
+        bus = self.context.event_bus
+
+        def backlog() -> str:
+            details = bus.subscription_details()
+            return "; ".join(
+                f"{item.get('name')}: pending={item.get('pending')} "
+                f"dropped={item.get('dropped')}"
+                for item in details
+            )
+
+        try:
+            self._cancel_watchdog = install_on_tk(
+                self.root,
+                UiStallWatchdog(self.context.settings.log_dir, context=backlog),
+            )
+        except Exception:  # noqa: BLE001 - a diagnostic must not stop the console
+            self._cancel_watchdog = None
+            LOGGER.warning("UI stall watchdog not started.", exc_info=True)
 
     def _initial_geometry(self) -> str:
         """Restore the last window geometry, or size to most of the screen."""
@@ -421,6 +538,19 @@ class MainWindow:
         self._palette = CommandPalette(body, self._build_commands(), self.fonts)
         self._notification_panel = self._build_notification_panel(body)
         self._toasts = ToastManager(body, self.fonts)
+        # The siren follows the visible popup: started when a detection popup
+        # is shown, stopped the instant it is dismissed (CHECK, CLOSE, a
+        # superseding escalation, or shutdown). Both hooks only signal the
+        # audio worker, so neither holds the Tk thread.
+        audio = getattr(self.context, "audio_alerts", None)
+        if audio is not None:
+            self._toasts.on_persistent(
+                present=lambda spec: audio.begin_persistent(
+                    spec.get("_token"), str(spec.get("level", "INFO")),
+                    bool(spec.get("is_detection")),
+                ),
+                dismiss=lambda spec: audio.end_persistent(spec.get("_token")),
+            )
 
     @staticmethod
     def _header_divider(parent: tk.Misc, side: str = "left") -> None:
@@ -1093,6 +1223,7 @@ class MainWindow:
         from aethra_sec.ui.screens.health import HealthScreen
         from aethra_sec.ui.screens.hosts import HostsScreen
         from aethra_sec.ui.screens.logs import LogsScreen
+        from aethra_sec.ui.screens.attack_statistics import AttackStatisticsScreen
         from aethra_sec.ui.screens.mitigation import MitigationScreen
         from aethra_sec.ui.screens.reports import ReportsScreen
         from aethra_sec.ui.screens.settings import SettingsScreen
@@ -1106,6 +1237,7 @@ class MainWindow:
             "vulnerabilities": VulnerabilitiesScreen,
             "hosts": HostsScreen,
             "alerts": AlertsScreen,
+            "attack_statistics": AttackStatisticsScreen,
             "mitigation": MitigationScreen,
             "reports": ReportsScreen,
             "logs": LogsScreen,
@@ -1119,6 +1251,93 @@ class MainWindow:
     # ------------------------------------------------------------------
     # Event pump (§75)
     # ------------------------------------------------------------------
+    def _wake_for_notification(self, _event: Event) -> None:
+        """Ask the Tk thread to drain notifications now (any thread)."""
+        if self._notification_wake_pending or self._closing:
+            return
+        self._notification_wake_pending = True
+        if not dispatch.post(self._drain_notifications):
+            self._notification_wake_pending = False  # no dispatcher: tick drains
+
+    def _drain_notifications(self) -> None:
+        """Deliver queued notifications on the Tk thread, a bounded number."""
+        self._notification_wake_pending = False
+        if self._closing:
+            return
+        try:
+            self.context.event_bus.dispatch(self._notification_subscription, 20)
+        except Exception:  # noqa: BLE001 - the tick will retry
+            LOGGER.exception("Prompt notification delivery failed.")
+
+    def _on_notification_event(self, event: Event) -> None:
+        """Announce one stored notification, on the Tk thread.
+
+        Separated from :meth:`_on_event` so it waits in a buffer of its own.
+        Sharing the main queue meant a flood of packet batches could evict a
+        stored notification before the interface read it, and the popup for a
+        real detection never happened.
+
+        NOTIFICATION_STORED, not NOTIFICATION_RAISED: the latter is a request
+        for a notification and only the backup service publishes one. The
+        notification service converts requests, Snort alerts, detections,
+        scans and subsystem failures into stored records, and this announces
+        what was actually stored.
+        """
+        if event.type != EventType.NOTIFICATION_STORED:
+            return
+        payload = event.payload
+        title = str(getattr(payload, "title", "Notification"))
+        # The same rule the notification panel uses: the deduplication key the
+        # service appends after an invisible marker is not part of the event
+        # and is not shown.
+        message = without_correlation_key(getattr(payload, "message", ""))
+        notification_id = getattr(payload, "notification_id", None)
+
+        # Sound is decided separately from the popup and on its own worker, so
+        # this returns at once and a silent or missing audio device cannot
+        # stop the popup below from being raised.
+        audio = getattr(self.context, "audio_alerts", None)
+        is_detection_sound = str(getattr(payload, "category", "")) == "alert"
+        if audio is not None and not is_detection_sound:
+            # Non-detection notifications keep their single system sound. A
+            # detection's sound is the persistent siren, started by the popup
+            # present hook below, so it is not also queued here (which would
+            # double the first sound).
+            queued = audio.notify(payload)
+            LOGGER.info(
+                "[NOTIFY] Sound %s: notification_id=%s ref=%s:%s",
+                "queued" if queued else "not played",
+                notification_id,
+                getattr(payload, "reference_type", "") or "-",
+                getattr(payload, "reference_id", None) or "-",
+            )
+
+        self.set_status(f"{title}: {message}")
+        # Centred and persistent, with CLOSE and CHECK. A detection that timed
+        # out of the corner of the screen while the operator was away is a
+        # detection nobody saw, so this one waits to be acknowledged instead
+        # of expiring. Neither button touches the alert record or its review
+        # status.
+        # The detection's own severity, carried on the event. A failure in
+        # building the popup is caught and logged by the event bus, which
+        # isolates every subscriber, so the next notification still arrives.
+        severity = str(getattr(payload, "severity", "") or "")
+        is_detection = str(getattr(payload, "category", "")) == "alert"
+        shown = self._toasts.show_persistent(
+            title, message,
+            level=str(getattr(payload, "level", "INFO")).upper(),
+            reference=_notification_reference(payload),
+            on_check=lambda: self.navigate("alerts"),
+            severity=severity,
+            is_detection=is_detection,
+        )
+        LOGGER.info(
+            "[NOTIFY] Popup %s: notification_id=%s severity=%s",
+            "displayed" if shown else "queued behind an open popup",
+            notification_id, severity or ("UNKNOWN" if is_detection else "-"),
+        )
+        self.refresh_notifications()
+
     def _on_event(self, event: Event) -> None:
         """Handle one event on the Tk thread."""
         if event.type in (
@@ -1130,24 +1349,13 @@ class MainWindow:
         ):
             self._refresh_status_strip()
 
-        if event.type == EventType.NOTIFICATION_RAISED:
-            payload = event.payload
-            title = str(getattr(payload, "title", "Notification"))
-            message = str(getattr(payload, "message", ""))
-            # Sound it on the same path that already shows it. The audio
-            # service queues and plays on its own worker, so this returns
-            # immediately and the Tk loop is never held for playback.
-            audio = getattr(self.context, "audio_alerts", None)
-            if audio is not None:
-                audio.notify(payload)
-            self.set_status(f"{title}: {message}")
-            self._toasts.show(
-                title, message,
-                level=str(getattr(payload, "level", "INFO")).upper(),
-                on_click=lambda: self._toggle_notifications(force_open=True),
-            )
-            self.refresh_notifications()
-        elif event.type == EventType.NMAP_SCAN_COMPLETED:
+        # NOTIFICATION_STORED, not NOTIFICATION_RAISED. The latter is a
+        # *request* for a notification - only the backup service publishes it -
+        # and the notification service converts it, along with Snort alerts,
+        # scans and subsystem failures, into a stored record. Sounding on the
+        # request meant a real IDS alert never sounded at all, because nothing
+        # ever requested one for it: the record was written and never announced.
+        if event.type == EventType.NMAP_SCAN_COMPLETED:
             scan = getattr(event.payload, "scan", None)
             if scan is not None:
                 self._toasts.show(
@@ -1204,7 +1412,16 @@ class MainWindow:
         if self._closing:
             return
         try:
-            self.context.event_bus.dispatch_all(limit_per_subscription=400)
+            # Budgeted, because this runs on the Tk thread. During a real
+            # Nmap port scan the capture pipeline raised events faster than
+            # they could be handled and this call alone held the main loop for
+            # up to 2,007 ms, which is the interface not answering the OS.
+            # Events not reached stay queued and are handled on the next tick;
+            # none is discarded here.
+            self.context.event_bus.dispatch_all(
+                limit_per_subscription=400,
+                time_budget_ms=self.EVENT_BUDGET_MS,
+            )
         except Exception:  # noqa: BLE001
             LOGGER.exception("Event dispatch failed.")
 
@@ -1282,7 +1499,9 @@ class MainWindow:
             counts: dict[str, int] = {}
             if snort is not None:
                 try:
-                    counts["alerts"] = snort.unresolved_alert_count(session)
+                    # AETHRA-SEC detections awaiting review: the Alerts
+                    # screen lists those only, so its badge counts those only.
+                    counts["alerts"] = snort.unreviewed_detection_count(session)
                 except Exception:  # noqa: BLE001
                     pass
             # Only ask when the session may: an unauthorised read would be
@@ -1336,17 +1555,55 @@ class MainWindow:
             LOGGER.debug("Status bar unavailable: %s", message)
 
     def refresh_notifications(self) -> None:
-        """Update the unread badge on the bell."""
+        """Update the unread badge on the bell, counting off the Tk thread.
+
+        The count is a database query, and this is called from ``_on_event``
+        for every stored notification. Running it inline put a query on the Tk
+        thread on the busiest path there is: during a real Nmap port scan the
+        capture pipeline raises notifications in bursts, and each one blocked
+        the main loop for the duration of a round trip.
+
+        Single-flight, because a burst would otherwise start a thread per
+        notification to ask the same question. A refresh that arrives while one
+        is in flight sets a flag and the worker asks once more on the way out,
+        so the badge still ends up showing the latest count.
+        """
         service = self.context.notifications
         if service is None:
             return
-        try:
-            count = service.unread_count(self.session)
-        except Exception:  # noqa: BLE001 - the bell must not break the shell
+        if self._notification_count_running:
+            self._notification_count_again = True
             return
-        self._notification_badge.set_count(count)
-        if self._notification_panel.winfo_ismapped():
-            self._populate_notifications()
+
+        session = self.session
+
+        def runner() -> None:
+            while True:
+                try:
+                    count = service.unread_count(session)
+                except Exception:  # noqa: BLE001 - the bell must not break the shell
+                    count = None
+
+                def deliver(value: int | None = count) -> None:
+                    self._notification_count_running = False
+                    if self._closing or value is None:
+                        return
+                    self._notification_badge.set_count(value)
+                    if self._notification_panel.winfo_ismapped():
+                        self._populate_notifications()
+
+                if not self._notification_count_again:
+                    dispatch.post(deliver)
+                    return
+                # Another refresh was requested while this one was out; ask
+                # again rather than deliver a count already known to be stale.
+                self._notification_count_again = False
+
+        self._notification_count_running = True
+        self._notification_count_again = False
+        threading.Thread(
+            target=runner, name="notification-count", daemon=True
+        ).start()
 
     def _toggle_notifications(self, *, force_open: bool = False) -> None:
         """Show or hide the notification panel."""
@@ -1504,6 +1761,10 @@ class MainWindow:
         """
         self._closing = True
         self._remember_window_state()
+        cancel_watchdog = getattr(self, "_cancel_watchdog", None)
+        if cancel_watchdog is not None:
+            cancel_watchdog()
+            self._cancel_watchdog = None
 
         capture = self.context.capture
         if capture is not None and capture.is_running:
@@ -1520,6 +1781,10 @@ class MainWindow:
             self._tick_job = None
         try:
             self.context.event_bus.unsubscribe(self._subscription)
+            self.context.event_bus.unsubscribe(self._notification_wake)
+            self.context.event_bus.unsubscribe(
+                self._notification_subscription
+            )
         except Exception:  # noqa: BLE001
             pass
 
@@ -1582,5 +1847,12 @@ def run_console(
     window = MainWindow(root, context, fonts, session)
     window.refresh_notifications()
     window._refresh_status_strip()  # noqa: SLF001 - initial paint
-    root.mainloop()
+    # Off unless AETHRA_FLOOD_PROBE is set, and it observes only: no capture
+    # setting, queue or counter is touched by it. See diagnostics/flood_probe.
+    probe = flood_probe.install(root, context, window)
+    try:
+        root.mainloop()
+    finally:
+        if probe is not None:
+            probe.stop()
     return window.outcome

@@ -92,6 +92,15 @@ FLUSH_INTERVAL_MS = 250
 #: record; this only bounds what the screen is asked to draw.
 MAX_BUFFERED_PACKETS = 5000
 
+#: Most packet rows inserted into the table in one flush. The table keeps only
+#: ``ui.packet_table_max_rows`` (2,000) newest rows, so inserting more than a
+#: bounded number per flush only costs Tk-thread time that a trim then throws
+#: away. A live UI-stall report (logs/ui_stall_20261015_232606_1.txt) caught
+#: the Tk thread 5.5 s deep in ttk Treeview inserts during a flood: a single
+#: flush was inserting thousands of rows. Capping it bounds each flush's cost
+#: by the clock. The newest rows win; the database keeps every packet.
+MAX_ROWS_PER_FLUSH = 600
+
 #: Direction views on the filter bar, left to right. The empty key is "all
 #: directions" - the absence of a direction filter, not a filter of its own.
 DIRECTION_BUTTONS: tuple[tuple[str, str], ...] = (
@@ -105,7 +114,9 @@ DIRECTION_BUTTONS: tuple[tuple[str, str], ...] = (
 PROTOCOL_BUTTONS: tuple[tuple[str, str], ...] = (
     ("HTTP", "HTTP"),
     ("HTTPS", "HTTPS/TLS"),
-    ("WEB", "Web"),
+    # "Web" was removed: it was exactly HTTP or HTTPS/TLS, both of which are
+    # still on the bar beside it, so it offered nothing the two of them did
+    # not already offer one click apart.
     ("SITES", "Sites"),
     ("TCP", "TCP"),
     ("UDP", "UDP"),
@@ -418,11 +429,6 @@ class TrafficScreen(Screen):
             "network TAP, or AETHRA-SEC in the traffic path.",
         )
         Tooltip(self._protocol_buttons["HTTPS"], HTTPS_NOTICE)
-        Tooltip(
-            self._protocol_buttons["WEB"],
-            "HTTP and HTTPS/TLS together, each identified by the protocol TShark "
-            "decoded - never by port number.",
-        )
         Tooltip(
             self._protocol_buttons["SITES"],
             "Names this computer connected to or looked up: HTTPS server names "
@@ -1742,6 +1748,15 @@ class TrafficScreen(Screen):
         self._flush_job = None
         buffered, self._buffer = self._buffer, []
         seen, self._seen_since_flush = self._seen_since_flush, 0
+        # Bound the Tk-thread cost of one flush: insert at most
+        # MAX_ROWS_PER_FLUSH newest rows. Anything older than that in a single
+        # burst would be trimmed off the table immediately anyway, so it is
+        # counted as display-dropped (the database still holds it) rather than
+        # inserted and discarded. This is what keeps a flood from holding the
+        # event loop for seconds.
+        if len(buffered) > MAX_ROWS_PER_FLUSH:
+            self._buffer_dropped += len(buffered) - MAX_ROWS_PER_FLUSH
+            buffered = buffered[-MAX_ROWS_PER_FLUSH:]
         if buffered:
             self._append_packets(buffered)
         self._update_surge_note(seen, len(buffered))

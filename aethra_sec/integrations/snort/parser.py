@@ -35,7 +35,12 @@ _FAST_RE = re.compile(
     r"(?P<message>.*?)\s*\[\*\*\]"
     r"(?:\s*\[Classification:\s*(?P<classification>[^\]]*)\])?"
     r"(?:\s*\[Priority:\s*(?P<priority>\d+)\])?"
-    r"(?:\s*\{(?P<protocol>[A-Za-z0-9_-]+)\})?"
+    # A colon belongs in this class: Snort's sfportscan preprocessor reports
+    # its pseudo-packet as "{PROTO:255}", and without the colon the protocol
+    # group fails, the whole line fails to match, and parse_fast returns None -
+    # so every port-scan alert the preprocessor raised was silently dropped
+    # before it could reach the database.
+    r"(?:\s*\{(?P<protocol>[A-Za-z0-9_:-]+)\})?"
     r"(?:\s*(?P<src>[0-9a-fA-F:.]+?)(?::(?P<sport>\d+))?\s*->\s*"
     r"(?P<dst>[0-9a-fA-F:.]+?)(?::(?P<dport>\d+))?\s*)?$",
     re.DOTALL,

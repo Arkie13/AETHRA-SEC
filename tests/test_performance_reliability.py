@@ -99,7 +99,9 @@ class TestSidebarBadgesNeverQueryOnTheTkThread:
             ._maybe_refresh_badge_counts
         )
         assert "threading.Thread" in src and "dispatch.post" in src
-        assert "unresolved_alert_count" in src
+        # The Alerts badge counts unreviewed AETHRA-SEC detections since the
+        # 15 Oct 2026 revision (the Alerts screen lists those only).
+        assert "unreviewed_detection_count" in src
         # The Incidents badge went with the Incidents screen; nothing may
         # keep querying for a counter no sidebar entry displays.
         assert "open_incident_count" not in src

@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -91,12 +92,55 @@ def find_nmap(configured_path: Path | None = None) -> Path | None:
     return None
 
 
-def probe_nmap(configured_path: Path | None = None) -> NmapAvailability:
+#: How long one Nmap probe result is reused.
+#:
+#: :func:`probe_nmap` locates the executable (a ``PATH`` scan) and then runs
+#: ``nmap --version`` as a real subprocess. On the development machine that
+#: measured 1.9 s mean and 7.2 s worst, and the Vulnerability Assessment
+#: refresh called it every few seconds - on a worker thread, but process
+#: creation and the ``PATH`` walk still contend for the GIL, so the interface
+#: stalled with it.
+#:
+#: An Nmap installation does not change second to second. It can change while
+#: the application runs, so the answer expires rather than being cached for
+#: the process lifetime: installing or removing Nmap is reflected within this
+#: window, and :func:`invalidate_nmap_probe` forces an immediate re-probe
+#: where a caller needs one (after the configured path is edited).
+NMAP_PROBE_CACHE_SECONDS = 60.0
+
+_probe_lock = threading.Lock()
+_probe_cache: dict[str, tuple[float, "NmapAvailability"]] = {}
+
+
+def invalidate_nmap_probe() -> None:
+    """Discard cached probe results, so the next call re-runs Nmap."""
+    with _probe_lock:
+        _probe_cache.clear()
+
+
+def probe_nmap(
+    configured_path: Path | None = None, *, refresh: bool = False
+) -> NmapAvailability:
     """Check whether Nmap can actually be executed.
 
     Runs ``nmap --version`` with a fixed argument list (no shell) and reports
-    the real version string.
+    the real version string. The result is cached for
+    :data:`NMAP_PROBE_CACHE_SECONDS`; pass ``refresh=True`` to re-probe now.
     """
+    key = str(configured_path or "")
+    if not refresh:
+        with _probe_lock:
+            cached = _probe_cache.get(key)
+            if cached is not None and (time.monotonic() - cached[0]) <= NMAP_PROBE_CACHE_SECONDS:
+                return cached[1]
+    result = _probe_nmap_uncached(configured_path)
+    with _probe_lock:
+        _probe_cache[key] = (time.monotonic(), result)
+    return result
+
+
+def _probe_nmap_uncached(configured_path: Path | None = None) -> NmapAvailability:
+    """Do the real probe: locate the executable and run ``nmap --version``."""
     if not PYTHON_NMAP_AVAILABLE:
         return NmapAvailability(
             available=False,

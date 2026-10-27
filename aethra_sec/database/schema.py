@@ -86,6 +86,12 @@ CREATE TABLE IF NOT EXISTS users (
     must_change_password TINYINT(1)  NOT NULL DEFAULT 0,
     created_at          DATETIME(6)  NOT NULL,
     updated_at          DATETIME(6)  NOT NULL,
+    -- When an administrator last changed this account's identity or
+    -- configuration. Deliberately NOT updated_at: that column also moves on
+    -- sign-in and on a failed-login count, so it cannot answer "when was this
+    -- account last edited". NULL means never edited since creation, which is
+    -- shown as a dash rather than guessed at.
+    date_modified       DATETIME(6)  NULL DEFAULT NULL,
     created_by          INT UNSIGNED NULL,
     PRIMARY KEY (id),
     UNIQUE KEY uq_users_username (username),
@@ -499,9 +505,12 @@ CREATE TABLE IF NOT EXISTS snort_alerts (
     evaluated_at        DATETIME(6)  NULL,
     duplicate_count     INT UNSIGNED NOT NULL DEFAULT 1,
     dedup_key           VARCHAR(190) NOT NULL DEFAULT '',
+    last_alert_time     DATETIME(6)  NULL,
+    peak_pps            DECIMAL(14,1) NULL,
     created_at          DATETIME(6)  NOT NULL,
     PRIMARY KEY (id),
     KEY ix_alerts_time (alert_time),
+    KEY ix_alerts_last_alert (last_alert_time),
     KEY ix_alerts_received (received_at),
     KEY ix_alerts_signature (signature_id),
     KEY ix_alerts_severity (severity),
@@ -542,6 +551,14 @@ CREATE TABLE IF NOT EXISTS traffic_anomalies (
     threshold_value     DECIMAL(16,3) NOT NULL DEFAULT 0,
     window_seconds      INT UNSIGNED NOT NULL DEFAULT 0,
     event_count         INT UNSIGNED NOT NULL DEFAULT 1,
+    -- observed_value is the PEAK measurement across the episode (kept with
+    -- GREATEST on every fold). latest_value is the most recent one, which is
+    -- what current severity is classified from.
+    latest_value        DECIMAL(16,3) NULL,
+    latest_measured_at  DATETIME(6)  NULL,
+    -- severity above is the CURRENT classification. peak_severity is the
+    -- highest the episode ever reached, and never falls.
+    peak_severity       VARCHAR(16)  NULL,
     first_seen          DATETIME(6)  NOT NULL,
     last_seen           DATETIME(6)  NOT NULL,
     evidence            TEXT         NULL,
@@ -565,6 +582,25 @@ CREATE TABLE IF NOT EXISTS traffic_anomalies (
 ) {TABLE_OPTIONS}
 """
 
+ANOMALY_SEVERITY_TRANSITIONS = f"""
+CREATE TABLE IF NOT EXISTS anomaly_severity_transitions (
+    id                  BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    anomaly_id          BIGINT UNSIGNED NOT NULL,
+    occurred_at         DATETIME(6)  NOT NULL,
+    previous_severity   VARCHAR(16)  NOT NULL,
+    new_severity        VARCHAR(16)  NOT NULL,
+    observed_value      DECIMAL(16,3) NULL,
+    window_seconds      INT UNSIGNED NULL,
+    measured_at         DATETIME(6)  NULL,
+    created_at          DATETIME(6)  NOT NULL,
+    PRIMARY KEY (id),
+    KEY ix_transitions_anomaly (anomaly_id, occurred_at),
+    CONSTRAINT fk_transitions_anomaly
+        FOREIGN KEY (anomaly_id) REFERENCES traffic_anomalies (id)
+        ON DELETE CASCADE
+) {TABLE_OPTIONS}
+"""
+
 MITIGATION_RECOMMENDATIONS = f"""
 CREATE TABLE IF NOT EXISTS mitigation_recommendations (
     id                  BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -580,6 +616,17 @@ CREATE TABLE IF NOT EXISTS mitigation_recommendations (
     long_term_action    TEXT         NULL,
     verification_steps  TEXT         NULL,
     reference_notes     TEXT         NULL,
+    -- Where the change belongs (host firewall, network edge, web layer).
+    -- An endpoint rule and a gateway rule are not interchangeable, and a
+    -- recommendation that does not say which it means is not actionable.
+    enforcement_point   TEXT         NULL,
+    -- The ordered procedure, one step per line. Kept apart from
+    -- immediate_action, which stays the short "do this first" summary.
+    procedure_steps     TEXT         NULL,
+    -- How to undo exactly the rule the procedure created.
+    rollback_steps      TEXT         NULL,
+    -- What the change may legitimately break.
+    operational_warnings TEXT        NULL,
     is_active           TINYINT(1)   NOT NULL DEFAULT 1,
     is_builtin          TINYINT(1)   NOT NULL DEFAULT 0,
     created_by          INT UNSIGNED NULL,
@@ -905,6 +952,7 @@ CREATE_TABLE_STATEMENTS: tuple[tuple[str, str], ...] = (
     ("incidents", INCIDENTS),
     ("snort_alerts", SNORT_ALERTS),
     ("traffic_anomalies", TRAFFIC_ANOMALIES),
+    ("anomaly_severity_transitions", ANOMALY_SEVERITY_TRANSITIONS),
     ("incident_events", INCIDENT_EVENTS),
     ("incident_notes", INCIDENT_NOTES),
     ("threat_mitigation_mapping", THREAT_MITIGATION_MAPPING),

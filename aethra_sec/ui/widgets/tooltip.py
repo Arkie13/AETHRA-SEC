@@ -134,3 +134,160 @@ def attach_tooltip(
 ) -> Tooltip:
     """Convenience wrapper returning the created :class:`Tooltip`."""
     return Tooltip(widget, text, text_provider=text_provider, wraplength=wraplength)
+
+
+class CellTooltip:
+    """One reusable hover box for individual cells of a table.
+
+    :class:`Tooltip` explains a whole widget. A table needs the text to follow
+    the cell under the pointer, so this keeps a single window and only
+    rebuilds it when the pointer moves onto a different cell - moving within
+    one cell does nothing, which is what stops it flickering. The text is
+    computed by the caller from data it already holds; nothing here queries.
+
+    Args:
+        widget: the widget the cells belong to (a Treeview).
+        delay_ms: how long the pointer must rest on a cell before it shows.
+        wraplength: pixel width at which the text wraps.
+    """
+
+    def __init__(
+        self,
+        widget: tk.Misc,
+        *,
+        delay_ms: int = SHOW_DELAY_MS,
+        wraplength: int = 460,
+    ) -> None:
+        self._widget = widget
+        self._delay = delay_ms
+        self._wraplength = wraplength
+        self._window: tk.Toplevel | None = None
+        self._label: ttk.Label | None = None
+        self._after_id: str | None = None
+        #: The cell currently shown or pending, as ``(item, column)``.
+        self._cell: tuple[str, str] | None = None
+        self._pending: tuple[str, int, int] | None = None
+
+    @property
+    def cell(self) -> tuple[str, str] | None:
+        """The cell the box is showing or about to show."""
+        return self._cell
+
+    @property
+    def text(self) -> str:
+        """The text on screen, or empty when hidden."""
+        if self._label is None or self._window is None:
+            return ""
+        try:
+            return str(self._label.cget("text"))
+        except tk.TclError:
+            return ""
+
+    def point_at(
+        self, item: str, column: str, text: str, x_root: int, y_root: int
+    ) -> None:
+        """The pointer is over ``(item, column)``, whose details are ``text``.
+
+        The same cell again is a no-op; a different cell replaces the text.
+        Empty text hides the box - a cell with nothing honest to say shows
+        nothing rather than an empty frame.
+        """
+        if not text:
+            self.hide()
+            return
+        if self._cell == (item, column):
+            return
+        self._cancel()
+        self._cell = (item, column)
+        self._pending = (text, x_root, y_root)
+        if self._window is not None:
+            self._show()  # already visible: move straight to the new cell
+            return
+        try:
+            self._after_id = self._widget.after(self._delay, self._show)
+        except tk.TclError:  # pragma: no cover - widget closing
+            self._after_id = None
+
+    def hide(self) -> None:
+        """Hide the box and forget the cell."""
+        self._cancel()
+        self._cell = None
+        self._pending = None
+        if self._window is not None:
+            try:
+                self._window.withdraw()
+            except tk.TclError:
+                self._window = None
+                self._label = None
+
+    def destroy(self) -> None:
+        """Release the window for good."""
+        self.hide()
+        if self._window is not None:
+            try:
+                self._window.destroy()
+            except tk.TclError:
+                pass
+        self._window = None
+        self._label = None
+
+    def _cancel(self) -> None:
+        if self._after_id is not None:
+            try:
+                self._widget.after_cancel(self._after_id)
+            except tk.TclError:
+                pass
+            self._after_id = None
+
+    def _ensure_window(self) -> bool:
+        if self._window is not None:
+            return True
+        try:
+            window = tk.Toplevel(self._widget)
+            window.wm_overrideredirect(True)
+            window.configure(background=PALETTE.border_strong)
+            frame = ttk.Frame(window, style="Toast.TFrame", padding=(12, 8))
+            frame.pack(padx=1, pady=1)
+            label = ttk.Label(
+                frame, text="", style="ToastBody.TLabel",
+                wraplength=self._wraplength, justify="left",
+            )
+            label.pack()
+            try:
+                window.wm_attributes("-topmost", True)
+            except tk.TclError:  # pragma: no cover - platform dependent
+                pass
+            window.withdraw()
+        except tk.TclError:  # pragma: no cover - widget closing
+            return False
+        self._window = window
+        self._label = label
+        return True
+
+    def _show(self) -> None:
+        self._after_id = None
+        if self._pending is None or not self._ensure_window():
+            return
+        text, x_root, y_root = self._pending
+        window, label = self._window, self._label
+        assert window is not None and label is not None
+        try:
+            label.configure(text=text)
+            window.update_idletasks()
+            width, height = window.winfo_reqwidth(), window.winfo_reqheight()
+            screen_w = window.winfo_screenwidth()
+            screen_h = window.winfo_screenheight()
+            # Beside the pointer, and kept on screen: flipped to the left or
+            # above when it would run off the right or bottom edge.
+            x = x_root + 16
+            y = y_root + 18
+            if x + width > screen_w:
+                x = max(0, x_root - width - 12)
+            if y + height > screen_h:
+                y = max(0, y_root - height - 12)
+            window.wm_geometry(f"+{x}+{y}")
+            window.deiconify()
+            window.lift()
+        except tk.TclError:  # pragma: no cover - widget closing
+            self._window = None
+            self._label = None

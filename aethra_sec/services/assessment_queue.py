@@ -72,7 +72,7 @@ from aethra_sec.models.enums import (
     ScanTrigger,
 )
 from aethra_sec.utils.logging import get_logger
-from aethra_sec.utils.net import local_ipv4_networks
+from aethra_sec.utils.net import local_ipv4_addresses, local_ipv4_networks
 from aethra_sec.utils.timeutil import utcnow
 
 LOGGER = get_logger("services.assessment_queue")
@@ -110,6 +110,9 @@ class QueueStatistics:
     skipped: int = 0
     cooldown: int = 0
     due_now: int = 0
+    #: False when ``due_now`` could not be computed, so a zero is not read as
+    #: "nothing is due". The reason is appended to :attr:`detail`.
+    due_now_available: bool = True
     last_assessment_at: Any = None
     last_discovery_at: Any = None
     detail: str = ""
@@ -329,17 +332,14 @@ class AssessmentQueueService:
         for network in local_ipv4_networks():
             if parsed == network.network_address:
                 return True
+        # Asked once per candidate host, so the adapter read behind this must
+        # be the cached one. Enumerating the adapters per host is what made
+        # eligibility cost 88 ms a host and froze the interface; see
+        # ADAPTER_CACHE_SECONDS.
         try:
-            import psutil
-            import socket
-
-            for entries in psutil.net_if_addrs().values():
-                for entry in entries:
-                    if entry.family == socket.AF_INET and entry.address == address:
-                        return True
-        except Exception:  # noqa: BLE001
+            return address in local_ipv4_addresses()
+        except Exception:  # noqa: BLE001 - absence is "not our address"
             return False
-        return False
 
     def eligibility(self, host: Any) -> tuple[bool, AssessmentState, str]:
         """Whether one host may be assessed now, and why not when it may not.
@@ -815,6 +815,16 @@ class AssessmentQueueService:
             else:
                 candidates = []
             stats.due_now = sum(1 for host in candidates if self.eligibility(host)[0])
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001 - never break the caller
+            # Was silently swallowed, which left "0 due now" on screen whether
+            # nothing was due or the question could not be answered. Those are
+            # different states and an operator has to be able to tell them
+            # apart, so the failure is logged and said out loud.
+            LOGGER.exception("The assessment due-now figure could not be computed.")
+            stats.due_now_available = False
+            detail = (
+                "The number of hosts due for assessment could not be "
+                f"determined: {exc}"
+            )
+            stats.detail = f"{stats.detail}  {detail}".strip() if stats.detail else detail
         return stats

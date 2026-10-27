@@ -37,6 +37,7 @@ from aethra_sec.ui.screens.traffic import (
     DIRECTION_BUTTONS,
     FLUSH_INTERVAL_MS,
     MAX_BUFFERED_PACKETS,
+    MAX_ROWS_PER_FLUSH,
     PROTOCOL_BUTTONS,
     TrafficScreen,
 )
@@ -306,6 +307,59 @@ class TestCoalescing:
         assert screen._seen_since_flush == 100
 
 
+class _RecordingTable:
+    """Records how many rows each flush actually inserts."""
+
+    def __init__(self) -> None:
+        self.inserts: list[int] = []
+
+    def add_rows(self, rows) -> None:  # noqa: ANN001
+        self.inserts.append(len(list(rows)))
+
+
+class _FlushScreen(_Screen):
+    """The REAL _flush_buffer and _append_packets, with a recording table."""
+
+    # The cap under test lives in the REAL _flush_buffer, which runs before
+    # _append_packets; the recording table counts what the cap let through.
+    _flush_buffer = TrafficScreen._flush_buffer
+    _update_surge_note = lambda self, *a, **k: None  # noqa: E731 - not under test
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._table = _RecordingTable()
+
+    def _append_packets(self, packets) -> None:  # noqa: ANN001
+        self._table.add_rows(packets)
+
+
+class TestPerFlushCapBoundsTkCost:
+    """TEST A: one flush can never insert an unbounded number of rows.
+
+    A live UI-stall report caught the Tk thread seconds deep in Treeview
+    inserts because one flush inserted thousands of rows. The cap bounds it.
+    """
+
+    def test_a_huge_burst_inserts_at_most_the_cap_in_one_flush(self) -> None:
+        screen = _FlushScreen()
+        screen._buffer = [_Packet() for _ in range(MAX_BUFFERED_PACKETS)]
+        screen._flush_buffer()
+        assert screen._table.inserts == [MAX_ROWS_PER_FLUSH]
+        # The rows not inserted are counted as display-dropped, not lost
+        # silently; the database still holds every packet.
+        assert screen._buffer_dropped == MAX_BUFFERED_PACKETS - MAX_ROWS_PER_FLUSH
+
+    def test_a_small_batch_is_inserted_whole(self) -> None:
+        screen = _FlushScreen()
+        screen._buffer = [_Packet() for _ in range(120)]
+        screen._flush_buffer()
+        assert screen._table.inserts == [120]
+        assert screen._buffer_dropped == 0
+
+    def test_the_cap_is_bounded_and_below_the_table_cap(self) -> None:
+        assert 50 <= MAX_ROWS_PER_FLUSH <= 2000
+
+
 def _view(expression: str) -> tuple[Any, list[Any]]:
     """A packet view with ``expression`` applied, driven by hand."""
     from aethra_sec.analytics.display_filter import compile_filter
@@ -340,7 +394,7 @@ class TestDisplayViews:
         """All, Incoming, Outgoing, Transit; HTTP, HTTPS, Web, TCP, UDP, ICMP, DNS, ARP."""
         assert {key for key, _label in DIRECTION_BUTTONS} == {"", "INCOMING", "OUTGOING", "TRANSIT"}
         assert {key for key, _label in PROTOCOL_BUTTONS} == {
-            "HTTP", "HTTPS", "WEB", "SITES", "TCP", "UDP", "ICMP", "DNS", "ARP",
+            "HTTP", "HTTPS", "SITES", "TCP", "UDP", "ICMP", "DNS", "ARP",
         }
 
     def test_all_traffic_admits_everything(self) -> None:

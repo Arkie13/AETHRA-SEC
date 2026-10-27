@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import threading
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Callable
 
+from aethra_sec.analytics.anomaly_rules import flood_severity
 from aethra_sec.analytics.risk_engine import RiskEngine
 from aethra_sec.config.settings import SnortSettings, ToolSettings
 from aethra_sec.core.errors import SnortIngestError, ValidationFailedError
@@ -95,6 +96,42 @@ class SnortService:
         self._network_lock = threading.Lock()
         self._networks: tuple[Any, ...] = ()
         self._networks_read_at: datetime | None = None
+        #: Live pps of a source, from the capture's detection engine. Set by
+        #: the application once capture exists; ``None`` leaves Snort's own
+        #: priority as the grade.
+        self._rate_probe: Callable[[str, str | None], float | None] | None = None
+
+    def set_rate_probe(
+        self, probe: "Callable[[str, str | None], float | None] | None"
+    ) -> None:
+        """Give ingest a way to read a source's live pps from the capture.
+
+        With it, a new Snort alert is graded on the §3.9.8 pps legend - the
+        same bands as a flood - instead of on the signature's priority.
+        """
+        self._rate_probe = probe
+
+    def _measure_source(self, record: SnortAlert) -> float | None:
+        """The live pps of the alert's source to its target, or ``None``."""
+        probe = self._rate_probe
+        if probe is None or not record.src_ip:
+            return None
+        try:
+            return probe(record.src_ip, record.dst_ip or None)
+        except Exception:  # noqa: BLE001 - grading must never lose an alert
+            LOGGER.debug("Rate probe failed for %s.", record.src_ip, exc_info=True)
+            return None
+
+    def _regrade_repeat(self, alert_id: int, record: SnortAlert) -> None:
+        """Raise a folded alert's pps and grade if its source got faster."""
+        pps = self._measure_source(record)
+        if pps is None:
+            return
+        severity, _band = flood_severity(pps)
+        try:
+            self._alerts.raise_alert_grade(alert_id, pps, severity)
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("Could not regrade alert %s.", alert_id, exc_info=True)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -284,9 +321,12 @@ class SnortService:
             # incident for an event that happened once.
             identical = self._alerts.find_identical(record.raw_alert)
             if identical:
+                # The same event re-read later: count it, never regrade it -
+                # its traffic is long gone and a rate now would describe
+                # something else.
                 alert_id, _count = identical
                 self._alerts.increment_duplicate(
-                    alert_id, record.received_at or utcnow()
+                    alert_id, record.received_at or utcnow(), record.alert_time
                 )
                 self._duplicates += 1
                 return
@@ -294,16 +334,34 @@ class SnortService:
             suppression = max(
                 1, self._settings.get_int("detection.suppression_window_seconds", 120)
             )
+            # The episode boundary, on the sensor's own clock: a repeat
+            # extends this row only if the row's traffic was last seen within
+            # the episode gap of this alert. A new test run after a pause is a
+            # new row (and a new detection), not a 7,730th repeat.
+            gap = max(1, self._settings.get_int("detection.episode_gap_seconds", 15))
+            event_time = record.alert_time or record.received_at or utcnow()
             existing = self._alerts.find_duplicate(
-                record.dedup_key, utcnow() - timedelta(seconds=suppression)
+                record.dedup_key, utcnow() - timedelta(seconds=suppression),
+                event_since=event_time - timedelta(seconds=gap),
             )
             if existing:
                 alert_id, _count = existing
                 self._alerts.increment_duplicate(
-                    alert_id, record.received_at or utcnow()
+                    alert_id, record.received_at or utcnow(), record.alert_time
                 )
+                # A live repeat: the attack is still going, so measure again
+                # and let the grade rise if the source is now faster.
+                self._regrade_repeat(alert_id, record)
                 self._duplicates += 1
                 return
+
+            # Grade on the §3.9.8 pps legend from the source's live rate, the
+            # same bands as a flood. Without a capture rate the priority grade
+            # set in _normalise stands, and peak_pps stays empty to say so.
+            pps = self._measure_source(record)
+            if pps is not None:
+                record.peak_pps = pps
+                record.severity, _band = flood_severity(pps)
 
             record.src_host_id = self._resolve_host(record.src_ip)
             record.dst_host_id = self._resolve_host(record.dst_ip)
@@ -549,6 +607,62 @@ class SnortService:
         """Anomalies an analyst has not evaluated yet."""
         self._access.require(session, Permission.ALERT_VIEW)
         return self._alerts.count_unreviewed_anomalies()
+
+    def aethra_detection_totals(
+        self, session: Session, anomaly_filters: dict[str, Any]
+    ) -> dict[str, int]:
+        """Severity totals and the unreviewed count for AETHRA-SEC detections only.
+
+        The primary Alerts view shows AETHRA-SEC's own detections, so its
+        summary must not count Snort alerts as though they were among them.
+        """
+        self._access.require(session, Permission.ALERT_VIEW)
+        totals = self._alerts.detection_totals(
+            alert_filters=None, anomaly_filters=anomaly_filters
+        )
+        totals["unreviewed"] = self._alerts.count_unreviewed_matching(
+            alert_filters=None, anomaly_filters=anomaly_filters
+        )
+        return totals
+
+    def snort_evidence_totals(
+        self, session: Session, alert_filters: dict[str, Any]
+    ) -> dict[str, int]:
+        """Severity totals for stored Snort alerts only (the evidence view)."""
+        self._access.require(session, Permission.ALERT_VIEW)
+        totals = self._alerts.detection_totals(
+            alert_filters=alert_filters, anomaly_filters=None
+        )
+        totals["unreviewed"] = self._alerts.count_unreviewed_matching(
+            alert_filters=alert_filters, anomaly_filters=None
+        )
+        return totals
+
+    def unreviewed_detection_count(self, session: Session) -> int:
+        """AETHRA-SEC detections nobody has reviewed yet (the sidebar badge)."""
+        self._access.require(session, Permission.ALERT_VIEW)
+        return int(self._alerts.count_unreviewed_anomalies())
+
+    def snort_evidence_for_attack(
+        self, session: Session, incident_id: int, limit: int = 200
+    ) -> list[SnortAlert]:
+        """Snort alerts the correlation engine linked to one attack."""
+        self._access.require(session, Permission.ALERT_VIEW)
+        return self._alerts.snort_evidence_for_incident(incident_id, limit)
+
+    def attack_statistics(
+        self, session: Session, start: Any, end: Any, active_gap_seconds: int
+    ) -> dict[str, Any]:
+        """Raw per-rule and per-signature figures for the Attack Statistics page."""
+        from datetime import timedelta
+
+        self._access.require(session, Permission.ALERT_VIEW)
+        return {
+            "aethra": self._alerts.aethra_episode_statistics(
+                start, end, utcnow() - timedelta(seconds=max(1, active_gap_seconds))
+            ),
+            "snort": self._alerts.snort_signature_statistics(start, end),
+        }
 
     def unresolved_alert_count(self, session: Session) -> int:
         """Stored alerts nobody has reviewed yet (the sidebar counter)."""

@@ -54,6 +54,9 @@ from aethra_sec.analytics.traffic_direction import (
     classify,
     resolve_local_addresses,
 )
+from aethra_sec.analytics.peer_visibility import (
+    PeerVisibilityTracker,
+)
 from aethra_sec.core.events import DisplayViewPayload, EventType
 from aethra_sec.utils.logging import get_logger
 
@@ -190,6 +193,11 @@ class PacketView:
 
         # Owned by the view thread (or by whoever drives step() in a test).
         self._local = LocalAddresses()
+        #: Counts, from real captured frames, whose traffic is arriving.
+        #: Answers "can this capture point see other devices?" from
+        #: packets rather than from the host inventory, which records
+        #: that a host was seen once, not that it is visible now.
+        self.visibility = PeerVisibilityTracker()
         self._last_resolved = 0.0
         self._session_packets = 0
         self._directions = _zeroed_directions()
@@ -394,6 +402,11 @@ class PacketView:
             local = self._local
             with self._retained_lock:
                 for packet in batch:
+                    # Count whose traffic is arriving while we already have the
+                    # packet and the resolved local addresses in hand. Done
+                    # here so the visibility figures and the direction column
+                    # can never disagree about what "this host" means.
+                    self.visibility.observe(packet, local)
                     direction = classify(packet, local).value
                     try:
                         packet.direction = direction

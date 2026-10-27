@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import itertools
 import threading
+import time
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Deque, Iterable
@@ -31,6 +33,11 @@ EventCallback = Callable[[Event], None]
 
 DEFAULT_QUEUE_SIZE = 2000
 
+
+#: Seconds between drop reports for one subscription. A full buffer
+#: discards an event per publish, so without this the warning about a
+#: flood would itself become one.
+DROP_LOG_INTERVAL_SECONDS = 30.0
 
 @dataclass
 class Subscription:
@@ -71,6 +78,9 @@ class EventBus:
         """
         self._lock = threading.RLock()
         self._subscriptions: dict[int, Subscription] = {}
+        #: Last drop warning per subscription, so one overflowing
+        #: buffer cannot fill the log with its own failure.
+        self._last_drop_log: dict[int, float] = {}
         self._by_type: dict[str, set[int]] = {}
         self._ids = itertools.count(1)
         self._default_queue_size = max(16, default_queue_size)
@@ -163,14 +173,21 @@ class EventBus:
                 if sid in self._subscriptions
             ]
             inline: list[Subscription] = []
+            # Collected under the lock, logged outside it: a full buffer is
+            # exactly when nothing should be held up writing to a log.
+            dropped_now: list[tuple[Subscription, Event]] = []
             for subscription in targets:
                 if subscription.queued:
                     if len(subscription.queue) >= subscription.max_size:
-                        subscription.queue.popleft()
+                        lost = subscription.queue.popleft()
                         subscription.dropped += 1
+                        dropped_now.append((subscription, lost))
                     subscription.queue.append(event)
                 else:
                     inline.append(subscription)
+
+        for subscription, lost in dropped_now:
+            self._report_drop(subscription, lost)
 
         # Inline callbacks run outside the lock so a slow subscriber cannot
         # stall publishers on other threads.
@@ -225,10 +242,76 @@ class EventBus:
             self._invoke(subscription, event)
         return len(events)
 
-    def dispatch_all(self, limit_per_subscription: int = 500) -> int:
+    #: Events taken from one subscription before the clock is consulted again.
+    #:
+    #: Small, because the budget below can only be honoured between chunks: a
+    #: single chunk always runs to completion, so this bounds how far past the
+    #: deadline a dispatch can go.
+    DISPATCH_CHUNK = 16
+
+    def _report_drop(self, subscription: "Subscription", lost: Event) -> None:
+        """Say that a buffer overflowed, without flooding the log itself.
+
+        A full buffer discards one event per publish, so logging every drop
+        would produce thousands of identical lines during the very burst that
+        caused it. One line per subscription per interval carries what
+        matters: which subscriber is behind, what kind of event was lost, and
+        how many have gone in total.
+        """
+        now = time.monotonic()
+        last = self._last_drop_log.get(subscription.id, 0.0)
+        if now - last < DROP_LOG_INTERVAL_SECONDS:
+            return
+        self._last_drop_log[subscription.id] = now
+        LOGGER.warning(
+            "Event buffer full for subscription '%s' (%d slots): discarded a "
+            "'%s' event; %d dropped in total. The subscriber is not keeping "
+            "up and events are being lost.",
+            subscription.name or subscription.id, subscription.max_size,
+            getattr(lost, "type", "?"), subscription.dropped,
+        )
+
+    def dispatch_all(
+        self,
+        limit_per_subscription: int = 500,
+        *,
+        time_budget_ms: float = 0.0,
+    ) -> int:
         """Dispatch every queued subscription that owns a callback.
 
-        This is the single call the main window makes on each UI tick.
+        This is the single call the main window makes on each UI tick, and it
+        runs on the Tk thread, so how long it may take is a property of the
+        interface rather than of the bus.
+
+        A count limit alone could not bound that. Measured during a real
+        full-port Nmap scan of one host, with the capture pipeline raising
+        ``capture.packet_batch`` at roughly 230 events a second, this call took
+        **777 ms on average and 2,007 ms at worst** - 96% of the whole UI tick
+        (24.09 s of 25.09 s) - and the interface stalled 69 times in 220
+        seconds. The per-event cost was not the problem: it averaged 0.063 ms.
+        Some individual events cost 215 ms, so any fixed count can still add up
+        to seconds.
+
+        ``time_budget_ms`` bounds it in wall-clock terms instead. Subscriptions
+        are served round-robin in small chunks and the clock is checked between
+        them, so one noisy subscription cannot starve the others and the Tk
+        thread is handed back on time.
+
+        Nothing is discarded here: an event not reached stays in its
+        subscription's queue and is dispatched on the next tick. Events are
+        only ever removed from a queue in order to be delivered. The bus's
+        existing bounded buffers remain the only place an event can be dropped,
+        and they already count it (``dropped_events``).
+
+        Args:
+            limit_per_subscription: most events taken from any one
+                subscription in this call.
+            time_budget_ms: wall-clock limit for the whole call. Zero - the
+                default - means no limit, which is the historical behaviour and
+                what the tests that count exhaustive delivery rely on.
+
+        Returns:
+            The number of events dispatched.
         """
         with self._lock:
             ids = [
@@ -236,7 +319,46 @@ class EventBus:
                 for sub in self._subscriptions.values()
                 if sub.queued and sub.callback is not None
             ]
-        return sum(self.dispatch(sid, limit_per_subscription) for sid in ids)
+        if not ids:
+            return 0
+        if time_budget_ms <= 0:
+            return sum(self.dispatch(sid, limit_per_subscription) for sid in ids)
+
+        deadline = time.monotonic() + (time_budget_ms / 1000.0)
+        budget = {sid: max(0, int(limit_per_subscription)) for sid in ids}
+        total = 0
+        active = list(ids)
+        # The first pass is not interrupted, so every queued subscription gets
+        # at least one chunk. Checking the clock mid-pass instead meant a
+        # subscription that happened to be served first could exhaust the whole
+        # budget and the others were never reached - a packet flood would then
+        # hide a Snort alert or a database status change behind it. The overrun
+        # this allows is bounded by (subscriptions x DISPATCH_CHUNK) events.
+        first_pass = True
+        while active:
+            progressed = False
+            for sid in list(active):
+                take = min(self.DISPATCH_CHUNK, budget[sid])
+                if take <= 0:
+                    active.remove(sid)
+                    continue
+                dispatched = self.dispatch(sid, take)
+                if dispatched:
+                    progressed = True
+                    total += dispatched
+                    budget[sid] -= dispatched
+                if dispatched < take:
+                    # Its queue is empty; nothing more to take this round.
+                    active.remove(sid)
+                if not first_pass and time.monotonic() >= deadline:
+                    return total
+            if first_pass:
+                first_pass = False
+                if time.monotonic() >= deadline:
+                    return total
+            if not progressed:
+                break
+        return total
 
     def pending(self, subscription_id: int) -> int:
         """Number of buffered events for a subscription."""

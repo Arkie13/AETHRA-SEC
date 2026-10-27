@@ -20,7 +20,8 @@ _USER_COLUMNS = (
     "u.id, u.username, u.password_hash, u.password_algorithm, u.full_name, "
     "u.email, u.role_id, u.is_active, u.is_locked, u.failed_login_count, "
     "u.locked_until, u.last_login_at, u.last_login_host, u.password_changed_at, "
-    "u.must_change_password, u.created_at, u.updated_at, u.created_by, "
+    "u.must_change_password, u.created_at, u.updated_at, u.date_modified, "
+    "u.created_by, "
     "r.name AS role_name"
 )
 
@@ -52,6 +53,7 @@ class UserRepository(Repository):
             must_change_password=as_bool(row.get("must_change_password")),
             created_at=as_dt(row.get("created_at")),
             updated_at=as_dt(row.get("updated_at")),
+            date_modified=as_dt(row.get("date_modified")),
             created_by=as_int(row.get("created_by")),
         )
 
@@ -223,11 +225,21 @@ class UserRepository(Repository):
         role_id: int,
         is_active: bool,
     ) -> None:
-        """Update editable account fields."""
+        """Update editable account fields.
+
+        This is an administrator changing the account's identity, so it stamps
+        ``date_modified`` as well as ``updated_at``. The two are not the same
+        thing: ``updated_at`` also moves on sign-in and on a failed-login
+        count, which is why it cannot answer "when was this account edited".
+        """
+        now = to_db(utcnow())
         self.db.execute(
             "UPDATE users SET full_name = %s, email = %s, role_id = %s, "
-            "is_active = %s, updated_at = %s WHERE id = %s",
-            (full_name, email, role_id, 1 if is_active else 0, to_db(utcnow()), user_id),
+            "is_active = %s, updated_at = %s, date_modified = %s WHERE id = %s",
+            (
+                full_name, email, role_id, 1 if is_active else 0,
+                now, now, user_id,
+            ),
         )
 
     def set_password(
@@ -244,15 +256,24 @@ class UserRepository(Repository):
             "UPDATE users SET password_hash = %s, password_algorithm = %s, "
             "password_changed_at = %s, must_change_password = %s, "
             "failed_login_count = 0, is_locked = 0, locked_until = NULL, "
-            "updated_at = %s WHERE id = %s",
-            (password_hash, algorithm, now, 1 if must_change else 0, now, user_id),
+            "updated_at = %s, date_modified = %s WHERE id = %s",
+            (
+                password_hash, algorithm, now, 1 if must_change else 0,
+                now, now, user_id,
+            ),
         )
 
     def set_active(self, user_id: int, active: bool) -> None:
-        """Activate or deactivate an account."""
+        """Activate or deactivate an account.
+
+        An administrator's decision about the account, so it stamps
+        ``date_modified``.
+        """
+        now = to_db(utcnow())
         self.db.execute(
-            "UPDATE users SET is_active = %s, updated_at = %s WHERE id = %s",
-            (1 if active else 0, to_db(utcnow()), user_id),
+            "UPDATE users SET is_active = %s, updated_at = %s, "
+            "date_modified = %s WHERE id = %s",
+            (1 if active else 0, now, now, user_id),
         )
 
     def set_locked(
